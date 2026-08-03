@@ -5,12 +5,34 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 log_dir=${NVFP4_LOG_DIR:-"${repo_dir}/test/nvfp4/logs/$(date -u +%Y%m%dT%H%M%SZ)"}
 suite=${1:-ops}
 model_path=${NVFP4_MODEL:-}
-gpu_profile=${NVFP4_GPU_PROFILE:-sm100}
+gpu_profile=${NVFP4_GPU_PROFILE:-auto}
 optest=${NVFP4_OPTEST:-"${repo_dir}/optest"}
-build_dir=${NVFP4_BUILD_DIR:-"${repo_dir}/build-nvfp4-${gpu_profile}"}
-build_jobs=${NVFP4_BUILD_JOBS:-$(nproc)}
 nvcc_path=${NVFP4_NVCC:-$(command -v nvcc || true)}
 mkdir -p "${log_dir}"
+
+resolve_gpu_profile() {
+    if [[ "${gpu_profile}" != auto ]]; then
+        return
+    fi
+    local compute_cap major minor arch
+    compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed -n '1p')
+    major=${compute_cap%%.*}
+    minor=${compute_cap#*.}
+    if [[ ! "${major}" =~ ^[0-9]+$ || ! "${minor}" =~ ^[0-9]+$ ]]; then
+        echo "cannot detect GPU compute capability: ${compute_cap}" >&2
+        exit 2
+    fi
+    arch=$((10#${major} * 10 + 10#${minor}))
+    if ((arch >= 120 && arch < 130)); then
+        gpu_profile=sm120
+    elif ((arch >= 100 && arch < 120)); then
+        gpu_profile=sm100
+    else
+        gpu_profile=preblackwell
+    fi
+    printf 'Auto-detected GPU profile: %s (compute capability %s)\n' \
+        "${gpu_profile}" "${compute_cap}"
+}
 
 run_logged() {
     local name=$1
@@ -27,13 +49,7 @@ run_logged() {
 }
 
 run_build() {
-    local cuda_arch
-    case "${gpu_profile}" in
-        sm100) cuda_arch=${NVFP4_CUDA_ARCH:-100} ;;
-        sm120) cuda_arch=${NVFP4_CUDA_ARCH:-120} ;;
-        preblackwell) cuda_arch=${NVFP4_CUDA_ARCH:-90} ;;
-        *) echo "unknown NVFP4_GPU_PROFILE=${gpu_profile}" >&2; exit 2 ;;
-    esac
+    local -a install_args
     if [[ -z "${nvcc_path}" ]]; then
         echo "nvcc not found; set NVFP4_NVCC=/path/to/nvcc" >&2
         exit 2
@@ -41,10 +57,12 @@ run_build() {
     run_logged environment bash -lc \
         'git rev-parse HEAD; git status --short --branch; nvidia-smi'
     run_logged nvcc_version "${nvcc_path}" --version
-    run_logged build_configure cmake -S "${repo_dir}" -B "${build_dir}" \
-        -DUSE_CUDA=ON -DUNIT_TEST=ON -DCUDA_ARCH="${cuda_arch}" \
-        -DCMAKE_CUDA_COMPILER="${nvcc_path}"
-    run_logged build_compile cmake --build "${build_dir}" --parallel "${build_jobs}"
+    install_args=(-DUSE_CUDA=ON -DUNIT_TEST=ON
+        "-DCMAKE_CUDA_COMPILER=${nvcc_path}")
+    if [[ -n "${NVFP4_CUDA_ARCH:-}" ]]; then
+        install_args+=("-DCUDA_ARCH=${NVFP4_CUDA_ARCH}")
+    fi
+    run_logged install bash "${repo_dir}/install.sh" "${install_args[@]}"
 }
 
 run_ops_functional() {
@@ -151,6 +169,8 @@ run_model() {
         --batch-size 32 --max_batch 32 --prefill-length 512 --max-tokens 64
 }
 
+resolve_gpu_profile
+
 case "${suite}" in
     build) run_build ;;
     ops-functional) run_ops_functional ;;
@@ -159,7 +179,7 @@ case "${suite}" in
     forward) run_forward ;;
     model-performance|model) run_model ;;
     all) run_build; run_ops; run_forward; run_model ;;
-    *) echo "usage: $0 {build|ops-functional|ops-performance|ops|forward|model-performance|all}; NVFP4_GPU_PROFILE=sm100|sm120|preblackwell" >&2; exit 2 ;;
+    *) echo "usage: $0 {build|ops-functional|ops-performance|ops|forward|model-performance|all}; NVFP4_GPU_PROFILE=auto|sm100|sm120|preblackwell" >&2; exit 2 ;;
 esac
 
 printf 'Logs: %s\n' "${log_dir}"

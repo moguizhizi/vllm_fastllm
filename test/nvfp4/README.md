@@ -34,10 +34,10 @@
 
 以下命令都把原始命令和完整输出保存到 `NVFP4_LOG_DIR`。建议同一次验证固定同一个目录。
 
-远端编译（B200/B300用 `sm100`，RTX 5090/RTX PRO 6000用 `sm120`）：
+远端编译。脚本自动识别 B200/B300、RTX 5090/RTX PRO 6000 等 GPU，
+并通过仓库现有的 `install.sh` 编译 FastLLM 和 `optest`：
 
 ```bash
-export NVFP4_GPU_PROFILE=sm120
 export NVFP4_LOG_DIR="$PWD/test/nvfp4/logs/remote-sm120-$(date -u +%Y%m%dT%H%M%SZ)"
 test/nvfp4/run_nvfp4_tests.sh build
 ```
@@ -93,8 +93,7 @@ NVFP4_MODEL=/models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
 ```text
 environment.log
 nvcc_version.log
-build_configure.log
-build_compile.log
+install.log
 op_dense_w4a4_decode_padding_bias.log
 op_dense_w4a4_decode_perf.log
 op_dense_w4a4_prefill_perf.log
@@ -112,3 +111,6 @@ NVFP4_OPTEST=/opt/fastllm/optest \
 NVFP4_LOG_DIR=/logs/nvfp4-run-001 \
   test/nvfp4/run_nvfp4_tests.sh ops
 ```
+
+一般不需要设置 `NVFP4_GPU_PROFILE` 或 `NVFP4_CUDA_ARCH`。前者只在自动识别错误或
+需要强制测试某条路径时覆盖；后者只在需要交叉编译或指定多个架构时传给 `install.sh`。
