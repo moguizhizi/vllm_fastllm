@@ -1930,6 +1930,306 @@ namespace {
         };
     }
 
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+    struct Nvfp4SwiGLUQuantState {
+        int rows = 0, hidden = 0;
+        fastllm::DataType inputType = fastllm::DataType::FLOAT16;
+        fastllm::Data input;
+        uint8_t *packed = nullptr;
+        uint8_t *scales = nullptr;
+        size_t packedBytes = 0, scaleBytes = 0;
+
+        explicit Nvfp4SwiGLUQuantState(const OpTestParams &params) {
+            rows = params.GetInt("rows");
+            hidden = params.GetInt("hidden");
+            inputType = params.GetString("input_type") == "bf16"
+                ? fastllm::DataType::BFLOAT16 : fastllm::DataType::FLOAT16;
+            if (rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
+                (params.GetString("input_type") != "fp16" &&
+                 params.GetString("input_type") != "bf16")) {
+                throw std::runtime_error(
+                    "nvfp4_swiglu_quant requires rows>0, 32-aligned hidden and fp16/bf16 input");
+            }
+            input.CopyFrom(MakeTensor({rows, hidden * 2}, 0.619f, 0.5f));
+            fastllm::ToDataType(input, inputType);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            packedBytes = (size_t)rows * hidden / 2;
+            scaleBytes = FastllmCudaNvfp4SwizzledScaleBytes(rows, hidden);
+            packed = static_cast<uint8_t *>(FastllmCudaMalloc(packedBytes));
+            scales = static_cast<uint8_t *>(FastllmCudaMalloc(scaleBytes));
+            if (packed == nullptr || scales == nullptr) {
+                throw std::runtime_error("NVFP4 SwiGLU quant scratch allocation failed");
+            }
+        }
+
+        ~Nvfp4SwiGLUQuantState() {
+            FastllmCudaFree(packed);
+            FastllmCudaFree(scales);
+        }
+
+        void Run() {
+            if (!FastllmCudaSiluMulNvfp4Quantize(
+                    input.cudaData, inputType, packed, scales,
+                    rows, hidden, 1.0f, nullptr)) {
+                throw std::runtime_error("NVFP4 fused SwiGLU quant launch failed");
+            }
+        }
+
+        fastllm::Data Dequantized() {
+            Run();
+            ForceDeviceSync();
+            std::vector<uint8_t> hostPacked(packedBytes), hostScales(scaleBytes);
+            FastllmCudaCopyFromDeviceToHost(hostPacked.data(), packed, packedBytes);
+            FastllmCudaCopyFromDeviceToHost(hostScales.data(), scales, scaleBytes);
+            static const float e2m1[16] = {
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+            std::vector<float> values((size_t)rows * hidden);
+            const int kTiles = (hidden + 63) / 64;
+            for (int row = 0; row < rows; ++row) {
+                for (int col = 0; col < hidden; ++col) {
+                    int pack = col / 16;
+                    int mTile = row >> 7;
+                    int outerM = row & 31;
+                    int innerM = (row >> 5) & 3;
+                    int kTile = pack >> 2;
+                    int innerK = pack & 3;
+                    size_t scaleOffset = ((size_t)mTile * kTiles + kTile) * 512 +
+                                         outerM * 16 + innerM * 4 + innerK;
+                    uint8_t byte = hostPacked[(size_t)row * (hidden / 2) + col / 2];
+                    uint8_t q = uint8_t((byte >> ((col & 1) * 4)) & 0xf);
+                    values[(size_t)row * hidden + col] =
+                        e2m1[q] * DecodeFp8E4M3(hostScales[scaleOffset]);
+                }
+            }
+            return fastllm::Data(fastllm::DataType::FLOAT32, {rows, hidden}, values);
+        }
+
+        fastllm::Data Reference() const {
+            fastllm::Data source(input);
+            fastllm::ToDataType(source, fastllm::DataType::FLOAT32);
+            source.ToDevice(fastllm::DataDevice::CPU);
+            std::vector<float> x = ToFloatVector(source);
+            std::vector<float> result((size_t)rows * hidden);
+            for (int row = 0; row < rows; ++row) {
+                for (int col = 0; col < hidden; ++col) {
+                    float gate = x[(size_t)row * hidden * 2 + col];
+                    float up = x[(size_t)row * hidden * 2 + hidden + col];
+                    result[(size_t)row * hidden + col] =
+                        gate / (1.0f + std::exp(-gate)) * up;
+                }
+            }
+            return fastllm::Data(fastllm::DataType::FLOAT32, {rows, hidden}, result);
+        }
+    };
+#endif
+
+    static OpCase MakeNvfp4SwiGLUQuantCase() {
+        OpCase result{
+            "nvfp4_swiglu_quant",
+            "fused SwiGLU plus dynamic NVFP4 activation quantization",
+            []() {
+                OpTestParams params;
+                params.Add("rows", "32", "flattened token rows");
+                params.Add("hidden", "1024", "post-SwiGLU width, multiple of 32");
+                params.Add("input_type", "fp16", "fp16 or bf16");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+                return device.rfind("cuda:", 0) == 0 &&
+                       FastllmCudaRuntimeArch() >= 100 && FastllmCudaRuntimeArch() < 130;
+#else
+                (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+                ScopedFirstDevice guard(device);
+                Nvfp4SwiGLUQuantState state(params);
+                return state.Dequantized();
+#else
+                (void)params; (void)device;
+                throw std::runtime_error("nvfp4_swiglu_quant requires SM100+ CUDA build");
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) -> std::function<void()> {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+                ScopedFirstDevice guard(device);
+                auto state = std::make_shared<Nvfp4SwiGLUQuantState>(params);
+                return [state]() { state->Run(); };
+#else
+                (void)params; (void)device;
+                return {};
+#endif
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("rows") * params.GetInt("hidden") * 4.5;
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("rows") * params.GetInt("hidden") * 5.0;
+            }};
+        result.runReference = [](const OpTestParams &params, const std::string&) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+            Nvfp4SwiGLUQuantState state(params);
+            return state.Reference();
+#else
+            (void)params;
+            return fastllm::Data();
+#endif
+        };
+        return result;
+    }
+
+    struct LinearNvfp4Fixture {
+        int batch = 0, in = 0, out = 0;
+        fastllm::DataType inputType = fastllm::DataType::FLOAT16;
+        std::vector<float> inputValues;
+        std::vector<uint8_t> weightBytes;
+
+        explicit LinearNvfp4Fixture(const OpTestParams &params) {
+            batch = params.GetInt("batch");
+            in = params.GetInt("in");
+            out = params.GetInt("out");
+            const std::string dtype = params.GetString("input_type");
+            inputType = dtype == "bf16" ? fastllm::DataType::BFLOAT16
+                                         : fastllm::DataType::FLOAT16;
+            if (batch <= 0 || in <= 0 || out <= 0 || in % 32 != 0 || out % 32 != 0 ||
+                (dtype != "fp16" && dtype != "bf16")) {
+                throw std::runtime_error(
+                    "linear_nvfp4 requires positive batch, 32-aligned in/out, and fp16/bf16 input");
+            }
+
+            fastllm::Data typed(inputType, {batch, in},
+                                ToFloatVector(MakeTensor({batch, in}, 0.271f, 0.35f)));
+            fastllm::Data normalized;
+            fastllm::ToDataType(typed, normalized, fastllm::DataType::FLOAT32);
+            normalized.ToDevice(fastllm::DataDevice::CPU);
+            inputValues = ToFloatVector(normalized);
+
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::NVFP4_BLOCK_16, 1, in);
+            weightBytes.resize((size_t)out * rowBytes);
+            for (int row = 0; row < out; ++row) {
+                for (int group = 0; group < in / 16; ++group) {
+                    uint8_t *block = weightBytes.data() + (size_t)row * rowBytes +
+                                     (size_t)group * (8 + sizeof(float));
+                    for (int pair = 0; pair < 8; ++pair) {
+                        // Valid E2M1 encodings.  Avoid signed zero.
+                        uint8_t low = uint8_t(1 + (row * 3 + group + pair * 5) % 7);
+                        uint8_t high = uint8_t(1 + (row + group * 3 + pair * 2) % 7);
+                        if ((row + group + pair) & 1) low |= 8;
+                        if ((row + group + pair * 2) & 2) high |= 8;
+                        block[pair] = uint8_t(low | (high << 4));
+                    }
+                    float scale = 0.00390625f * float(1 + ((row * 7 + group * 3) % 8));
+                    std::memcpy(block + 8, &scale, sizeof(scale));
+                }
+            }
+        }
+
+        fastllm::Data MakeInput() const {
+            return fastllm::Data(inputType, {batch, in}, inputValues);
+        }
+
+        void MakeWeight(fastllm::Data &weight) const {
+            weight.dataType = fastllm::DataType::NVFP4_BLOCK_16;
+            weight.blockM = 16;
+            weight.blockK = 1;
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.UpdateUnitSize();
+            weight.Resize({out, in});
+            weight.Allocate(true);
+            std::memcpy(weight.cpuData, weightBytes.data(), weightBytes.size());
+        }
+
+        fastllm::Data Reference() const {
+            static const float e2m1[16] = {
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::NVFP4_BLOCK_16, 1, in);
+            std::vector<float> result((size_t)batch * out, 0.0f);
+            for (int token = 0; token < batch; ++token) {
+                for (int row = 0; row < out; ++row) {
+                    float sum = 0.0f;
+                    for (int col = 0; col < in; ++col) {
+                        const uint8_t *block = weightBytes.data() + (size_t)row * rowBytes +
+                                               (size_t)(col / 16) * (8 + sizeof(float));
+                        float scale;
+                        std::memcpy(&scale, block + 8, sizeof(scale));
+                        uint8_t packed = block[(col % 16) / 2];
+                        uint8_t q = uint8_t((packed >> ((col & 1) * 4)) & 0xf);
+                        sum += inputValues[(size_t)token * in + col] * e2m1[q] * scale;
+                    }
+                    result[(size_t)token * out + row] = sum;
+                }
+            }
+            return fastllm::Data(fastllm::DataType::FLOAT32, {batch, out}, result);
+        }
+
+        fastllm::Data RunCuda() const {
+            fastllm::Data input = MakeInput(), weight, bias, output;
+            MakeWeight(weight);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Linear(input, weight, bias, output);
+            return ConvertToFloat32Data(output);
+        }
+    };
+
+    static OpCase MakeLinearNvfp4Case() {
+        OpCase result{
+            "linear_nvfp4",
+            "NVFP4 dense: native W4A4 on SM100+, Marlin W4A16 on SM75-SM99",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "32", "rows; W4A4 default threshold is 32, Marlin requires >=2");
+                params.Add("in", "1024", "input features, multiple of 32 (Marlin: 64)");
+                params.Add("out", "1024", "output features, multiple of 32 (Marlin: 64)");
+                params.Add("input_type", "fp16", "fp16 or bf16; Marlin accepts fp16 only");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+#ifdef USE_CUDA
+                if (device.rfind("cuda:", 0) != 0) return false;
+                LinearNvfp4Fixture fixture(params);
+                int arch = FastllmCudaRuntimeArch();
+#ifdef FASTLLM_ENABLE_CUTLASS_NVFP4
+                if (arch == 100 || (arch >= 120 && arch < 130)) return true;
+#endif
+                return arch >= 75 && arch < 100 && fixture.inputType == fastllm::DataType::FLOAT16 &&
+                       fixture.batch >= 2 && fixture.in % 64 == 0 && fixture.out % 64 == 0;
+#else
+                (void)params; (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) {
+#ifdef USE_CUDA
+                ScopedFirstDevice guard(device);
+                return LinearNvfp4Fixture(params).RunCuda();
+#else
+                (void)params; (void)device;
+                throw std::runtime_error("linear_nvfp4 requires CUDA");
+#endif
+            },
+            [](const OpTestParams &params) {
+                int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
+                return (double)batch * in * 2.0 +
+                       (double)fastllm::GetDataBytes(fastllm::DataType::NVFP4_BLOCK_16, out, in) +
+                       (double)batch * out * 2.0;
+            },
+            [](const OpTestParams &params) {
+                return 2.0 * params.GetInt("batch") * params.GetInt("in") * params.GetInt("out");
+            }};
+        result.runReference = [](const OpTestParams &params, const std::string&) {
+            return LinearNvfp4Fixture(params).Reference();
+        };
+        return result;
+    }
+
     static OpCase MakeLinearCase() {
         return {
             "linear",
@@ -2951,6 +3251,7 @@ namespace {
         int experts = 82;
         int block = 128;
         std::string path = "operator";
+        std::string weightType = "fp8";
         fastllm::Data input, index, score, output;
         fastllm::Data w1, w2, w3, curInput, curOutput;
         fastllm::Data referenceW1, referenceOutput;
@@ -2979,6 +3280,34 @@ namespace {
             weight.ToDevice(fastllm::DataDevice::CUDA);
         }
 
+        static void InitNvfp4Weight(fastllm::Data &weight, int rows, int cols, int seed) {
+            weight.dataType = fastllm::DataType::NVFP4_BLOCK_16;
+            weight.blockM = 16;
+            weight.blockK = 1;
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.UpdateUnitSize();
+            weight.Resize({rows, cols});
+            weight.Allocate(false);
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::NVFP4_BLOCK_16, 1, cols);
+            for (int row = 0; row < rows; ++row) {
+                for (int group = 0; group < cols / 16; ++group) {
+                    uint8_t *dst = weight.cpuData + (size_t)row * rowBytes +
+                                   (size_t)group * (8 + sizeof(float));
+                    for (int pair = 0; pair < 8; ++pair) {
+                        uint8_t low = uint8_t(1 + (row + group * 3 + pair + seed) % 7);
+                        uint8_t high = uint8_t(1 + (row * 3 + group + pair * 5 + seed) % 7);
+                        if ((row + pair + seed) & 1) low |= 8;
+                        if ((group + pair + seed) & 1) high |= 8;
+                        dst[pair] = uint8_t(low | (high << 4));
+                    }
+                    float scale = 0.001953125f * float(1 + ((row + group + seed) % 8));
+                    std::memcpy(dst + 8, &scale, sizeof(scale));
+                }
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
         void Init(const OpTestParams &params) {
 #ifdef USE_CUDA
             batch = params.GetInt("batch");
@@ -2988,6 +3317,7 @@ namespace {
             experts = params.GetInt("experts");
             block = params.GetInt("block");
             path = params.GetString("path");
+            weightType = params.GetString("weight_type");
             FastllmCudaSetDevice(0);
 
             fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
@@ -3028,8 +3358,15 @@ namespace {
                 int idx = (e + 1) * 2;
                 ownedWeights[idx] = std::make_unique<fastllm::Data>();
                 ownedWeights[idx + 1] = std::make_unique<fastllm::Data>();
-                InitFp8Weight(*ownedWeights[idx], inter * 2, hidden, block, (float)e + 0.3f);
-                InitFp8Weight(*ownedWeights[idx + 1], hidden, inter, block, (float)e + 13.7f);
+                if (weightType == "nvfp4") {
+                    InitNvfp4Weight(*ownedWeights[idx], inter * 2, hidden, e + 3);
+                    InitNvfp4Weight(*ownedWeights[idx + 1], hidden, inter, e + 17);
+                } else if (weightType == "fp8") {
+                    InitFp8Weight(*ownedWeights[idx], inter * 2, hidden, block, (float)e + 0.3f);
+                    InitFp8Weight(*ownedWeights[idx + 1], hidden, inter, block, (float)e + 13.7f);
+                } else {
+                    throw std::runtime_error("weight_type must be fp8 or nvfp4");
+                }
                 weights[idx] = ownedWeights[idx].get();
                 weights[idx + 1] = ownedWeights[idx + 1].get();
             }
@@ -3070,7 +3407,7 @@ namespace {
 
         void CheckWarpSpecialization() {
 #ifdef USE_CUDA
-            if (batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
+            if (weightType != "fp8" || batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
                 return;
             }
             if (!RunIndexed(referenceW1, referenceOutput, false)) {
@@ -3102,6 +3439,26 @@ namespace {
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
                                   0.0f, output, 0, fastllm::MoeGateSwiglu);
+            } else if (path == "check_nvfp4") {
+                if (weightType != "nvfp4") {
+                    throw std::runtime_error("check_nvfp4 requires weight_type=nvfp4");
+                }
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  0.0f, referenceOutput, 0, fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  0.0f, output, 0, fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                if (!stats.passed) {
+                    throw std::runtime_error("grouped NVFP4 W4A4 differs from W4A16 reference");
+                }
             } else if (path == "legacy") {
                 if (!RunIndexed(w1, output, false)) {
                     throw std::runtime_error("legacy MergeMOE FP8 launch failed");
@@ -3111,7 +3468,7 @@ namespace {
                     throw std::runtime_error("warp MergeMOE FP8 launch failed");
                 }
             } else {
-                throw std::runtime_error("path must be operator, legacy or warp");
+                throw std::runtime_error("path must be operator, check_nvfp4, legacy or warp");
             }
         }
     };
@@ -3162,7 +3519,7 @@ namespace {
     static OpCase MakeMergeMoeFp8Case() {
         return {
             "mergemoe_fp8",
-            "benchmark-only Qwen3-style FP8 block-scaled MergeMOE",
+            "benchmark/check Qwen3-style FP8 or NVFP4 grouped MergeMOE",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "token batch size");
@@ -3172,11 +3529,19 @@ namespace {
                 params.Add("topk", "8", "experts per token");
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("path", "operator", "operator, legacy or warp");
+                params.Add("path", "operator", "operator, check_nvfp4, legacy or warp");
+                params.Add("weight_type", "fp8", "fp8 or nvfp4");
                 return params;
             },
-            [](const OpTestParams&, const std::string &device) {
-                return device.rfind("cuda", 0) == 0;
+            [](const OpTestParams &params, const std::string &device) {
+                if (device.rfind("cuda", 0) != 0) return false;
+#ifdef USE_CUDA
+                if (params.GetString("weight_type") == "nvfp4") {
+                    int arch = FastllmCudaRuntimeArch();
+                    return arch == 100;
+                }
+#endif
+                return true;
             },
             [](const OpTestParams&, const std::string&) {
                 fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
@@ -3802,6 +4167,8 @@ namespace {
             MakeLayerNormCase(),
             MakeRmsNormCase(),
             MakeW4A8ActivationQuantCase(),
+            MakeNvfp4SwiGLUQuantCase(),
+            MakeLinearNvfp4Case(),
             MakeLinearCase(),
             MakeMergeMoeW4A8Case(),
             MakeSiluCase(),
