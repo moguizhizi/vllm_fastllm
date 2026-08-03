@@ -257,13 +257,29 @@ if (USE_CUDA)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
     set(FASTLLM_CUDA_ARCHITECTURES ${CUDA_ARCH})
-    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
         set(FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "")
         foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
-            if (FASTLLM_CUDA_ARCH STREQUAL "120")
-                list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "120f")
-            elseif (FASTLLM_CUDA_ARCH STREQUAL "121")
-                list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "121f")
+            if (FASTLLM_CUDA_ARCH STREQUAL "100")
+                if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "100f")
+                else()
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "100a")
+                endif()
+            elseif (FASTLLM_CUDA_ARCH STREQUAL "120" AND
+                    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+                if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "120f")
+                else()
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "120a")
+                endif()
+            elseif (FASTLLM_CUDA_ARCH STREQUAL "121" AND
+                    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+                if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "121f")
+                else()
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "121a")
+                endif()
             else()
                 list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "${FASTLLM_CUDA_ARCH}")
             endif()
@@ -285,12 +301,13 @@ if (USE_CUDA)
     set(FASTLLM_CUTLASS_FP8_SM120_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM121_ENABLED OFF)
     foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
-        if (FASTLLM_CUDA_ARCH STREQUAL "120f" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
+        if (FASTLLM_CUDA_ARCH STREQUAL "120a" OR FASTLLM_CUDA_ARCH STREQUAL "121a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "120f" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
             set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
         endif()
-        if (FASTLLM_CUDA_ARCH STREQUAL "120f")
+        if (FASTLLM_CUDA_ARCH STREQUAL "120a" OR FASTLLM_CUDA_ARCH STREQUAL "120f")
             set(FASTLLM_CUTLASS_FP8_SM120_ENABLED ON)
-        elseif (FASTLLM_CUDA_ARCH STREQUAL "121f")
+        elseif (FASTLLM_CUDA_ARCH STREQUAL "121a" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
             set(FASTLLM_CUTLASS_FP8_SM121_ENABLED ON)
         endif()
     endforeach()
@@ -310,6 +327,47 @@ if (USE_CUDA)
         endif()
     else()
         message(STATUS "CUTLASS FP8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
+    endif()
+
+    # Native NVFP4 W4A4 uses block-scaled Tensor Core instructions.  Keep the
+    # feature tied to the exact accelerated architecture variants that CUTLASS
+    # requires; a plain PTX-compatible target is not sufficient.
+    set(FASTLLM_CUTLASS_NVFP4_SM100_ENABLED OFF)
+    set(FASTLLM_CUTLASS_NVFP4_SM120_ENABLED OFF)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if (FASTLLM_CUDA_ARCH STREQUAL "100a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "100f" OR
+            FASTLLM_CUDA_ARCH STREQUAL "10.0a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "10.0f")
+            set(FASTLLM_CUTLASS_NVFP4_SM100_ENABLED ON)
+        elseif(FASTLLM_CUDA_ARCH STREQUAL "120a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "121a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "120f" OR
+               FASTLLM_CUDA_ARCH STREQUAL "121f" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.0a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.1a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.0f" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.1f")
+            set(FASTLLM_CUTLASS_NVFP4_SM120_ENABLED ON)
+        endif()
+    endforeach()
+    set(FASTLLM_CUTLASS_NVFP4_ENABLED OFF)
+    if (EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9 AND
+        (FASTLLM_CUTLASS_NVFP4_SM100_ENABLED OR FASTLLM_CUTLASS_NVFP4_SM120_ENABLED))
+        set(FASTLLM_CUTLASS_NVFP4_ENABLED ON)
+        include_directories("${FASTLLM_CUTLASS_DIR}/include")
+        include_directories(src/devices/cuda/fp4)
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_NVFP4)
+        if (FASTLLM_CUTLASS_NVFP4_SM100_ENABLED)
+            add_compile_definitions(FASTLLM_ENABLE_CUTLASS_NVFP4_SM100)
+        endif()
+        if (FASTLLM_CUTLASS_NVFP4_SM120_ENABLED)
+            add_compile_definitions(FASTLLM_ENABLE_CUTLASS_NVFP4_SM120)
+        endif()
+        message(STATUS "CUTLASS NVFP4 W4A4 kernels: ON")
+    else()
+        message(STATUS "CUTLASS NVFP4 W4A4 kernels: OFF")
     endif()
 
     set(FASTLLM_CUTLASS_W4A8_ARCH_ENABLED OFF)
@@ -349,6 +407,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
+        src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
@@ -365,6 +424,17 @@ if (USE_CUDA)
             src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
             src/devices/cuda/linear/fastllm-w4a8-utils.cu
             src/devices/cuda/moe/fastllm-moe-w4a8-cutlass.cu
+        )
+    endif()
+
+    if(FASTLLM_CUTLASS_NVFP4_ENABLED)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/fp4/fastllm-nvfp4-quant.cu
+            src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass.cu
+            src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass-sm100.cu
+            src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass-sm120.cu
+            src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass-sm100.cu
+            src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass.cu
         )
     endif()
 

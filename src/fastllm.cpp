@@ -2179,6 +2179,8 @@ namespace fastllm {
 
     Data::~Data() {
 #ifdef USE_CUDA
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }

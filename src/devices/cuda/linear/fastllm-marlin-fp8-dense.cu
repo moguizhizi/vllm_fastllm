@@ -119,6 +119,41 @@ static KernelFn PickKernel(int sizeM, int threadK, int threadN, int groupBlocks,
 }
 #undef RET_K
 
+// NVFP4 Marlin uses E2M1 weights with E4M3 group-16 scales.  It shares the
+// same vLLM Marlin body, but must instantiate a different weight/scale type.
+#define RET_FP4(THREADS, TM, TN, TK, M8)                                      \
+    return MARLIN_NAMESPACE_NAME::Marlin<                                     \
+        vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(),        \
+        vllm::kFE4M3fn.id(), (THREADS), (TM), (TN), (TK), (M8), 2, 1, false>
+
+static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
+                              bool m8, int &threads) {
+    threads = 0;
+    const int tm = (m8 || sizeM <= 8) ? 1 : std::min(4, (sizeM + 15) / 16);
+    if (m8 || sizeM <= 8) {
+        if (threadK == 128 && threadN == 128) { threads = 256; RET_FP4(256, 1, 8, 8, true); }
+        if (threadK == 64 && threadN == 128) { threads = 128; RET_FP4(128, 1, 8, 4, true); }
+        if (threadK == 128 && threadN == 64) { threads = 128; RET_FP4(128, 1, 4, 8, true); }
+        return nullptr;
+    }
+#define RET_FP4_TM(THREADS_, TN_, TK_) do {                                  \
+    threads = (THREADS_);                                                     \
+    if (tm == 1) RET_FP4((THREADS_), 1, (TN_), (TK_), false);                 \
+    if (tm == 2) RET_FP4((THREADS_), 2, (TN_), (TK_), false);                 \
+    if (tm == 3) RET_FP4((THREADS_), 3, (TN_), (TK_), false);                 \
+    if (tm == 4) RET_FP4((THREADS_), 4, (TN_), (TK_), false);                 \
+} while (0)
+    if (threadK == 64 && threadN == 256) RET_FP4_TM(256, 16, 4);
+    if (threadK == 64 && threadN == 128) RET_FP4_TM(128, 8, 4);
+    if (threadK == 128 && threadN == 64) RET_FP4_TM(128, 4, 8);
+    if (threadK == 128 && threadN == 128 && tm == 1) {
+        threads = 256; RET_FP4(256, 1, 8, 8, false);
+    }
+#undef RET_FP4_TM
+    return nullptr;
+}
+#undef RET_FP4
+
 static bool SelectTile(int sizeM, int sizeN, int sizeK, int &threadK, int &threadN) {
     static const int smallM[][2] = {{64, 128}, {128, 64}, {128, 128}};
     static const int largeM[][2] = {{64, 128}, {128, 64}, {64, 256}, {128, 128}};
@@ -160,6 +195,15 @@ static bool PrepareKernels(int device) {
                             maxShared) != cudaSuccess) {
                         ok = false;
                         break;
+                    }
+                }
+                if (ok) {
+                    int threads = 0;
+                    KernelFn fp4 = PickFp4Kernel(m, t[0], t[1], m <= 8, threads);
+                    if (fp4 != nullptr && cudaFuncSetAttribute(
+                            fp4, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            maxShared) != cudaSuccess) {
+                        ok = false;
                     }
                 }
                 if (!ok) break;
@@ -272,6 +316,51 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
             /*use_fp32_reduce=*/true, maxShared);
         if (cudaPeekAtLastError() != cudaSuccess) return false;
 
+        row += chunkM;
+        remaining -= chunkM;
+    }
+    return true;
+}
+
+extern "C" bool FastllmCudaMarlinHalfNVFP4Gemm(
+        const void *a, const uint32_t *b_q_weight, const void *b_scales,
+        const float *global_scale,
+        void *c, int size_m, int size_n, int size_k, int *workspace) {
+    if (!DeviceOk() || size_m <= 0 || size_n <= 0 || size_k <= 0 ||
+        global_scale == nullptr || size_n % 64 != 0 || size_k % 64 != 0 ||
+        size_k % 16 != 0) return false;
+    int dev = 0, sms = 0, maxShared = 0;
+    cudaGetDevice(&dev);
+    if (!EnsureKernels(dev)) return false;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (sms <= 0 || maxShared <= 0) return false;
+    int maxMBlock = size_m <= 8 ? 8 : std::min(64, ((size_m + 15) / 16) * 16);
+    if (!EnsureCTmp(dev, (size_t)sms * maxMBlock * 256)) return false;
+
+    int row = 0;
+    int remaining = size_m;
+    const int maxParallel = size_n <= 4096 ? 128 : 16;
+    while (remaining > 0) {
+        int chunkM = remaining;
+        if (remaining >= 64) chunkM = std::min(remaining / 64, maxParallel) * 64;
+        int threadK = 0, threadN = 0;
+        if (!SelectTile(chunkM, size_n, size_k, threadK, threadN)) return false;
+        int threads = 0;
+        KernelFn kernel = PickFp4Kernel(chunkM, threadK, threadN, chunkM <= 8, threads);
+        if (kernel == nullptr) return false;
+        const half *chunkA = reinterpret_cast<const half *>(a) + (size_t)row * size_k;
+        half *chunkC = reinterpret_cast<half *>(c) + (size_t)row * size_n;
+        kernel<<<sms, threads, maxShared, cudaStreamPerThread>>>(
+            reinterpret_cast<const int4 *>(chunkA),
+            reinterpret_cast<const int4 *>(b_q_weight),
+            reinterpret_cast<int4 *>(chunkC),
+            reinterpret_cast<int4 *>(GetCTmp(dev).ptr),
+            nullptr, nullptr, reinterpret_cast<const int4 *>(b_scales),
+            global_scale, nullptr, nullptr,
+            size_k / 16, chunkM, size_n, size_k, size_k, workspace,
+            false, false, true, maxShared);
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
         row += chunkM;
         remaining -= chunkM;
     }

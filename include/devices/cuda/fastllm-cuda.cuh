@@ -238,6 +238,16 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
+bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a, const uint32_t *b_q_weight,
+                                    const void *b_scales,
+                                    const float *global_scale, void *c,
+                                    int size_m, int size_n, int size_k,
+                                    int *workspace);
+bool FastllmCudaTryMarlinHalfMatMulNVFP4(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
+void FastllmCudaReleaseNvfp4MarlinCache(const fastllm::Data *weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
                                                 fastllm::Data &weight,
                                                 const fastllm::Data &bias,
@@ -554,6 +564,61 @@ bool FastllmCudaPermuteTo(const fastllm::Data &input, fastllm::Data &output,
 bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
                            const fastllm::Data &bias, fastllm::Data &output,
                            int numTokens, int inChannels, int outChannels);
+#ifdef FASTLLM_ENABLE_CUTLASS_NVFP4
+size_t FastllmCudaNvfp4SwizzledScaleBytes(int rows, int columns);
+bool FastllmCudaNvfp4QuantizeActivation(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int columns, float globalScale, void *streamPtr = nullptr);
+bool FastllmCudaSiluMulNvfp4Quantize(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int hidden, float globalScale, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4Block16ToCutlass(
+    const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
+    int rows, int columns, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4CutlassGemmSm100(
+    const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
+    const uint8_t *scaleB, const float *alpha, void *d,
+    fastllm::DataType outputType, int m, int n, int k, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4CutlassGemmSm120(
+    const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
+    const uint8_t *scaleB, const float *alpha, void *d,
+    fastllm::DataType outputType, int m, int n, int k, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4GroupedGemmSm100(
+    const uint8_t *const *a, const uint8_t *const *b,
+    const uint8_t *const *scaleA, const uint8_t *const *scaleB,
+    const float *const *alpha, void *const *d, const int *rows,
+    int groups, int n, int k, fastllm::DataType outputType,
+    void *streamPtr = nullptr);
+bool FastllmCudaPrepareNvfp4W4A4Weight(
+    fastllm::Data &weight, int inFeatures, int outFeatures,
+    const uint8_t **packedWeight, const uint8_t **scales,
+    const float **alpha);
+bool TryCudaCutlassNvfp4W4A4(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
+void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight);
+bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
+    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
+    fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const int *routeRows, const float *routeScales,
+    const int *routePositions, const int *expertStarts,
+    const int *expertCounts, int batch, int topk, int totalTasks,
+    int hidden, int inter);
+#else
+inline bool TryCudaCutlassNvfp4W4A4(
+    const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
+    fastllm::Data &, int, int, int) { return false; }
+inline void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *) {}
+inline bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
+    const fastllm::Data &, fastllm::Data &, fastllm::Data &,
+    fastllm::Data &, fastllm::Data **, int, const int *, const float *,
+    const int *, const int *, const int *, int, int, int, int, int) {
+    return false;
+}
+#endif
 #ifdef FASTLLM_ENABLE_CUTLASS_W4A8
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,

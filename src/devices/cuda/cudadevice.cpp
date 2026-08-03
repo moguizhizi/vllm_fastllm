@@ -3405,6 +3405,13 @@ namespace fastllm {
         if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) {
             return;
         }
+        if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, m, k)) {
+            return;
+        }
+        if (FastllmCudaTryMarlinHalfMatMulNVFP4(
+                input, weight, bias, output, n, m, k)) {
+            return;
+        }
         if (weight.dataType == DataType::INT4_W4A8) {
             int runtimeArch = FastllmCudaRuntimeArch();
             if (runtimeArch != 90) {
@@ -6186,6 +6193,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 routeScales[pos] = scoreData[b * topk + j];
                 routePositions[b * topk + j] = pos;
             }
+        }
+        if (isNVFP4 && FastllmCudaMergeMoeNvfp4W4A4Grouped(
+                input, w1, w2, output, weights, weightsBatch,
+                routeRows.data(), routeScales.data(), routePositions.data(),
+                expertStarts.data(), expertCounts.data(), batch, topk,
+                totalTasks, hidden, inter)) {
+            return true;
         }
         if (input.dataType == DataType::FLOAT16) {
             bool ok = isFp8 ? FastllmCudaHalfMergeMOEFP8E4M3GroupedIndexed(
