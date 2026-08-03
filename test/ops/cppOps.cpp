@@ -2781,6 +2781,22 @@ namespace {
             }
         }
 
+        static void InitPerChannelWeight(fastllm::Data &weight, int out, int in, float seed) {
+            weight.dataType = fastllm::DataType::FP8_E4M3;
+            weight.UpdateUnitSize();
+            weight.Resize({out, in});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.blockK = 1;
+            weight.blockM = in;
+            weight.Allocate(false);
+            uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
+            for (uint64_t i = 0; i < weight.GetBytes(); i++)
+                ptr[i] = static_cast<uint8_t>(0x20 + ((i + (uint64_t)(seed * 11.0f)) & 0x1f));
+            weight.scales.resize(out);
+            for (int i = 0; i < out; ++i)
+                weight.scales[i] = 0.015f + 0.0001f * (float)((i + (int)seed) % 11);
+        }
+
         static void MakeBlockyInput(fastllm::Data &input, int batch, int in, int block) {
             float *ptr = reinterpret_cast<float*>(input.cpuData);
             int groups = (in + block - 1) / block;
@@ -2823,8 +2839,10 @@ namespace {
                 InitPackedWeight(weight, out, in, block, 0.7f);
             } else if (weightLayout == "separate") {
                 InitSeparateScaleWeight(weight, out, in, block, 0.7f);
+            } else if (weightLayout == "perchannel") {
+                InitPerChannelWeight(weight, out, in, 0.7f);
             } else {
-                throw std::runtime_error("weight_layout must be packed or separate");
+                throw std::runtime_error("weight_layout must be packed, separate or perchannel");
             }
             weight.ToDevice(fastllm::DataDevice::CUDA);
 
@@ -2974,6 +2992,34 @@ namespace {
             ref32.Print("linear_fp8_check.ref.float32");
             cutlass32.Print("linear_fp8_check.cutlass.float32");
         }
+    }
+
+    static void CheckLinearFp8StandardSm120Cuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "perchannel")
+            throw std::runtime_error("SM120 standard FP8 check requires weight_layout=perchannel");
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+        fastllm::Data reference = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
+        fastllm::Data actual = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
+        bool ok = state->input.dataType == fastllm::DataType::FLOAT16
+            ? FastllmCudaHalfMatMulFloatFP8E4M3(state->input, state->weight, state->bias,
+                                                reference, state->batch, state->in, state->out)
+            : FastllmCudaBFloat16MatMulFP8E4M3(state->input, state->weight, state->bias,
+                                                reference, state->batch, state->in, state->out);
+        if (!ok) throw std::runtime_error("standard FP8 reference failed");
+        ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
+            state->input, state->weight, state->bias, actual,
+            state->batch, state->in, state->out);
+        if (!ok) throw std::runtime_error("SM120 standard FP8 CUTLASS path failed");
+        ForceDeviceSync();
+        fastllm::Data reference32 = ConvertToFloat32Data(reference);
+        fastllm::Data actual32 = ConvertToFloat32Data(actual);
+        PrintLinearFp8Block128CheckStats(
+            ToFloatVector(reference32), ToFloatVector(actual32),
+            state->batch, state->out);
+        ComparisonStats stats = CompareData(reference32, actual32, 0.5f, 0.1f);
+        if (!stats.passed)
+            throw std::runtime_error("SM120 standard FP8 W8A8 output mismatch");
     }
 
     static void CheckLinearFp8MarlinCuda(const OpTestParams &params) {
@@ -3156,6 +3202,9 @@ namespace {
         } else if (params.GetInt("check") == 3) {
             CheckLinearFp8MarlinCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 4) {
+            CheckLinearFp8StandardSm120Cuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -3226,10 +3275,10 @@ namespace {
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "bf16", "fp16 or bf16");
                 params.Add("input_pattern", "blocky", "smooth or blocky");
-                params.Add("weight_layout", "packed", "packed or separate");
+                params.Add("weight_layout", "packed", "packed, separate or perchannel");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
                 params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
-                params.Add("check", "0", "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail check");
+                params.Add("check", "0", "1 blockwise, 2 fused swiglu, 3 Marlin, 4 SM120 standard FP8");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },
@@ -3256,6 +3305,120 @@ namespace {
         };
     }
 
+    struct LinearInt8W8A8State {
+        int batch, in, out;
+        fastllm::Data input, weight, bias, output;
+        void Init(const OpTestParams &params) {
+#ifdef USE_CUDA
+            batch = params.GetInt("batch"); in = params.GetInt("in"); out = params.GetInt("out");
+            fastllm::Data fp32 = MakeTensor({batch, in}, 0.23f, 0.2f);
+            input.CopyFrom(fp32);
+            fastllm::ToDataType(input, params.GetString("input_type") == "fp16"
+                ? fastllm::DataType::FLOAT16 : fastllm::DataType::BFLOAT16);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            weight.dataType = fastllm::DataType::INT8_W8A8;
+            weight.UpdateUnitSize(); weight.Resize({out, in}); weight.Allocate(false);
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.perChannelAxis = 0; weight.scales.resize(out);
+            int8_t *q = (int8_t*)weight.cpuData;
+            for (int row = 0; row < out; ++row) {
+                float scale = 0.0025f + 0.00001f * (row % 31);
+                weight.scales[row] = scale;
+                for (int col = 0; col < in; ++col)
+                    q[(size_t)row * in + col] = (int8_t)(((row * 17 + col * 13) % 255) - 127);
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+            if (params.GetInt("has_bias")) {
+                bias = MakeRampTensor({out}, -0.1f);
+                bias.ToDevice(fastllm::DataDevice::CUDA);
+            }
+            output.dataType = input.dataType; output.UpdateUnitSize();
+            output.Resize({batch, out}); output.Allocate(false);
+            output.ToDevice(fastllm::DataDevice::CUDA, false);
+#else
+            (void)params;
+#endif
+        }
+        void Run() {
+            if (!FastllmCudaCutlassLinearInt8W8A8Sm90(
+                    input, weight, bias, output, batch, in, out))
+                throw std::runtime_error("SM90 INT8 W8A8 path rejected the test case");
+        }
+        void Check() {
+            Run(); ForceDeviceSync();
+            std::vector<float> x = ToFloatVector(ConvertToFloat32Data(input));
+            std::vector<float> y = ToFloatVector(ConvertToFloat32Data(output));
+            const int8_t *q = (const int8_t*)weight.cpuData;
+            const float *b = bias.dims.empty() ? nullptr : (const float*)bias.cpuData;
+            float maxDiff = 0.0f;
+            for (int r = 0; r < batch; ++r) {
+                float maxInput = 0.0f;
+                for (int p = 0; p < in; ++p)
+                    maxInput = std::max(maxInput, std::fabs(x[(size_t)r * in + p]));
+                float tokenScale = maxInput == 0.0f ? 1.0f : maxInput / 127.0f;
+                for (int c = 0; c < out; ++c) {
+                    int32_t dot = 0;
+                    for (int p = 0; p < in; ++p) {
+                        int value = (int)std::nearbyint(x[(size_t)r * in + p] / tokenScale);
+                        value = std::max(-127, std::min(127, value));
+                        dot += value * (int)q[(size_t)c * in + p];
+                    }
+                    float ref = (float)dot * tokenScale * weight.scales[c] +
+                                (b ? b[c] : 0.0f);
+                    maxDiff = std::max(maxDiff, std::fabs(ref - y[(size_t)r * out + c]));
+                }
+            }
+            std::cout << "linear_int8_w8a8 check max_abs_diff=" << maxDiff << "\n";
+            if (!std::isfinite(maxDiff) || maxDiff > 0.75f)
+                throw std::runtime_error("SM90 INT8 W8A8 output mismatch");
+        }
+    };
+
+    static BenchmarkResult BenchmarkLinearInt8W8A8(
+        const OpTestParams &params, const std::string &device, int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        LinearInt8W8A8State state; state.Init(params);
+        if (params.GetInt("check")) { state.Check(); return {}; }
+        for (int i = 0; i < warmup; ++i) state.Run();
+        ForceDeviceSync(); auto begin = Clock::now();
+        for (int i = 0; i < iters; ++i) state.Run();
+        ForceDeviceSync(); auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() / std::max(iters, 1);
+        result.bytesMoved = (double)state.batch * state.in * 2 +
+            (double)state.out * state.in + state.out * sizeof(float) +
+            (double)state.batch * state.out * 2;
+        result.flops = 2.0 * state.batch * state.in * state.out;
+        double seconds = result.avgMs / 1000.0;
+        if (seconds > 0) result.computeTFlops = result.flops / seconds / 1e12;
+        return result;
+#else
+        (void)params; (void)device; (void)warmup; (void)iters;
+        throw std::runtime_error("linear_int8_w8a8 requires CUDA");
+#endif
+    }
+
+    static OpCase MakeLinearInt8W8A8Case() {
+        return {"linear_int8_w8a8", "SM90 symmetric INT8 W8A8 dense",
+            [](){ OpTestParams p; p.Add("batch","16","rows"); p.Add("in","4096","K");
+                  p.Add("out","4096","N"); p.Add("input_type","bf16","fp16 or bf16");
+                  p.Add("has_bias","1","FP32 bias"); p.Add("check","0","1 functional check"); return p; },
+            [](const OpTestParams&, const std::string &device) {
+#ifdef USE_CUDA
+                if (device.rfind("cuda",0) != 0) return false;
+                ScopedFirstDevice guard(device); return FastllmCudaRuntimeArch() == 90;
+#else
+                return false;
+#endif
+            },
+            [](const OpTestParams&, const std::string&) { fastllm::Data x(fastllm::DataType::FLOAT32,{1}); x.Allocate(0.0f); return x; },
+            BenchmarkLinearInt8W8A8,
+            [](const OpTestParams &p) { return (double)p.GetInt("batch")*p.GetInt("in")*2 +
+                (double)p.GetInt("out")*p.GetInt("in") + (double)p.GetInt("batch")*p.GetInt("out")*2; },
+            [](const OpTestParams &p) { return 2.0*p.GetInt("batch")*p.GetInt("in")*p.GetInt("out"); }, true};
+    }
+
     struct MergeMoeFp8BenchState {
         int batch = 1;
         int topk = 8;
@@ -3265,6 +3428,7 @@ namespace {
         int block = 128;
         std::string path = "operator";
         std::string weightType = "fp8";
+        std::string scaleLayout = "block128";
         fastllm::Data input, index, score, output;
         fastllm::Data w1, w2, w3, curInput, curOutput;
         fastllm::Data referenceW1, referenceOutput;
@@ -3290,6 +3454,24 @@ namespace {
             for (size_t i = 0; i < weight.scales.size(); i++) {
                 weight.scales[i] = 0.015f + 0.0001f * (float)((i + (int)seed) % 7);
             }
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        static void InitFp8PerChannelWeight(fastllm::Data &weight, int rows,
+                                             int cols, float seed) {
+            weight.dataType = fastllm::DataType::FP8_E4M3;
+            weight.UpdateUnitSize();
+            weight.Resize({rows, cols});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.blockK = 1;
+            weight.blockM = cols;
+            weight.Allocate(false);
+            uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
+            for (uint64_t i = 0; i < weight.GetBytes(); i++)
+                ptr[i] = static_cast<uint8_t>(0x20 + ((i + (uint64_t)(seed * 17.0f)) & 0x1f));
+            weight.scales.resize(rows);
+            for (int i = 0; i < rows; ++i)
+                weight.scales[i] = 0.015f + 0.0001f * (float)((i + (int)seed) % 7);
             weight.ToDevice(fastllm::DataDevice::CUDA);
         }
 
@@ -3331,6 +3513,7 @@ namespace {
             block = params.GetInt("block");
             path = params.GetString("path");
             weightType = params.GetString("weight_type");
+            scaleLayout = params.GetString("scale_layout");
             FastllmCudaSetDevice(0);
 
             fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
@@ -3375,8 +3558,15 @@ namespace {
                     InitNvfp4Weight(*ownedWeights[idx], inter * 2, hidden, e + 3);
                     InitNvfp4Weight(*ownedWeights[idx + 1], hidden, inter, e + 17);
                 } else if (weightType == "fp8") {
-                    InitFp8Weight(*ownedWeights[idx], inter * 2, hidden, block, (float)e + 0.3f);
-                    InitFp8Weight(*ownedWeights[idx + 1], hidden, inter, block, (float)e + 13.7f);
+                    if (scaleLayout == "perchannel") {
+                        InitFp8PerChannelWeight(*ownedWeights[idx], inter * 2, hidden, (float)e + 0.3f);
+                        InitFp8PerChannelWeight(*ownedWeights[idx + 1], hidden, inter, (float)e + 13.7f);
+                    } else if (scaleLayout == "block128") {
+                        InitFp8Weight(*ownedWeights[idx], inter * 2, hidden, block, (float)e + 0.3f);
+                        InitFp8Weight(*ownedWeights[idx + 1], hidden, inter, block, (float)e + 13.7f);
+                    } else {
+                        throw std::runtime_error("scale_layout must be block128 or perchannel");
+                    }
                 } else {
                     throw std::runtime_error("weight_type must be fp8 or nvfp4");
                 }
@@ -3472,6 +3662,29 @@ namespace {
                 if (!stats.passed) {
                     throw std::runtime_error("grouped NVFP4 W4A4 differs from W4A16 reference");
                 }
+            } else if (path == "check_fp8") {
+                if (weightType != "fp8" || scaleLayout != "perchannel" ||
+                    input.dataType != fastllm::DataType::BFLOAT16) {
+                    throw std::runtime_error(
+                        "check_fp8 requires bf16 + fp8 + perchannel scales");
+                }
+                setenv("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", "0", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  0.0f, referenceOutput, 0, fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  0.0f, output, 0, fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "SM90 grouped FP8 CUTLASS differs from CUDA fallback");
+                }
             } else if (path == "legacy") {
                 if (!RunIndexed(w1, output, false)) {
                     throw std::runtime_error("legacy MergeMOE FP8 launch failed");
@@ -3481,7 +3694,8 @@ namespace {
                     throw std::runtime_error("warp MergeMOE FP8 launch failed");
                 }
             } else {
-                throw std::runtime_error("path must be operator, check_nvfp4, legacy or warp");
+                throw std::runtime_error(
+                    "path must be operator, check_fp8, check_nvfp4, legacy or warp");
             }
         }
     };
@@ -3542,8 +3756,9 @@ namespace {
                 params.Add("topk", "8", "experts per token");
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("path", "operator", "operator, check_nvfp4, legacy or warp");
+                params.Add("path", "operator", "operator, check_fp8, check_nvfp4, legacy or warp");
                 params.Add("weight_type", "fp8", "fp8 or nvfp4");
+                params.Add("scale_layout", "block128", "FP8 scale layout: block128 or perchannel");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
@@ -4192,6 +4407,7 @@ namespace {
             MakeRmsNormFp16SpecializedCase(),
             MakeRecurrentFromConvFp16Case(),
             MakeLinearFp8Block128Case(),
+            MakeLinearInt8W8A8Case(),
             MakeMergeMoeFp8Case(),
             MakeFusedMoeFp8Case(),
             MakeRouterLinearFp16Case(),
