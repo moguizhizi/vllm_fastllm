@@ -2084,21 +2084,24 @@ namespace {
 
     struct LinearNvfp4Fixture {
         int batch = 0, in = 0, out = 0;
+        bool useBias = false;
         fastllm::DataType inputType = fastllm::DataType::FLOAT16;
         std::vector<float> inputValues;
+        std::vector<float> biasValues;
         std::vector<uint8_t> weightBytes;
 
         explicit LinearNvfp4Fixture(const OpTestParams &params) {
             batch = params.GetInt("batch");
             in = params.GetInt("in");
             out = params.GetInt("out");
+            useBias = params.GetInt("bias") != 0;
             const std::string dtype = params.GetString("input_type");
             inputType = dtype == "bf16" ? fastllm::DataType::BFLOAT16
                                          : fastllm::DataType::FLOAT16;
-            if (batch <= 0 || in <= 0 || out <= 0 || in % 32 != 0 || out % 32 != 0 ||
+            if (batch <= 0 || in <= 0 || out <= 0 || in % 16 != 0 ||
                 (dtype != "fp16" && dtype != "bf16")) {
                 throw std::runtime_error(
-                    "linear_nvfp4 requires positive batch, 32-aligned in/out, and fp16/bf16 input");
+                    "linear_nvfp4 requires positive batch/out, 16-aligned in, and fp16/bf16 input");
             }
 
             fastllm::Data typed(inputType, {batch, in},
@@ -2107,6 +2110,8 @@ namespace {
             fastllm::ToDataType(typed, normalized, fastllm::DataType::FLOAT32);
             normalized.ToDevice(fastllm::DataDevice::CPU);
             inputValues = ToFloatVector(normalized);
+            biasValues.resize(out);
+            for (int i = 0; i < out; ++i) biasValues[i] = 0.001f * float((i % 17) - 8);
 
             const size_t rowBytes = fastllm::GetDataBytes(
                 fastllm::DataType::NVFP4_BLOCK_16, 1, in);
@@ -2144,6 +2149,12 @@ namespace {
             std::memcpy(weight.cpuData, weightBytes.data(), weightBytes.size());
         }
 
+        fastllm::Data MakeBias() const {
+            return useBias
+                ? fastllm::Data(fastllm::DataType::FLOAT32, {out}, biasValues)
+                : fastllm::Data();
+        }
+
         fastllm::Data Reference() const {
             static const float e2m1[16] = {
                 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -2163,14 +2174,15 @@ namespace {
                         uint8_t q = uint8_t((packed >> ((col & 1) * 4)) & 0xf);
                         sum += inputValues[(size_t)token * in + col] * e2m1[q] * scale;
                     }
-                    result[(size_t)token * out + row] = sum;
+                    result[(size_t)token * out + row] = sum +
+                        (useBias ? biasValues[row] : 0.0f);
                 }
             }
             return fastllm::Data(fastllm::DataType::FLOAT32, {batch, out}, result);
         }
 
         fastllm::Data RunCuda() const {
-            fastllm::Data input = MakeInput(), weight, bias, output;
+            fastllm::Data input = MakeInput(), weight, bias = MakeBias(), output;
             MakeWeight(weight);
             input.ToDevice(fastllm::DataDevice::CUDA);
             weight.ToDevice(fastllm::DataDevice::CUDA);
@@ -2185,9 +2197,10 @@ namespace {
             "NVFP4 dense: native W4A4 on SM100+, Marlin W4A16 on SM75-SM99",
             []() {
                 OpTestParams params;
-                params.Add("batch", "32", "rows; W4A4 default threshold is 32, Marlin requires >=2");
-                params.Add("in", "1024", "input features, multiple of 32 (Marlin: 64)");
-                params.Add("out", "1024", "output features, multiple of 32 (Marlin: 64)");
+                params.Add("batch", "1", "rows; W4A4 supports decode M=1, Marlin requires >=2");
+                params.Add("in", "1008", "input features, multiple of 16; CUTLASS pads to 32");
+                params.Add("out", "1000", "output features; CUTLASS pads to 32 and slices");
+                params.Add("bias", "1", "add FP32 bias after W4A4 GEMM");
                 params.Add("input_type", "fp16", "fp16 or bf16; Marlin accepts fp16 only");
                 return params;
             },
@@ -2197,7 +2210,7 @@ namespace {
                 LinearNvfp4Fixture fixture(params);
                 int arch = FastllmCudaRuntimeArch();
 #ifdef FASTLLM_ENABLE_CUTLASS_NVFP4
-                if (arch == 100 || (arch >= 120 && arch < 130)) return true;
+                if (arch >= 100 && arch < 130) return true;
 #endif
                 return arch >= 75 && arch < 100 && fixture.inputType == fastllm::DataType::FLOAT16 &&
                        fixture.batch >= 2 && fixture.in % 64 == 0 && fixture.out % 64 == 0;

@@ -7,6 +7,9 @@ suite=${1:-ops}
 model_path=${NVFP4_MODEL:-}
 gpu_profile=${NVFP4_GPU_PROFILE:-sm100}
 optest=${NVFP4_OPTEST:-"${repo_dir}/optest"}
+build_dir=${NVFP4_BUILD_DIR:-"${repo_dir}/build-nvfp4-${gpu_profile}"}
+build_jobs=${NVFP4_BUILD_JOBS:-$(nproc)}
+nvcc_path=${NVFP4_NVCC:-$(command -v nvcc || true)}
 mkdir -p "${log_dir}"
 
 run_logged() {
@@ -23,20 +26,40 @@ run_logged() {
     (cd "${repo_dir}" && "$@") 2>&1 | tee -a "${log_file}"
 }
 
-run_ops() {
+run_build() {
+    local cuda_arch
+    case "${gpu_profile}" in
+        sm100) cuda_arch=${NVFP4_CUDA_ARCH:-100} ;;
+        sm120) cuda_arch=${NVFP4_CUDA_ARCH:-120} ;;
+        preblackwell) cuda_arch=${NVFP4_CUDA_ARCH:-90} ;;
+        *) echo "unknown NVFP4_GPU_PROFILE=${gpu_profile}" >&2; exit 2 ;;
+    esac
+    if [[ -z "${nvcc_path}" ]]; then
+        echo "nvcc not found; set NVFP4_NVCC=/path/to/nvcc" >&2
+        exit 2
+    fi
+    run_logged environment bash -lc \
+        'git rev-parse HEAD; git status --short --branch; nvidia-smi'
+    run_logged nvcc_version "${nvcc_path}" --version
+    run_logged build_configure cmake -S "${repo_dir}" -B "${build_dir}" \
+        -DUSE_CUDA=ON -DUNIT_TEST=ON -DCUDA_ARCH="${cuda_arch}" \
+        -DCMAKE_CUDA_COMPILER="${nvcc_path}"
+    run_logged build_compile cmake --build "${build_dir}" --parallel "${build_jobs}"
+}
+
+run_ops_functional() {
     if [[ "${gpu_profile}" == sm100 || "${gpu_profile}" == sm120 ]]; then
-        run_logged op_dense_w4a4 env \
+        run_logged op_dense_w4a4_decode_padding_bias env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             FASTLLM_CUDA_NVFP4_W4A4=1 \
-            FASTLLM_CUDA_NVFP4_W4A4_MIN_ROWS=32 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
-            --param batch=32 --param in=1024 --param out=1024 \
-            --param input_type=bf16 --warmup 10 --iters 100 \
-            --atol 0.20 --rtol 0.20
+            --param batch=1 --param in=1008 --param out=1000 \
+            --param bias=1 --param input_type=bf16 \
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         run_logged op_swiglu_fp4_quant "${optest}" \
             --op nvfp4_swiglu_quant --device cuda:0 \
             --param rows=32 --param hidden=1024 --param input_type=bf16 \
-            --warmup 10 --iters 100 --atol 0.20 --rtol 0.20
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         if [[ "${gpu_profile}" == sm100 ]]; then
             run_logged op_grouped_moe_w4a4_check env \
                 FASTLLM_CUDA_NVFP4_TRACE=1 \
@@ -47,24 +70,58 @@ run_ops() {
                 --param batch=32 --param topk=2 --param experts=8 \
                 --param hidden=256 --param inter=256 --param input_type=bf16 \
                 --warmup 0 --iters 1
+        fi
+    else
+        run_logged op_dense_marlin_w4a16_check env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=8 --param in=1024 --param out=1024 \
+            --param bias=0 --param input_type=fp16 --warmup 0 --iters 1 \
+            --atol 0.05 --rtol 0.05
+    fi
+}
+
+run_ops_performance() {
+    if [[ "${gpu_profile}" == sm100 || "${gpu_profile}" == sm120 ]]; then
+        run_logged op_dense_w4a4_decode_perf env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 FASTLLM_CUDA_NVFP4_W4A4=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=1 --param in=1024 --param out=1024 \
+            --param bias=0 --param input_type=bf16 --warmup 20 --iters 200 \
+            --atol 0.20 --rtol 0.20
+        run_logged op_dense_w4a4_prefill_perf env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 FASTLLM_CUDA_NVFP4_W4A4=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=32 --param in=1024 --param out=1024 \
+            --param bias=0 --param input_type=bf16 --warmup 20 --iters 200 \
+            --atol 0.20 --rtol 0.20
+        run_logged op_swiglu_fp4_quant_perf "${optest}" \
+            --op nvfp4_swiglu_quant --device cuda:0 \
+            --param rows=32 --param hidden=1024 --param input_type=bf16 \
+            --warmup 20 --iters 200 --atol 0.20 --rtol 0.20
+        if [[ "${gpu_profile}" == sm100 ]]; then
             run_logged op_grouped_moe_w4a4_perf env \
-                FASTLLM_CUDA_NVFP4_TRACE=1 \
-                FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
+                FASTLLM_CUDA_NVFP4_TRACE=1 FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
                 FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=16 \
                 "${optest}" --op mergemoe_fp8 --device cuda:0 \
                 --param weight_type=nvfp4 --param path=operator \
                 --param batch=32 --param topk=2 --param experts=8 \
                 --param hidden=256 --param inter=256 --param input_type=bf16 \
-                --warmup 10 --iters 100
+                --warmup 20 --iters 200
         fi
     else
-        run_logged op_dense_marlin_w4a16 env \
+        run_logged op_dense_marlin_w4a16_perf env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=8 --param in=1024 --param out=1024 \
-            --param input_type=fp16 --warmup 10 --iters 100 \
+            --param bias=0 --param input_type=fp16 --warmup 20 --iters 200 \
             --atol 0.05 --rtol 0.05
     fi
+}
+
+run_ops() {
+    run_ops_functional
+    run_ops_performance
 }
 
 require_model() {
@@ -95,11 +152,14 @@ run_model() {
 }
 
 case "${suite}" in
+    build) run_build ;;
+    ops-functional) run_ops_functional ;;
+    ops-performance) run_ops_performance ;;
     ops) run_ops ;;
     forward) run_forward ;;
-    model) run_model ;;
-    all) run_ops; run_forward; run_model ;;
-    *) echo "usage: $0 {ops|forward|model|all}; NVFP4_GPU_PROFILE=sm100|sm120|preblackwell" >&2; exit 2 ;;
+    model-performance|model) run_model ;;
+    all) run_build; run_ops; run_forward; run_model ;;
+    *) echo "usage: $0 {build|ops-functional|ops-performance|ops|forward|model-performance|all}; NVFP4_GPU_PROFILE=sm100|sm120|preblackwell" >&2; exit 2 ;;
 esac
 
 printf 'Logs: %s\n' "${log_dir}"
