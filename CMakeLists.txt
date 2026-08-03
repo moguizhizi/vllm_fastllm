@@ -298,9 +298,15 @@ if (USE_CUDA)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda/linear/marlin_dense_fp8)
     set(FASTLLM_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
     set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED OFF)
+    set(FASTLLM_CUTLASS_FP8_SM90_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM120_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM121_ENABLED OFF)
     foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if (FASTLLM_CUDA_ARCH STREQUAL "90a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "9.0a")
+            set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+            set(FASTLLM_CUTLASS_FP8_SM90_ENABLED ON)
+        endif()
         if (FASTLLM_CUDA_ARCH STREQUAL "120a" OR FASTLLM_CUDA_ARCH STREQUAL "121a" OR
             FASTLLM_CUDA_ARCH STREQUAL "120f" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
             set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
@@ -312,13 +318,16 @@ if (USE_CUDA)
         endif()
     endforeach()
     if (NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
-        FASTLLM_CUTLASS_FP8_ARCH_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        FASTLLM_CUTLASS_FP8_ARCH_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.3)
         message(STATUS "CUTLASS FP8 kernels: ON (${FASTLLM_CUTLASS_DIR})")
         include_directories("${FASTLLM_CUTLASS_DIR}/include")
         if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include")
             include_directories("${FASTLLM_CUTLASS_DIR}/tools/util/include")
         endif()
         add_compile_definitions(FASTLLM_ENABLE_CUTLASS_FP8)
+        if (FASTLLM_CUTLASS_FP8_SM90_ENABLED)
+            add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+        endif()
         if (FASTLLM_CUTLASS_FP8_SM120_ENABLED)
             add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
         endif()
@@ -394,6 +403,20 @@ if (USE_CUDA)
         message(STATUS "CUTLASS W4A8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
     endif()
 
+    set(FASTLLM_CUTLASS_W8A8_ENABLED OFF)
+    if (EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
+        ((FASTLLM_CUTLASS_FP8_SM90_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.3) OR
+         (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)))
+        set(FASTLLM_CUTLASS_W8A8_ENABLED ON)
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_W8A8)
+        if (FASTLLM_CUTLASS_FP8_SM90_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.3)
+            add_compile_definitions(FASTLLM_CUTLASS_W8A8_SM90)
+        endif()
+        if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+            add_compile_definitions(FASTLLM_CUTLASS_W8A8_SM120)
+        endif()
+    endif()
+
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
         src/devices/cuda/fastllm-cuda.cu 
@@ -409,6 +432,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
+        src/devices/cuda/linear/fastllm-linear-w8a8-cutlass.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu

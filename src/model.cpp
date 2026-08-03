@@ -830,8 +830,9 @@ namespace fastllm {
             AssertInFastLLM(this->shape.size() >= 2 && (isScalarScale || scale.shape.size() >= 2),
                             "CreateBufferWithScale error: weight shape should be >= 2 and scale should be scalar or >= 2.");
             bool isFp8 = this->dtype == "F8_E4M3";
+            bool isInt8W8A8 = this->dtype == "I8" && dstType == DataType::INT8_W8A8;
             bool isPackedFp4 = this->dtype == "I8" || this->dtype == "U8";
-            if (!isFp8 && !isPackedFp4) {
+            if (!isFp8 && !isPackedFp4 && !isInt8W8A8) {
                 ErrorInFastLLM("CreateBufferWithScale error: dtype should be FP8_E4M3 or packed FP4 I8/U8");
             }
             long long n64 = 1, ns64 = 1;
@@ -848,7 +849,7 @@ namespace fastllm {
                             (isScalarScale || scale.shape.back() <= INT_MAX),
                             "CreateBufferWithScale error: shape is too large.");
             int n = (int)n64, packedM = (int)this->shape.back();
-            int m = isPackedFp4 ? packedM * 2 : packedM;
+            int m = (isPackedFp4 && !isInt8W8A8) ? packedM * 2 : packedM;
             int ns, ms, blockN, blockM;
             if (isScalarScale) {
                 ns = n;
@@ -870,7 +871,27 @@ namespace fastllm {
             }
             ClearBuffer();
 
-            if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4 ||
+            if (dstType == DataType::INT8_W8A8) {
+                AssertInFastLLM(!isScalarScale && ns == n && ms == 1 &&
+                                scale.len == (size_t)n,
+                                "INT8_W8A8 requires [out,1] per-channel scales.");
+                buffer = new uint8_t[this->bytes];
+                FILE *fw = fopen(this->fileName.c_str(), "rb");
+#if defined(_WIN32) || defined(_WIN64)
+                _fseeki64(fw, this->data_offsets[0], 0);
+#else
+                fseek(fw, this->data_offsets[0], 0);
+#endif
+                size_t ret = fread(buffer, 1, this->bytes, fw);
+                fclose(fw);
+                AssertInFastLLM(ret == this->bytes && this->bytes == (size_t)n * m,
+                                "INT8_W8A8 signed weight byte size mismatch.");
+                scalesBuffer = new float[n];
+                memcpy(scalesBuffer, scale.buffer, (size_t)n * sizeof(float));
+                blockK = 1;
+                blockM = m;
+                return;
+            } else if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4 ||
                 dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) {
                 if (dstType == DataType::FP8_E4M3 && !isFp8) {
                     ErrorInFastLLM("CreateBufferWithScale error: packed FP4 cannot be loaded as FP8_E4M3.");
@@ -1218,6 +1239,13 @@ namespace fastllm {
                 ret = fread(buffer, 1, this->bytes, fi);
                 fclose(fi);
                 return;
+            } else if (this->dtype == "I8" && dstType == DataType::INT8_W8A8) {
+                ClearBuffer();
+                buffer = new uint8_t[this->bytes];
+                ret = fread(buffer, 1, this->bytes, fi);
+                AssertInFastLLM(ret == this->bytes, "Failed to read signed INT8 W8A8 tensor.");
+                fclose(fi);
+                return;
             } else if (this->dtype == "F8_E4M3") {
                 srcType = DataType::FP8_E4M3;
             } else if (this->dtype == "BF16") {
@@ -1422,6 +1450,32 @@ namespace fastllm {
             foundLinearW4A8 = true;
         }
         return foundLinearW4A8;
+    }
+
+    static bool IsCompressedTensorsInt8W8A8Config(const json11::Json &config) {
+        const auto &quant = config["quantization_config"];
+        if (quant.is_null() || quant["quant_method"].string_value() != "compressed-tensors" ||
+            quant["format"].string_value() != "int-quantized") return false;
+        bool found = false;
+        for (const auto &entry : quant["config_groups"].object_items()) {
+            const auto &group = entry.second;
+            if (!HasJsonString(group["targets"], "Linear")) continue;
+            const auto &weight = group["weights"];
+            const auto &input = group["input_activations"];
+            bool supported = weight["type"].string_value() == "int" &&
+                weight["num_bits"].int_value() == 8 &&
+                weight["strategy"].string_value() == "channel" &&
+                weight["symmetric"].bool_value() && !weight["dynamic"].bool_value() &&
+                weight["actorder"].is_null() &&
+                input["type"].string_value() == "int" &&
+                input["num_bits"].int_value() == 8 &&
+                input["strategy"].string_value() == "token" &&
+                input["symmetric"].bool_value() && input["dynamic"].bool_value() &&
+                input["actorder"].is_null();
+            if (!supported) return false;
+            found = true;
+        }
+        return found;
     }
 
     static bool DescribeCompressedTensorsW4A8Bundle(
@@ -3424,6 +3478,7 @@ namespace fastllm {
         auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
         bool isAwqModel = false;
         bool isCompressedW4A8Model = false;
+        bool isCompressedInt8W8A8Model = false;
         int awqGroupCnt = 128;
         std::string modelType = "";
         if (weightOnly) {
@@ -3459,6 +3514,7 @@ namespace fastllm {
                 printf("[Fastllm] AWQ: keep unquantized floating-point tensors in source dtype.\n");
             }
             isCompressedW4A8Model = IsCompressedTensorsW4A8Config(config);
+            isCompressedInt8W8A8Model = IsCompressedTensorsInt8W8A8Config(config);
         }
         basellm *model = CreateModelWithType(modelType);
         if (isJsonModel) {
@@ -3862,6 +3918,16 @@ namespace fastllm {
                             int curGroupCnt = isMoeLinear
                                     ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
                                     : groupCnt;
+                            if (isCompressedInt8W8A8Model && tensor.dtype == "I8" &&
+                                StringEndWith(tensorName, ".weight")) {
+                                std::string candidate = tensorName + "_scale";
+                                auto scaleIt = safeTensors.itmeDict.find(candidate);
+                                AssertInFastLLM(scaleIt != safeTensors.itmeDict.end(),
+                                                "INT8_W8A8 weight is missing weight_scale: " + tensorName + "\n");
+                                dataType = DataType::INT8_W8A8;
+                                oriDataType = DataType::INT8_W8A8;
+                                scaleTensorName = candidate;
+                            }
                             if (isW4A8PackedTensor) {
                                 dataType = DataType::INT4_W4A8;
                                 oriDataType = DataType::INT4_W4A8;

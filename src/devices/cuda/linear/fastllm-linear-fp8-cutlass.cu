@@ -31,6 +31,18 @@
 namespace fastllm_cuda_cutlass_fp8 {
 
 template <typename Kernel>
+struct FastllmEnableSm90Only : Kernel {
+    template <typename... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
+        Kernel::operator()(std::forward<Args>(args)...);
+#elif defined(__CUDA_ARCH__)
+        asm("trap;");
+#endif
+    }
+};
+
+template <typename Kernel>
 struct FastllmEnableSm120Family : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
@@ -47,6 +59,7 @@ struct FastllmEnableSm120Family : Kernel {
 
 using namespace cute;
 
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
 template <class OutType, int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK,
           class MmaTileShape, class ClusterShape, class EpilogueScheduler,
           class MainloopScheduler, bool SwapAB = false>
@@ -127,7 +140,71 @@ struct FastllmCutlassFp8BlockwiseGemm {
 
     struct GemmKernel : public KernelType {};
 };
+#endif
 
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+template <class OutType, bool SwapAB = false>
+struct FastllmCutlassSm90Fp8BlockwiseGemm {
+    static constexpr bool swap_ab = SwapAB;
+    using ElementAB = cutlass::float_e4m3_t;
+    using ElementA = ElementAB;
+    using ElementB = ElementAB;
+    using ElementD = OutType;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBlockScale = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+    using LayoutAT = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+    using LayoutBT = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+    using LayoutDT = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
+    static constexpr int AlignmentA = 16;
+    static constexpr int AlignmentB = 16;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+    using TileShape = std::conditional_t<SwapAB, Shape<_128, _16, _128>, Shape<_128, _128, _128>>;
+    using ClusterShape = std::conditional_t<SwapAB, Shape<_1, _1, _1>, Shape<_1, _2, _1>>;
+    using ScaleConfig = std::conditional_t<SwapAB,
+        cutlass::detail::Sm90BlockwiseScaleConfig<128, 1, 128, GMMA::Major::K, GMMA::Major::MN>,
+        cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128, GMMA::Major::MN, GMMA::Major::K>>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+    using EpilogueSchedule = std::conditional_t<SwapAB,
+        cutlass::epilogue::TmaWarpSpecialized,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>;
+    using MainloopSchedule = std::conditional_t<SwapAB,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8BlockScaledAccum,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum>;
+    using Operation = cutlass::epilogue::fusion::LinearCombination<
+        ElementD, ElementCompute, void, float, cutlass::FloatRoundStyle::round_to_nearest>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+        ElementCompute, void, std::conditional_t<SwapAB, LayoutDT, LayoutD>, AlignmentD,
+        ElementD, std::conditional_t<SwapAB, LayoutDT, LayoutD>, AlignmentD,
+        EpilogueSchedule, Operation>::CollectiveOp;
+    using CollectiveMainloop = std::conditional_t<SwapAB,
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementB, cute::tuple<LayoutBT, LayoutSFA>, AlignmentB,
+            ElementA, cute::tuple<LayoutAT, LayoutSFB>, AlignmentA,
+            ElementAccumulator, TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            MainloopSchedule>::CollectiveOp,
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
+            ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
+            ElementAccumulator, TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            MainloopSchedule>::CollectiveOp>;
+    using KernelType = FastllmEnableSm90Only<cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>>;
+    struct GemmKernel : KernelType {};
+};
+#endif
+
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
 template <typename OutType>
 struct FastllmSm120Fp8DefaultConfig {
     using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
@@ -157,6 +234,7 @@ struct FastllmSm120Fp8SwapABConfig {
     using Gemm = FastllmCutlassFp8BlockwiseGemm<
         OutType, 128, 1, 128, TileShape, ClusterShape, EpilogueSchedule, KernelSchedule, true>;
 };
+#endif
 
 struct FastllmCutlassFp8Scratch {
     cutlass::float_e4m3_t *input = nullptr;
@@ -195,6 +273,10 @@ static bool FastllmCutlassIsStreamCapturing(cudaStream_t stream) {
 
 static bool FastllmCutlassFp8CompiledForRuntimeArch(int arch) {
     switch (arch) {
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+    case 90:
+        return true;
+#endif
 #if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
     case 120:
         return true;
@@ -674,7 +756,22 @@ template <typename OutType>
 static bool FastllmDispatchCutlassFp8Blockwise(
     cutlass::float_e4m3_t *input, cutlass::float_e4m3_t *weightTN,
     float *inputScales, float *weightScales, OutType *output,
-    int batch, int outFeatures, int inFeatures, cudaStream_t stream) {
+    int batch, int outFeatures, int inFeatures, int arch, cudaStream_t stream) {
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+    if (arch == 90) {
+        if ((batch % 4) != 0) {
+            using Gemm = FastllmCutlassSm90Fp8BlockwiseGemm<OutType, true>;
+            return FastllmRunCutlassFp8Blockwise<Gemm>(
+                input, weightTN, inputScales, weightScales, output,
+                batch, outFeatures, inFeatures, stream);
+        }
+        using Gemm = FastllmCutlassSm90Fp8BlockwiseGemm<OutType, false>;
+        return FastllmRunCutlassFp8Blockwise<Gemm>(
+            input, weightTN, inputScales, weightScales, output,
+            batch, outFeatures, inFeatures, stream);
+    }
+#endif
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
     // The SM120 ping-pong blockwise kernel can produce run-to-run differences
     // for Qwen3.5's wide projections (for example a 92-token prefill), which
     // is enough to change greedy decoding. Use the deterministic SwapAB path.
@@ -686,6 +783,12 @@ static bool FastllmDispatchCutlassFp8Blockwise(
     using Gemm = typename FastllmSm120Fp8DefaultConfig<OutType>::Gemm;
     return FastllmRunCutlassFp8Blockwise<Gemm>(
         input, weightTN, inputScales, weightScales, output, batch, outFeatures, inFeatures, stream);
+#else
+    (void)input; (void)weightTN; (void)inputScales; (void)weightScales;
+    (void)output; (void)batch; (void)outFeatures; (void)inFeatures;
+    (void)arch; (void)stream;
+    return false;
+#endif
 }
 
 } // namespace fastllm_cuda_cutlass_fp8
@@ -696,17 +799,21 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
     fastllm::Data &output, int n, int m, int k) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
-    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
     using namespace fastllm_cuda_cutlass_fp8;
 
     if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 || (k % 128) != 0 ||
-        input.cudaData == nullptr || weight.cudaData == nullptr ||
+        input.cudaData == nullptr || weight.cudaData == nullptr || output.cudaData == nullptr ||
         weight.dataType != fastllm::DataType::FP8_E4M3 ||
-        weight.blockM != 128 || weight.blockK != 128 || weight.scales.empty() ||
+        weight.dims != std::vector<int>({k, m}) ||
+        weight.blockM != 128 || weight.blockK != 128 ||
+        weight.scales.size() != (size_t)(k / 128) * (m / 128) ||
         output.dataType != input.dataType ||
         (input.dataType != fastllm::DataType::FLOAT16 &&
          input.dataType != fastllm::DataType::BFLOAT16) ||
-        (bias.dims.size() > 0 && bias.dataType != fastllm::DataType::FLOAT32)) {
+        (bias.dims.size() > 0 &&
+         (bias.dataType != fastllm::DataType::FLOAT32 ||
+          bias.cudaData == nullptr || bias.Count(0) != k))) {
         return false;
     }
     int arch = FastllmCudaRuntimeArch();
@@ -762,7 +869,7 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128(
     if (input.dataType == fastllm::DataType::FLOAT16) {
         ok = FastllmDispatchCutlassFp8Blockwise(
             scratch->input, cache->weightTN, scratch->inputScales, cache->weightScales,
-            (cutlass::half_t*)outputData, n, k, m, stream);
+            (cutlass::half_t*)outputData, n, k, m, arch, stream);
         if (ok && bias.dims.size() > 0) {
             int threads = 256;
             int blocks = (int)std::min<size_t>(4096, ((size_t)n * k + threads - 1) / threads);
@@ -773,7 +880,7 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128(
     } else {
         ok = FastllmDispatchCutlassFp8Blockwise(
             scratch->input, cache->weightTN, scratch->inputScales, cache->weightScales,
-            (cutlass::bfloat16_t*)outputData, n, k, m, stream);
+            (cutlass::bfloat16_t*)outputData, n, k, m, arch, stream);
         if (ok && bias.dims.size() > 0) {
             int threads = 256;
             int blocks = (int)std::min<size_t>(4096, ((size_t)n * k + threads - 1) / threads);
@@ -802,7 +909,7 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
     fastllm::Data &output, int n, int m, int k) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
-    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
     using namespace fastllm_cuda_cutlass_fp8;
 
     if (!FastllmCutlassUseFusedSwigluQuant() || !FastllmCutlassUseWarpQuant()) {
@@ -866,7 +973,7 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
     if (input.dataType == fastllm::DataType::FLOAT16) {
         ok = FastllmDispatchCutlassFp8Blockwise(
             scratch->input, cache->weightTN, scratch->inputScales, cache->weightScales,
-            (cutlass::half_t*)outputData, n, k, m, stream);
+            (cutlass::half_t*)outputData, n, k, m, arch, stream);
         if (ok && bias.dims.size() > 0) {
             int threads = 256;
             int blocks = (int)std::min<size_t>(4096, ((size_t)n * k + threads - 1) / threads);
@@ -877,7 +984,7 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
     } else {
         ok = FastllmDispatchCutlassFp8Blockwise(
             scratch->input, cache->weightTN, scratch->inputScales, cache->weightScales,
-            (cutlass::bfloat16_t*)outputData, n, k, m, stream);
+            (cutlass::bfloat16_t*)outputData, n, k, m, arch, stream);
         if (ok && bias.dims.size() > 0) {
             int threads = 256;
             int blocks = (int)std::min<size_t>(4096, ((size_t)n * k + threads - 1) / threads);

@@ -660,6 +660,13 @@ bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
     const int *routePositions, const int *expertStarts,
     const int *expertCounts, int batch, int topk, int totalTasks,
     int hidden, int inter);
+bool FastllmCudaBFloat16MergeMOEFp8CutlassSm90(
+    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
+    fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const int *routeRows, const float *routeScales,
+    const int *routePositions, const int *expertStarts,
+    const int *expertCounts, int batch, int topk, int totalTasks,
+    int hidden, int inter);
 #else
 inline bool TryCudaCutlassW4A8(const fastllm::Data &, fastllm::Data &,
                                const fastllm::Data &, fastllm::Data &,
@@ -670,6 +677,12 @@ inline void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight) {
     weight.w4a8CudaCaches.clear();
 }
 inline bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
+    const fastllm::Data &, fastllm::Data &, fastllm::Data &,
+    fastllm::Data &, fastllm::Data **, int, const int *, const float *,
+    const int *, const int *, const int *, int, int, int, int, int) {
+    return false;
+}
+inline bool FastllmCudaBFloat16MergeMOEFp8CutlassSm90(
     const fastllm::Data &, fastllm::Data &, fastllm::Data &,
     fastllm::Data &, fastllm::Data **, int, const int *, const float *,
     const int *, const int *, const int *, int, int, int, int, int) {
@@ -994,6 +1007,8 @@ bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fast
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearInt8W8A8Sm90(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFp8W8A8Sm120(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

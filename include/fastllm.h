@@ -320,6 +320,7 @@ namespace fastllm {
         // The final partial block has no padding. The implicit zero point is 8.
         INT4_GROUP32 = 1008,
         INT4_W4A8 = 1009, // independent W4A8: uint4b8 source + BF16 symmetric group=128 scales
+        INT8_W8A8 = 1010, // signed symmetric INT8 weight + FP32 per-output-channel scales
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32

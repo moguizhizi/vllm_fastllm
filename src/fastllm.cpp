@@ -526,6 +526,7 @@ namespace fastllm {
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::INT4_W4A8, {"int4_w4a8"}},
+        {DataType::INT8_W8A8, {"int8_w8a8"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
@@ -601,7 +602,7 @@ namespace fastllm {
                    type == DataType::INT4_W4A8 ||
                    type == DataType::NVFP4) {
             return type == DataType::NVFP4 ? GetNVFP4WeightBytes(rows, columns) : rows * (columns / 2);
-        } else if (type == DataType::INT8) {
+        } else if (type == DataType::INT8 || type == DataType::INT8_W8A8) {
             return rows * columns;
         } else if (type == DataType::FP8_E4M3_BLOCK_128) {
             // columns * [fp8] + ((columns - 1) / 128 + 1) * [float]
@@ -1435,7 +1436,14 @@ namespace fastllm {
             if (oriData != nullptr) {
                 memcpy(data.cpuData, oriData, data.GetBytes());
             } 
-            if (dataType == DataType::INT4_GROUP) {
+            if (dataType == DataType::INT8_W8A8) {
+                AssertInFastLLM(this->dims.size() == 2 && oriScales != nullptr,
+                                "INT8_W8A8 requires 2D signed weights and channel scales.\n");
+                this->perChannelAxis = 0;
+                this->mins.clear();
+                this->zeros.clear();
+                this->scales.assign(oriScales, oriScales + this->dims[0]);
+            } else if (dataType == DataType::INT4_GROUP) {
                 int k = this->dims[0], m = this->dims[1], group = (m - 1) / groupCnt + 1;
                 this->group = group;
                 this->groupCnt = groupCnt;
@@ -1691,7 +1699,8 @@ namespace fastllm {
                 this->dataType == DataType::FLOAT16) {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
+        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::INT8_W8A8 ||
+                   this->dataType == DataType::FP8_E4M3 ||
                    this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
@@ -3055,6 +3064,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::INT4_GROUP32) {
             return DataType::INF_INT8_GROUP32;
         } else if (this->dataType == DataType::BFLOAT16 || 
+                    this->dataType == DataType::INT8_W8A8 ||
                     this->dataType == DataType::FP8_E4M3 ||
                     this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                     this->dataType == DataType::FP8_E4M3_PERCHANNEL) {

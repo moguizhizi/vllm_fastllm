@@ -3345,6 +3345,7 @@ namespace fastllm {
                    weightType == DataType::FLOAT16 ||
                    weightType == DataType::BFLOAT16 ||
                    weightType == DataType::INT8 ||
+                   weightType == DataType::INT8_W8A8 ||
                    weightType == DataType::INT4_GROUP ||
                    weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::INT4_GROUP128 ||
@@ -3380,6 +3381,7 @@ namespace fastllm {
                    weightType == DataType::FLOAT16 ||
                    weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::INT4_W4A8 ||
+                   weightType == DataType::INT8_W8A8 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
@@ -3404,6 +3406,15 @@ namespace fastllm {
         }
         if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) {
             return;
+        }
+        if (FastllmCudaCutlassLinearInt8W8A8Sm90(input, weight, bias, output, n, m, k) ||
+            FastllmCudaCutlassLinearFp8W8A8Sm120(input, weight, bias, output, n, m, k)) {
+            return;
+        }
+        if (weight.dataType == DataType::INT8_W8A8) {
+            ErrorInFastLLM(
+                "Linear error: symmetric INT8 W8A8 requires an SM90 CUTLASS build, "
+                "signed I8 [N,K] weights, FP32 per-channel scales, K%16=0 and N%8=0.\n");
         }
         if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, m, k)) {
             return;
@@ -6207,6 +6218,16 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             }
         }
         if (isNVFP4 && FastllmCudaMergeMoeNvfp4W4A4Grouped(
+                input, w1, w2, output, weights, weightsBatch,
+                routeRows.data(), routeScales.data(), routePositions.data(),
+                expertStarts.data(), expertCounts.data(), batch, topk,
+                totalTasks, hidden, inter)) {
+            return true;
+        }
+        if (isFp8 && FastllmCudaRuntimeArch() == 90 &&
+            CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", true) &&
+            input.dataType == DataType::BFLOAT16 &&
+            FastllmCudaBFloat16MergeMOEFp8CutlassSm90(
                 input, w1, w2, output, weights, weightsBatch,
                 routeRows.data(), routeScales.data(), routePositions.data(),
                 expertStarts.data(), expertCounts.data(), batch, topk,
