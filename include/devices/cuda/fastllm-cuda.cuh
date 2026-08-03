@@ -570,13 +570,27 @@ bool FastllmCudaNvfp4QuantizeActivation(
     const void *input, fastllm::DataType inputType,
     uint8_t *output, uint8_t *outputScales,
     int rows, int columns, float globalScale, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4QuantizeActivationPadded(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int columns, int paddedColumns,
+    float globalScale, void *streamPtr = nullptr);
 bool FastllmCudaSiluMulNvfp4Quantize(
     const void *input, fastllm::DataType inputType,
     uint8_t *output, uint8_t *outputScales,
     int rows, int hidden, float globalScale, void *streamPtr = nullptr);
+bool FastllmCudaSiluMulNvfp4QuantizePadded(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int hidden, int paddedHidden,
+    float globalScale, void *streamPtr = nullptr);
 bool FastllmCudaNvfp4Block16ToCutlass(
     const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
     int rows, int columns, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4Block16ToCutlassPadded(
+    const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
+    int rows, int columns, int paddedRows, int paddedColumns,
+    void *streamPtr = nullptr);
 bool FastllmCudaNvfp4CutlassGemmSm100(
     const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
     const uint8_t *scaleB, const float *alpha, void *d,
@@ -599,6 +613,10 @@ bool TryCudaCutlassNvfp4W4A4(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output,
     int n, int m, int k);
+bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
 void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight);
 bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
@@ -609,6 +627,9 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     int hidden, int inter);
 #else
 inline bool TryCudaCutlassNvfp4W4A4(
+    const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
+    fastllm::Data &, int, int, int) { return false; }
+inline bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
     const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
     fastllm::Data &, int, int, int) { return false; }
 inline void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *) {}

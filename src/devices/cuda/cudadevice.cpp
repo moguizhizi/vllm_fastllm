@@ -3616,9 +3616,6 @@ namespace fastllm {
 
     static bool CanUseCudaCutlassSwigluLinearAdd(
         const Data &input, const Data &weight, const Data &bias, const Data &output) {
-        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT", true)) {
-            return false;
-        }
         if (input.dims.empty() || weight.dims.size() != 2 || output.dims.empty()) {
             return false;
         }
@@ -3627,12 +3624,25 @@ namespace fastllm {
             return false;
         }
         int n = input.Count(0) / gateup;
+        int inter = gateup / 2;
+        int hidden = output.dims.back();
+        if (weight.dataType == DataType::NVFP4_BLOCK_16 && weight.blockM == 16) {
+            return CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_NVFP4_SWIGLU_QUANT", true) &&
+                   n > 0 &&
+                   (input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16) &&
+                   output.dataType == input.dataType &&
+                   weight.dims[0] == hidden && weight.dims[1] == inter &&
+                   (inter % 16) == 0 &&
+                   (bias.dims.empty() || (bias.dataType == DataType::FLOAT32 &&
+                                          bias.Count(0) == (uint64_t)hidden));
+        }
+        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT", true)) {
+            return false;
+        }
         int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
         if (n < minBatch) {
             return false;
         }
-        int inter = gateup / 2;
-        int hidden = output.dims.back();
         return (input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16) &&
                output.dataType == input.dataType &&
                weight.dataType == DataType::FP8_E4M3 &&
@@ -3691,7 +3701,9 @@ namespace fastllm {
         int m = input.dims.back() / 2;
         int k = weight.dims[0];
         middle.Allocate(false);
-        bool ok = FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(input, weight, bias, middle, n, m, k);
+        bool ok = weight.dataType == DataType::NVFP4_BLOCK_16
+            ? FastllmCudaCutlassNvfp4W4A4FromSwiglu(input, weight, bias, middle, n, m, k)
+            : FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(input, weight, bias, middle, n, m, k);
         if (!ok) {
             Data swiglu;
             DoCudaSwigluReshape(input, swiglu);

@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
 
 namespace {
 
@@ -16,8 +17,10 @@ struct WeightCache {
     uint8_t *weight = nullptr;
     uint8_t *scales = nullptr;
     float *alpha = nullptr;
-    int rows = 0;
-    int columns = 0;
+    int sourceRows = 0;
+    int sourceColumns = 0;
+    int paddedRows = 0;
+    int paddedColumns = 0;
 };
 
 struct ActivationScratch {
@@ -27,9 +30,19 @@ struct ActivationScratch {
     size_t scaleBytes = 0;
 };
 
+struct OutputScratch {
+    void *output = nullptr;
+    size_t bytes = 0;
+};
+
 std::mutex cacheMutex;
 std::map<std::pair<const fastllm::Data *, int>, WeightCache> weightCaches;
 std::map<int, ActivationScratch> activationScratch;
+std::map<int, OutputScratch> outputScratch;
+
+static int RoundUp(int value, int alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
 
 static bool Enabled() {
     const char *value = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
@@ -43,7 +56,7 @@ static bool TraceEnabled() {
 
 static int MinRows() {
     const char *value = std::getenv("FASTLLM_CUDA_NVFP4_W4A4_MIN_ROWS");
-    return value == nullptr ? 32 : std::max(1, std::atoi(value));
+    return value == nullptr ? 1 : std::max(1, std::atoi(value));
 }
 
 static int RuntimeArch() {
@@ -76,9 +89,12 @@ static bool SemanticsSupported(const fastllm::Data &input,
     if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 || weight.blockM != 16) {
         *reason = "weight is not NVFP4_BLOCK_16"; return false;
     }
-    if (!bias.dims.empty()) { *reason = "bias is not yet fused"; return false; }
-    if (m <= 0 || k <= 0 || m % 32 != 0 || k % 32 != 0) {
-        *reason = "K/N alignment is not 32"; return false;
+    if (!bias.dims.empty() &&
+        (bias.dataType != fastllm::DataType::FLOAT32 || bias.Count(0) != (uint64_t)k)) {
+        *reason = "bias must be empty or FP32 with N elements"; return false;
+    }
+    if (m <= 0 || k <= 0 || m % 16 != 0) {
+        *reason = "K is not compatible with NVFP4 block-16"; return false;
     }
     if (weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m) {
         *reason = "weight shape mismatch"; return false;
@@ -99,28 +115,34 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
     std::lock_guard<std::mutex> guard(cacheMutex);
     auto key = std::make_pair((const fastllm::Data *)&weight, device);
     WeightCache &cache = weightCaches[key];
-    if (cache.source == weight.cudaData && cache.rows == k && cache.columns == m &&
+    const int paddedM = RoundUp(m, 32);
+    const int paddedK = RoundUp(k, 32);
+    if (cache.source == weight.cudaData && cache.sourceRows == k &&
+        cache.sourceColumns == m && cache.paddedRows == paddedK &&
+        cache.paddedColumns == paddedM &&
         cache.weight != nullptr && cache.scales != nullptr && cache.alpha != nullptr) return &cache;
     if (FastllmCudaGraphIsCapturing()) return nullptr;
     ReleaseCache(cache);
-    cache.weight = static_cast<uint8_t *>(FastllmCudaMalloc((size_t)k * m / 2));
+    cache.weight = static_cast<uint8_t *>(FastllmCudaMalloc((size_t)paddedK * paddedM / 2));
     cache.scales = static_cast<uint8_t *>(FastllmCudaMalloc(
-        FastllmCudaNvfp4SwizzledScaleBytes(k, m)));
+        FastllmCudaNvfp4SwizzledScaleBytes(paddedK, paddedM)));
     cache.alpha = static_cast<float *>(FastllmCudaMalloc(sizeof(float)));
     if (cache.weight == nullptr || cache.scales == nullptr || cache.alpha == nullptr) {
         ReleaseCache(cache); return nullptr;
     }
     const float one = 1.0f;
-    if (!FastllmCudaNvfp4Block16ToCutlass(
+    if (!FastllmCudaNvfp4Block16ToCutlassPadded(
             static_cast<const uint8_t *>(weight.cudaData), cache.weight,
-            cache.scales, k, m, (void *)cudaStreamPerThread) ||
+            cache.scales, k, m, paddedK, paddedM, (void *)cudaStreamPerThread) ||
         cudaMemcpyAsync(cache.alpha, &one, sizeof(one), cudaMemcpyHostToDevice,
                         cudaStreamPerThread) != cudaSuccess) {
         ReleaseCache(cache); return nullptr;
     }
     cache.source = weight.cudaData;
-    cache.rows = k;
-    cache.columns = m;
+    cache.sourceRows = k;
+    cache.sourceColumns = m;
+    cache.paddedRows = paddedK;
+    cache.paddedColumns = paddedM;
     return &cache;
 }
 
@@ -150,6 +172,63 @@ static ActivationScratch *GetActivationScratch(int n, int m) {
     return &scratch;
 }
 
+static OutputScratch *GetOutputScratch(size_t bytes) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
+    std::lock_guard<std::mutex> guard(cacheMutex);
+    OutputScratch &scratch = outputScratch[device];
+    if (scratch.output != nullptr && scratch.bytes >= bytes) return &scratch;
+    if (FastllmCudaGraphIsCapturing()) return nullptr;
+    void *newOutput = FastllmCudaMalloc(bytes);
+    if (newOutput == nullptr) return nullptr;
+    if (scratch.output != nullptr) FastllmCudaFree(scratch.output);
+    scratch.output = newOutput;
+    scratch.bytes = bytes;
+    return &scratch;
+}
+
+template <typename T>
+__global__ void FinalizeOutputKernel(const T *source, T *destination,
+                                     const float *bias, int rows, int columns,
+                                     int sourceStride) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t elements = (size_t)rows * columns;
+    if (index >= elements) return;
+    const int row = index / columns;
+    const int column = index - (size_t)row * columns;
+    float value;
+    if constexpr (std::is_same<T, half>::value) {
+        value = __half2float(source[(size_t)row * sourceStride + column]);
+        if (bias != nullptr) value += bias[column];
+        destination[index] = __float2half_rn(value);
+    } else {
+        value = __bfloat162float(source[(size_t)row * sourceStride + column]);
+        if (bias != nullptr) value += bias[column];
+        destination[index] = __float2bfloat16_rn(value);
+    }
+}
+
+static bool FinalizeOutput(const void *source, void *destination,
+                           const float *bias, fastllm::DataType dataType,
+                           int rows, int columns, int sourceStride) {
+    const size_t elements = (size_t)rows * columns;
+    const int threads = 256;
+    const int blocks = (elements + threads - 1) / threads;
+    if (dataType == fastllm::DataType::FLOAT16) {
+        FinalizeOutputKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+            static_cast<const half *>(source), static_cast<half *>(destination),
+            bias, rows, columns, sourceStride);
+    } else if (dataType == fastllm::DataType::BFLOAT16) {
+        FinalizeOutputKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(source),
+            static_cast<__nv_bfloat16 *>(destination), bias,
+            rows, columns, sourceStride);
+    } else {
+        return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 } // namespace
 
 bool FastllmCudaPrepareNvfp4W4A4Weight(
@@ -161,59 +240,100 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
         weight.blockM != 16 || inFeatures <= 0 || outFeatures <= 0 ||
         inFeatures % 32 != 0 || outFeatures % 32 != 0) return false;
     WeightCache *cache = GetWeightCache(weight, inFeatures, outFeatures);
-    if (cache == nullptr) return false;
+    if (cache == nullptr || cache->paddedColumns != inFeatures ||
+        cache->paddedRows != outFeatures) return false;
     *packedWeight = cache->weight;
     *scales = cache->scales;
     *alpha = cache->alpha;
     return true;
 }
 
-bool TryCudaCutlassNvfp4W4A4(
+static bool RunCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
-        int n, int m, int k) {
+        int n, int m, int k, bool siluMulInput) {
     const int arch = RuntimeArch();
     const char *reason = "unsupported";
-    const bool supportedArch = arch == 100 || (arch >= 120 && arch < 130);
+    const bool supportedArch = arch >= 100 && arch < 130;
     if (!supportedArch ||
         !SemanticsSupported(input, weight, bias, output, n, m, k, &reason)) {
-        Trace("fallback", !supportedArch ? "runtime SM is not 100 or 120-129" : reason,
+        Trace("fallback", !supportedArch ? "runtime SM is not 100-129" : reason,
               n, m, k, arch);
+        return false;
+    }
+    if (input.dims.empty() ||
+        input.dims.back() != (siluMulInput ? m * 2 : m)) {
+        Trace("fallback", "activation shape mismatch", n, m, k, arch);
         return false;
     }
 
     WeightCache *cache = GetWeightCache(weight, m, k);
-    ActivationScratch *scratch = GetActivationScratch(n, m);
-    if (cache == nullptr || scratch == nullptr) {
-        Trace("fallback", "cache/scratch unavailable", n, m, k, arch);
+    if (cache == nullptr) {
+        Trace("fallback", "weight cache unavailable", n, m, k, arch);
         return false;
     }
-    void *inputData = FastllmCudaPrepareInput(input);
-    void *outputData = FastllmCudaPrepareOutput(output);
-    if (inputData == nullptr || outputData == nullptr ||
-        !FastllmCudaNvfp4QuantizeActivation(
-            inputData, input.dataType, scratch->activation, scratch->scales,
-            n, m, 1.0f, (void *)cudaStreamPerThread)) {
-        if (inputData != nullptr) FastllmCudaFinishInput(input, inputData);
-        if (outputData != nullptr) FastllmCudaFinishOutput(output, outputData);
-        Trace("fallback", "activation quantization failed", n, m, k, arch);
+    ActivationScratch *activation = GetActivationScratch(n, cache->paddedColumns);
+    const bool paddedOutput = cache->paddedRows != k;
+    OutputScratch *padded = paddedOutput
+        ? GetOutputScratch((size_t)n * cache->paddedRows * sizeof(uint16_t)) : nullptr;
+    if (activation == nullptr || (paddedOutput && padded == nullptr)) {
+        Trace("fallback", "activation/output scratch unavailable", n, m, k, arch);
         return false;
     }
 
-    bool ok = arch == 100
-        ? FastllmCudaNvfp4CutlassGemmSm100(
-              scratch->activation, cache->weight, scratch->scales, cache->scales,
-              cache->alpha, outputData, output.dataType, n, k, m,
-              (void *)cudaStreamPerThread)
-        : FastllmCudaNvfp4CutlassGemmSm120(
-              scratch->activation, cache->weight, scratch->scales, cache->scales,
-              cache->alpha, outputData, output.dataType, n, k, m,
-              (void *)cudaStreamPerThread);
-    FastllmCudaFinishInput(input, inputData);
-    FastllmCudaFinishOutput(output, outputData);
-    Trace(ok ? "w4a4-cutlass" : "fallback", ok ? "success" : "CUTLASS launch failed",
-          n, m, k, arch);
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    void *biasData = bias.dims.empty() ? nullptr : FastllmCudaPrepareInput(bias);
+    void *gemmOutput = paddedOutput ? padded->output : outputData;
+    bool ok = inputData != nullptr && outputData != nullptr &&
+              (bias.dims.empty() || biasData != nullptr);
+    if (ok) {
+        ok = siluMulInput
+            ? FastllmCudaSiluMulNvfp4QuantizePadded(
+                  inputData, input.dataType, activation->activation, activation->scales,
+                  n, m, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread)
+            : FastllmCudaNvfp4QuantizeActivationPadded(
+                  inputData, input.dataType, activation->activation, activation->scales,
+                  n, m, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread);
+    }
+    if (ok) {
+        ok = arch < 120
+            ? FastllmCudaNvfp4CutlassGemmSm100(
+                  activation->activation, cache->weight, activation->scales, cache->scales,
+                  cache->alpha, gemmOutput, output.dataType,
+                  n, cache->paddedRows, cache->paddedColumns,
+                  (void *)cudaStreamPerThread)
+            : FastllmCudaNvfp4CutlassGemmSm120(
+                  activation->activation, cache->weight, activation->scales, cache->scales,
+                  cache->alpha, gemmOutput, output.dataType,
+                  n, cache->paddedRows, cache->paddedColumns,
+                  (void *)cudaStreamPerThread);
+    }
+    if (ok && (paddedOutput || biasData != nullptr)) {
+        ok = FinalizeOutput(gemmOutput, outputData, static_cast<const float *>(biasData),
+                            output.dataType, n, k, cache->paddedRows);
+    }
+
+    if (biasData != nullptr) FastllmCudaFinishInput(bias, biasData);
+    if (inputData != nullptr) FastllmCudaFinishInput(input, inputData);
+    if (outputData != nullptr) FastllmCudaFinishOutput(output, outputData);
+    Trace(ok ? (siluMulInput ? "w4a4-swiglu-cutlass" : "w4a4-cutlass") : "fallback",
+          ok ? "success" : "quantize/GEMM/finalize failed", n, m, k, arch);
     return ok;
+}
+
+bool TryCudaCutlassNvfp4W4A4(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, false);
+}
+
+bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, true);
 }
 
 void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight) {

@@ -17,22 +17,24 @@ template <typename T>
 __global__ void FastllmNvfp4QuantKernel(
         const T *__restrict__ input, uint8_t *__restrict__ output,
         uint8_t *__restrict__ outputScales, int rows, int columns,
+        int paddedColumns,
         int roundedRows, int kTiles, float globalScale) {
     const int group = blockIdx.y * blockDim.x + threadIdx.x;
-    const int groups = columns / 16;
+    const int groups = paddedColumns / 16;
     if (group >= groups) return;
     for (int row = blockIdx.x; row < roundedRows; row += gridDim.x) {
         fastllm_nvfp4::PackedVec<T> values;
-        const bool valid = row < rows;
+        const bool valid = row < rows && group < columns / 16;
+        const T *source = valid ? input + (size_t)row * columns + group * 16 : input;
         fastllm_nvfp4::Load256OrZero(
             reinterpret_cast<fastllm_nvfp4::U32x8 &>(values),
-            input + (size_t)row * columns + group * 16, valid);
+            source, valid);
         uint8_t *scale = fastllm_nvfp4::SwizzledScaleAddress(
             row, group, kTiles, outputScales);
         const uint64_t packed = fastllm_nvfp4::Quantize16(
             values, globalScale, scale);
-        if (valid) {
-            reinterpret_cast<uint64_t *>(output + (size_t)row * (columns / 2))[group] = packed;
+        if (row < rows) {
+            reinterpret_cast<uint64_t *>(output + (size_t)row * (paddedColumns / 2))[group] = packed;
         }
     }
 }
@@ -41,14 +43,15 @@ template <typename T>
 __global__ void FastllmSiluMulNvfp4QuantKernel(
         const T *__restrict__ input, uint8_t *__restrict__ output,
         uint8_t *__restrict__ outputScales, int rows, int hidden,
+        int paddedHidden,
         int roundedRows, int kTiles, float globalScale) {
     const int group = blockIdx.y * blockDim.x + threadIdx.x;
-    const int groups = hidden / 16;
+    const int groups = paddedHidden / 16;
     if (group >= groups) return;
     for (int row = blockIdx.x; row < roundedRows; row += gridDim.x) {
         fastllm_nvfp4::PackedVec<T> gate, up;
-        const bool valid = row < rows;
-        const T *rowInput = input + (size_t)row * hidden * 2;
+        const bool valid = row < rows && group < hidden / 16;
+        const T *rowInput = valid ? input + (size_t)row * hidden * 2 : input;
         fastllm_nvfp4::Load256OrZero(
             reinterpret_cast<fastllm_nvfp4::U32x8 &>(gate),
             rowInput + group * 16, valid);
@@ -60,8 +63,8 @@ __global__ void FastllmSiluMulNvfp4QuantKernel(
             row, group, kTiles, outputScales);
         const uint64_t packed = fastllm_nvfp4::Quantize16(
             activated, globalScale, scale);
-        if (valid) {
-            reinterpret_cast<uint64_t *>(output + (size_t)row * (hidden / 2))[group] = packed;
+        if (row < rows) {
+            reinterpret_cast<uint64_t *>(output + (size_t)row * (paddedHidden / 2))[group] = packed;
         }
     }
 }
@@ -69,21 +72,24 @@ __global__ void FastllmSiluMulNvfp4QuantKernel(
 __global__ void FastllmNvfp4Block16ToCutlassKernel(
         const uint8_t *__restrict__ source, uint8_t *__restrict__ packedWeight,
         uint8_t *__restrict__ weightScales, int rows, int columns,
+        int paddedRows, int paddedColumns,
         int sourceBytesPerRow, int kTiles) {
     const int group = blockIdx.y * blockDim.x + threadIdx.x;
-    const int groups = columns / 16;
+    const int groups = paddedColumns / 16;
     if (group >= groups) return;
-    for (int row = blockIdx.x; row < ((rows + 127) / 128) * 128; row += gridDim.x) {
+    for (int row = blockIdx.x; row < ((paddedRows + 127) / 128) * 128; row += gridDim.x) {
         uint64_t packed = 0;
         uint8_t scaleByte = 0;
-        if (row < rows) {
+        if (row < rows && group < columns / 16) {
             const uint8_t *block = source + (size_t)row * sourceBytesPerRow
                                  + (size_t)group * (8 + sizeof(float));
             packed = *reinterpret_cast<const uint64_t *>(block);
             __nv_fp8_e4m3 scale(*reinterpret_cast<const float *>(block + 8));
             scaleByte = reinterpret_cast<const uint8_t &>(scale);
+        }
+        if (row < paddedRows) {
             reinterpret_cast<uint64_t *>(
-                packedWeight + (size_t)row * (columns / 2))[group] = packed;
+                packedWeight + (size_t)row * (paddedColumns / 2))[group] = packed;
         }
         *fastllm_nvfp4::SwizzledScaleAddress(row, group, kTiles, weightScales) = scaleByte;
     }
@@ -102,33 +108,33 @@ static bool FastllmNvfp4RuntimeSupported() {
 
 template <typename T>
 static bool LaunchQuant(const void *input, uint8_t *output, uint8_t *scales,
-                        int rows, int columns, float globalScale,
+                        int rows, int columns, int paddedColumns, float globalScale,
                         cudaStream_t stream) {
-    const int groups = columns / 16;
+    const int groups = paddedColumns / 16;
     const int threads = std::min(256, groups);
     const int roundedRows = (rows + 127) / 128 * 128;
-    const int kTiles = (columns + 63) / 64;
+    const int kTiles = (paddedColumns + 63) / 64;
     dim3 block(threads);
     dim3 grid(std::min(roundedRows, 128), (groups + threads - 1) / threads);
     FastllmNvfp4QuantKernel<T><<<grid, block, 0, stream>>>(
         static_cast<const T *>(input), output, scales, rows, columns,
-        roundedRows, kTiles, globalScale);
+        paddedColumns, roundedRows, kTiles, globalScale);
     return cudaGetLastError() == cudaSuccess;
 }
 
 template <typename T>
 static bool LaunchSiluMulQuant(const void *input, uint8_t *output, uint8_t *scales,
-                               int rows, int hidden, float globalScale,
+                               int rows, int hidden, int paddedHidden, float globalScale,
                                cudaStream_t stream) {
-    const int groups = hidden / 16;
+    const int groups = paddedHidden / 16;
     const int threads = std::min(256, groups);
     const int roundedRows = (rows + 127) / 128 * 128;
-    const int kTiles = (hidden + 63) / 64;
+    const int kTiles = (paddedHidden + 63) / 64;
     dim3 block(threads);
     dim3 grid(std::min(roundedRows, 128), (groups + threads - 1) / threads);
     FastllmSiluMulNvfp4QuantKernel<T><<<grid, block, 0, stream>>>(
         static_cast<const T *>(input), output, scales, rows, hidden,
-        roundedRows, kTiles, globalScale);
+        paddedHidden, roundedRows, kTiles, globalScale);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -143,17 +149,30 @@ bool FastllmCudaNvfp4QuantizeActivation(
         const void *input, fastllm::DataType inputType,
         uint8_t *output, uint8_t *outputScales,
         int rows, int columns, float globalScale, void *streamPtr) {
+    return FastllmCudaNvfp4QuantizeActivationPadded(
+        input, inputType, output, outputScales, rows, columns, columns,
+        globalScale, streamPtr);
+}
+
+bool FastllmCudaNvfp4QuantizeActivationPadded(
+        const void *input, fastllm::DataType inputType,
+        uint8_t *output, uint8_t *outputScales,
+        int rows, int columns, int paddedColumns,
+        float globalScale, void *streamPtr) {
     if (!FastllmNvfp4RuntimeSupported() || input == nullptr || output == nullptr ||
         outputScales == nullptr || rows <= 0 || columns <= 0 || columns % 16 != 0 ||
+        paddedColumns < columns || paddedColumns % 32 != 0 ||
         !std::isfinite(globalScale) || globalScale <= 0.0f) {
         return false;
     }
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
     if (inputType == fastllm::DataType::FLOAT16) {
-        return LaunchQuant<half>(input, output, outputScales, rows, columns, globalScale, stream);
+        return LaunchQuant<half>(input, output, outputScales, rows, columns,
+                                 paddedColumns, globalScale, stream);
     }
     if (inputType == fastllm::DataType::BFLOAT16) {
-        return LaunchQuant<__nv_bfloat16>(input, output, outputScales, rows, columns, globalScale, stream);
+        return LaunchQuant<__nv_bfloat16>(input, output, outputScales, rows, columns,
+                                          paddedColumns, globalScale, stream);
     }
     return false;
 }
@@ -162,17 +181,30 @@ bool FastllmCudaSiluMulNvfp4Quantize(
         const void *input, fastllm::DataType inputType,
         uint8_t *output, uint8_t *outputScales,
         int rows, int hidden, float globalScale, void *streamPtr) {
+    return FastllmCudaSiluMulNvfp4QuantizePadded(
+        input, inputType, output, outputScales, rows, hidden, hidden,
+        globalScale, streamPtr);
+}
+
+bool FastllmCudaSiluMulNvfp4QuantizePadded(
+        const void *input, fastllm::DataType inputType,
+        uint8_t *output, uint8_t *outputScales,
+        int rows, int hidden, int paddedHidden,
+        float globalScale, void *streamPtr) {
     if (!FastllmNvfp4RuntimeSupported() || input == nullptr || output == nullptr ||
         outputScales == nullptr || rows <= 0 || hidden <= 0 || hidden % 16 != 0 ||
+        paddedHidden < hidden || paddedHidden % 32 != 0 ||
         !std::isfinite(globalScale) || globalScale <= 0.0f) {
         return false;
     }
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
     if (inputType == fastllm::DataType::FLOAT16) {
-        return LaunchSiluMulQuant<half>(input, output, outputScales, rows, hidden, globalScale, stream);
+        return LaunchSiluMulQuant<half>(input, output, outputScales, rows, hidden,
+                                        paddedHidden, globalScale, stream);
     }
     if (inputType == fastllm::DataType::BFLOAT16) {
-        return LaunchSiluMulQuant<__nv_bfloat16>(input, output, outputScales, rows, hidden, globalScale, stream);
+        return LaunchSiluMulQuant<__nv_bfloat16>(input, output, outputScales, rows, hidden,
+                                                 paddedHidden, globalScale, stream);
     }
     return false;
 }
@@ -180,19 +212,30 @@ bool FastllmCudaSiluMulNvfp4Quantize(
 bool FastllmCudaNvfp4Block16ToCutlass(
         const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
         int rows, int columns, void *streamPtr) {
+    return FastllmCudaNvfp4Block16ToCutlassPadded(
+        source, packedWeight, weightScales, rows, columns, rows, columns,
+        streamPtr);
+}
+
+bool FastllmCudaNvfp4Block16ToCutlassPadded(
+        const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
+        int rows, int columns, int paddedRows, int paddedColumns,
+        void *streamPtr) {
     if (!FastllmNvfp4RuntimeSupported() || source == nullptr || packedWeight == nullptr ||
-        weightScales == nullptr || rows <= 0 || columns <= 0 || columns % 32 != 0) {
+        weightScales == nullptr || rows <= 0 || columns <= 0 || columns % 16 != 0) {
         return false;
     }
-    const int groups = columns / 16;
+    if (paddedRows < rows || paddedColumns < columns || paddedRows % 32 != 0 ||
+        paddedColumns % 32 != 0) return false;
+    const int groups = paddedColumns / 16;
     const int threads = std::min(256, groups);
-    const int sourceBytesPerRow = groups * (8 + sizeof(float));
-    const int kTiles = (columns + 63) / 64;
-    dim3 grid(std::min((rows + 127) / 128 * 128, 128),
+    const int sourceBytesPerRow = (columns / 16) * (8 + sizeof(float));
+    const int kTiles = (paddedColumns + 63) / 64;
+    dim3 grid(std::min((paddedRows + 127) / 128 * 128, 128),
               (groups + threads - 1) / threads);
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
     FastllmNvfp4Block16ToCutlassKernel<<<grid, threads, 0, stream>>>(
         source, packedWeight, weightScales, rows, columns,
-        sourceBytesPerRow, kTiles);
+        paddedRows, paddedColumns, sourceBytesPerRow, kTiles);
     return cudaGetLastError() == cudaSuccess;
 }
