@@ -2085,6 +2085,8 @@ namespace {
     struct LinearNvfp4Fixture {
         int batch = 0, in = 0, out = 0;
         bool useBias = false;
+        bool checkRelease = false;
+        bool checkFallback = false;
         fastllm::DataType inputType = fastllm::DataType::FLOAT16;
         std::vector<float> inputValues;
         std::vector<float> biasValues;
@@ -2095,6 +2097,8 @@ namespace {
             in = params.GetInt("in");
             out = params.GetInt("out");
             useBias = params.GetInt("bias") != 0;
+            checkRelease = params.GetInt("check_release") != 0;
+            checkFallback = params.GetInt("check_fallback") != 0;
             const std::string dtype = params.GetString("input_type");
             inputType = dtype == "bf16" ? fastllm::DataType::BFLOAT16
                                          : fastllm::DataType::FLOAT16;
@@ -2187,7 +2191,28 @@ namespace {
             input.ToDevice(fastllm::DataDevice::CUDA);
             weight.ToDevice(fastllm::DataDevice::CUDA);
             fastllm::Linear(input, weight, bias, output);
-            return ConvertToFloat32Data(output);
+            if (checkRelease && FastllmCudaRuntimeArch() >= 100 &&
+                FastllmCudaRuntimeArch() < 130 && weight.cudaData != nullptr) {
+                throw std::runtime_error(
+                    "NVFP4 W4A4 retained the original CUDA weight after repack");
+            }
+            fastllm::Data nativeOutput = ConvertToFloat32Data(output);
+            if (checkFallback && FastllmCudaRuntimeArch() >= 100 &&
+                FastllmCudaRuntimeArch() < 130) {
+                const char *oldValue = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
+                const bool hadOldValue = oldValue != nullptr;
+                const std::string savedValue = hadOldValue ? oldValue : "";
+                setenv("FASTLLM_CUDA_NVFP4_W4A4", "0", 1);
+                fastllm::Data fallbackOutput;
+                fastllm::Linear(input, weight, bias, fallbackOutput);
+                if (hadOldValue) setenv("FASTLLM_CUDA_NVFP4_W4A4", savedValue.c_str(), 1);
+                else unsetenv("FASTLLM_CUDA_NVFP4_W4A4");
+                if (weight.cudaData == nullptr) {
+                    throw std::runtime_error(
+                        "NVFP4 fallback did not restore the original CUDA weight");
+                }
+            }
+            return nativeOutput;
         }
     };
 
@@ -2266,6 +2291,8 @@ namespace {
                 params.Add("out", "1000", "output features; CUTLASS pads to 32 and slices");
                 params.Add("bias", "1", "add FP32 bias after W4A4 GEMM");
                 params.Add("input_type", "fp16", "fp16 or bf16; Marlin accepts fp16 only");
+                params.Add("check_release", "0", "require W4A4 to release the original CUDA weight");
+                params.Add("check_fallback", "0", "disable W4A4 after repack and verify fallback restore");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {

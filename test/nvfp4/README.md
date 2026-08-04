@@ -25,6 +25,16 @@
 - `FASTLLM_CUDA_MOE_NVFP4_W4A4=0`：关闭 grouped MoE W4A4。
 - `FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=N`：grouped MoE 门槛，默认 16。
 
+## 权重显存生命周期
+
+首次命中 W4A4 时，FastLLM 将 `NVFP4_BLOCK_16` 重排为 CUTLASS FP4 权重和
+E4M3 scale。重排流同步完成后，原始 `cudaData` 会被归还给 CUDA 内存池，后续按
+`Data + device + shape` 命中重排缓存，不再保留两份 GPU 权重。CPU/mmap 原始数据
+继续保留；W4A4 失败需要 legacy fallback 时，会按需恢复原始 CUDA 权重。
+
+`ops-functional` 的 dense 用例会同时检查：原始 CUDA 权重已释放，以及关闭 W4A4
+后 fallback 能恢复原始权重。
+
 ## 模型和显卡
 
 - dense W4A4 首选：`nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4`；B200/B300（SM100）或 RTX PRO 6000 Blackwell（SM120，96GB）。这是最小、最便于 forward_check 的 W4A4 模型。

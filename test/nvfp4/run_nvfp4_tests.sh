@@ -74,6 +74,7 @@ run_ops_functional() {
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=1 --param in=1008 --param out=1000 \
             --param bias=1 --param input_type=bf16 \
+            --param check_release=1 --param check_fallback=1 \
             --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         run_logged op_swiglu_fp4_quant "${optest}" \
             --op nvfp4_swiglu_quant --device cuda:0 \
