@@ -285,9 +285,12 @@ static bool RunCutlassNvfp4W4A4(
     void *outputData = FastllmCudaPrepareOutput(output);
     void *biasData = bias.dims.empty() ? nullptr : FastllmCudaPrepareInput(bias);
     void *gemmOutput = paddedOutput ? padded->output : outputData;
+    const char *failureStage = "prepare input/output";
     bool ok = inputData != nullptr && outputData != nullptr &&
               (bias.dims.empty() || biasData != nullptr);
     if (ok) {
+        failureStage = siluMulInput ? "SwiGLU activation quantization" :
+                                      "activation quantization";
         ok = siluMulInput
             ? FastllmCudaSiluMulNvfp4QuantizePadded(
                   inputData, input.dataType, activation->activation, activation->scales,
@@ -297,6 +300,7 @@ static bool RunCutlassNvfp4W4A4(
                   n, m, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread);
     }
     if (ok) {
+        failureStage = arch < 120 ? "SM100 CUTLASS GEMM" : "SM120 CUTLASS GEMM";
         ok = arch < 120
             ? FastllmCudaNvfp4CutlassGemmSm100(
                   activation->activation, cache->weight, activation->scales, cache->scales,
@@ -310,6 +314,7 @@ static bool RunCutlassNvfp4W4A4(
                   (void *)cudaStreamPerThread);
     }
     if (ok && (paddedOutput || biasData != nullptr)) {
+        failureStage = "output finalize";
         ok = FinalizeOutput(gemmOutput, outputData, static_cast<const float *>(biasData),
                             output.dataType, n, k, cache->paddedRows);
     }
@@ -318,7 +323,7 @@ static bool RunCutlassNvfp4W4A4(
     if (inputData != nullptr) FastllmCudaFinishInput(input, inputData);
     if (outputData != nullptr) FastllmCudaFinishOutput(output, outputData);
     Trace(ok ? (siluMulInput ? "w4a4-swiglu-cutlass" : "w4a4-cutlass") : "fallback",
-          ok ? "success" : "quantize/GEMM/finalize failed", n, m, k, arch);
+          ok ? "success" : failureStage, n, m, k, arch);
     return ok;
 }
 

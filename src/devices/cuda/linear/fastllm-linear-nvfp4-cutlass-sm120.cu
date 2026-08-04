@@ -10,8 +10,23 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace {
 using namespace cute;
+
+bool TraceEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_NVFP4_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+void TraceFailure(const char *stage, cutlass::Status status) {
+    if (TraceEnabled()) {
+        std::fprintf(stderr, "[fastllm][nvfp4][sm120] stage=%s status=%s\n",
+                     stage, cutlassGetStatusString(status));
+    }
+}
 struct ConfigMedium {
     using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
     using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
@@ -83,12 +98,30 @@ bool Run(const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
     Gemm gemm;
     size_t bytes = Gemm::get_workspace_size(args);
     void *workspace = bytes == 0 ? nullptr : FastllmCudaMalloc(bytes);
-    if (bytes != 0 && workspace == nullptr) return false;
+    if (bytes != 0 && workspace == nullptr) {
+        if (TraceEnabled()) {
+            std::fprintf(stderr, "[fastllm][nvfp4][sm120] stage=workspace status=allocation_failed bytes=%zu\n",
+                         bytes);
+        }
+        return false;
+    }
     cutlass::Status status = gemm.can_implement(args);
-    if (status == cutlass::Status::kSuccess) status = gemm.initialize(args, workspace, stream);
-    if (status == cutlass::Status::kSuccess) status = gemm.run(stream);
+    if (status != cutlass::Status::kSuccess) TraceFailure("can_implement", status);
+    if (status == cutlass::Status::kSuccess) {
+        status = gemm.initialize(args, workspace, stream);
+        if (status != cutlass::Status::kSuccess) TraceFailure("initialize", status);
+    }
+    if (status == cutlass::Status::kSuccess) {
+        status = gemm.run(stream);
+        if (status != cutlass::Status::kSuccess) TraceFailure("run", status);
+    }
     if (workspace != nullptr) FastllmCudaFree(workspace);
-    return status == cutlass::Status::kSuccess && cudaGetLastError() == cudaSuccess;
+    const cudaError_t cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess && TraceEnabled()) {
+        std::fprintf(stderr, "[fastllm][nvfp4][sm120] stage=launch status=%s\n",
+                     cudaGetErrorString(cudaStatus));
+    }
+    return status == cutlass::Status::kSuccess && cudaStatus == cudaSuccess;
 }
 
 template <typename Out>
