@@ -80,7 +80,12 @@ __global__ void FastllmNvfp4Block16ToCutlassKernel(
         if (row < rows && group < columns / 16) {
             const uint8_t *block = source + (size_t)row * sourceBytesPerRow
                                  + (size_t)group * (8 + sizeof(float));
-            packed = *reinterpret_cast<const uint64_t *>(block);
+            // NVFP4_BLOCK_16 stores 8 packed bytes plus one float scale, so
+            // adjacent blocks are 12 bytes apart. Odd blocks are only
+            // 4-byte aligned and must not be read through a uint64_t pointer.
+            const uint32_t packedLo = *reinterpret_cast<const uint32_t *>(block);
+            const uint32_t packedHi = *reinterpret_cast<const uint32_t *>(block + 4);
+            packed = uint64_t(packedLo) | (uint64_t(packedHi) << 32);
             __nv_fp8_e4m3 scale(*reinterpret_cast<const float *>(block + 8));
             scaleByte = reinterpret_cast<const uint8_t &>(scale);
         }
