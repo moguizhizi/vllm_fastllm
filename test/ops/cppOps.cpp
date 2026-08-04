@@ -2044,7 +2044,7 @@ namespace {
                 return false;
 #endif
             },
-            [](const OpTestParams &params, const std::string &device) {
+            [](const OpTestParams &params, const std::string &device) -> fastllm::Data {
 #if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
                 ScopedFirstDevice guard(device);
                 Nvfp4SwiGLUQuantState state(params);
