@@ -2191,6 +2191,70 @@ namespace {
         }
     };
 
+    struct LinearNvfp4BenchState {
+        int batch = 0, in = 0, out = 0;
+        fastllm::Data input, weight, bias, output;
+
+        void Init(const OpTestParams &params) {
+            LinearNvfp4Fixture fixture(params);
+            batch = fixture.batch;
+            in = fixture.in;
+            out = fixture.out;
+            fastllm::Data hostInput = fixture.MakeInput();
+            input.CopyFrom(hostInput);
+            fixture.MakeWeight(weight);
+            if (fixture.useBias) {
+                fastllm::Data hostBias = fixture.MakeBias();
+                bias.CopyFrom(hostBias);
+                bias.ToDevice(fastllm::DataDevice::CUDA);
+            }
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void Run() {
+            fastllm::Linear(input, weight, bias, output);
+        }
+    };
+
+    static BenchmarkResult BenchmarkLinearNvfp4Cuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<LinearNvfp4BenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; ++i) state->Run();
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; ++i) state->Run();
+        ForceDeviceSync();
+        auto end = Clock::now();
+
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        result.bytesMoved = (double)state->batch * state->in * 2.0 +
+                            (double)fastllm::GetDataBytes(
+                                fastllm::DataType::NVFP4_BLOCK_16,
+                                state->out, state->in) +
+                            (double)state->batch * state->out * 2.0;
+        result.flops = 2.0 * state->batch * state->in * state->out;
+        const double seconds = result.avgMs / 1000.0;
+        if (seconds > 0.0) {
+            result.bandwidthGBps = result.bytesMoved / seconds / 1e9;
+            result.computeTFlops = result.flops / seconds / 1e12;
+        }
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("linear_nvfp4 benchmark requires CUDA");
+#endif
+    }
+
     static OpCase MakeLinearNvfp4Case() {
         OpCase result{
             "linear_nvfp4",
@@ -2240,6 +2304,7 @@ namespace {
         result.runReference = [](const OpTestParams &params, const std::string&) {
             return LinearNvfp4Fixture(params).Reference();
         };
+        result.benchmarkOverride = BenchmarkLinearNvfp4Cuda;
         return result;
     }
 
