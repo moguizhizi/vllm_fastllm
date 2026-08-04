@@ -34,8 +34,9 @@
 
 以下命令都把原始命令和完整输出保存到 `NVFP4_LOG_DIR`。建议同一次验证固定同一个目录。
 
-远端编译。脚本自动识别 B200/B300、RTX 5090/RTX PRO 6000 等 GPU，
-并通过仓库现有的 `install.sh` 编译 FastLLM 和 `optest`：
+远端编译。脚本通过 `nvidia-smi` 自动识别 B200/B300、RTX 5090/RTX PRO 6000
+等 GPU，把实际算力显式传给 `CUDA_ARCH`，并通过仓库现有的 `install.sh`
+编译 FastLLM 和 `optest`，避免旧版 CMake 产生无效的 `compute_native`：
 
 ```bash
 export NVFP4_LOG_DIR="$PWD/test/nvfp4/logs/remote-sm120-$(date -u +%Y%m%dT%H%M%SZ)"

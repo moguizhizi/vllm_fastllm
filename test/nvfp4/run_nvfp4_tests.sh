@@ -6,15 +6,13 @@ log_dir=${NVFP4_LOG_DIR:-"${repo_dir}/test/nvfp4/logs/$(date -u +%Y%m%dT%H%M%SZ)
 suite=${1:-ops}
 model_path=${NVFP4_MODEL:-}
 gpu_profile=${NVFP4_GPU_PROFILE:-auto}
+cuda_arch=${NVFP4_CUDA_ARCH:-auto}
 optest=${NVFP4_OPTEST:-"${repo_dir}/optest"}
 nvcc_path=${NVFP4_NVCC:-$(command -v nvcc || true)}
 mkdir -p "${log_dir}"
 
 resolve_gpu_profile() {
-    if [[ "${gpu_profile}" != auto ]]; then
-        return
-    fi
-    local compute_cap major minor arch
+    local compute_cap major minor detected_arch
     compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed -n '1p')
     major=${compute_cap%%.*}
     minor=${compute_cap#*.}
@@ -22,16 +20,21 @@ resolve_gpu_profile() {
         echo "cannot detect GPU compute capability: ${compute_cap}" >&2
         exit 2
     fi
-    arch=$((10#${major} * 10 + 10#${minor}))
-    if ((arch >= 120 && arch < 130)); then
-        gpu_profile=sm120
-    elif ((arch >= 100 && arch < 120)); then
-        gpu_profile=sm100
-    else
-        gpu_profile=preblackwell
+    detected_arch=$((10#${major} * 10 + 10#${minor}))
+    if [[ "${gpu_profile}" == auto ]]; then
+        if ((detected_arch >= 120 && detected_arch < 130)); then
+            gpu_profile=sm120
+        elif ((detected_arch >= 100 && detected_arch < 120)); then
+            gpu_profile=sm100
+        else
+            gpu_profile=preblackwell
+        fi
     fi
-    printf 'Auto-detected GPU profile: %s (compute capability %s)\n' \
-        "${gpu_profile}" "${compute_cap}"
+    if [[ "${cuda_arch}" == auto ]]; then
+        cuda_arch=${detected_arch}
+    fi
+    printf 'GPU profile: %s; CUDA_ARCH: %s; compute capability: %s\n' \
+        "${gpu_profile}" "${cuda_arch}" "${compute_cap}"
 }
 
 run_logged() {
@@ -58,10 +61,8 @@ run_build() {
         'git rev-parse HEAD; git status --short --branch; nvidia-smi'
     run_logged nvcc_version "${nvcc_path}" --version
     install_args=(-DUSE_CUDA=ON -DUNIT_TEST=ON
-        "-DCMAKE_CUDA_COMPILER=${nvcc_path}")
-    if [[ -n "${NVFP4_CUDA_ARCH:-}" ]]; then
-        install_args+=("-DCUDA_ARCH=${NVFP4_CUDA_ARCH}")
-    fi
+        "-DCMAKE_CUDA_COMPILER=${nvcc_path}"
+        "-DCUDA_ARCH=${cuda_arch}")
     run_logged install bash "${repo_dir}/install.sh" "${install_args[@]}"
 }
 
