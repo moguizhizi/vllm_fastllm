@@ -107,13 +107,13 @@ run_ops_functional() {
 run_ops_performance() {
     if [[ "${gpu_profile}" == sm100 || "${gpu_profile}" == sm120 ]]; then
         run_logged op_dense_w4a4_decode_perf env \
-            FASTLLM_CUDA_NVFP4_TRACE=1 FASTLLM_CUDA_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_NVFP4_W4A4=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=1 --param in=1024 --param out=1024 \
             --param bias=0 --param input_type=bf16 --warmup 20 --iters 200 \
             --atol 0.20 --rtol 0.20
         run_logged op_dense_w4a4_prefill_perf env \
-            FASTLLM_CUDA_NVFP4_TRACE=1 FASTLLM_CUDA_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_NVFP4_W4A4=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=32 --param in=1024 --param out=1024 \
             --param bias=0 --param input_type=bf16 --warmup 20 --iters 200 \
@@ -124,7 +124,7 @@ run_ops_performance() {
             --warmup 20 --iters 200 --atol 0.20 --rtol 0.20
         if [[ "${gpu_profile}" == sm100 ]]; then
             run_logged op_grouped_moe_w4a4_perf env \
-                FASTLLM_CUDA_NVFP4_TRACE=1 FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
+                FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
                 FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=16 \
                 "${optest}" --op mergemoe_fp8 --device cuda:0 \
                 --param weight_type=nvfp4 --param path=operator \
@@ -134,7 +134,6 @@ run_ops_performance() {
         fi
     else
         run_logged op_dense_marlin_w4a16_perf env \
-            FASTLLM_CUDA_NVFP4_TRACE=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=8 --param in=1024 --param out=1024 \
             --param bias=0 --param input_type=fp16 --warmup 20 --iters 200 \
