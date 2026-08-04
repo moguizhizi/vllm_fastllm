@@ -248,8 +248,7 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
             if (weight != nullptr && weight->dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
                 weight->cudaData == nullptr &&
                 !weight->RestoreCudaDataForRepackedWeight()) {
-                fastllm::ErrorInFastLLM(
-                    "NVFP4 grouped MoE fallback cannot restore an original weight.\n");
+                throw ("NVFP4 grouped MoE fallback cannot restore an original weight.");
             }
         }
     }
