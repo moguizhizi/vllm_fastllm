@@ -1,6 +1,7 @@
 /* Apache-2.0: kernels adapted from vLLM nvfp4_quant_kernels.cu and
  * activation_nvfp4_quant_fusion_kernels.cu. */
 #include "fastllm-cuda.cuh"
+#define NVFP4_ENABLE_ELTS16 1
 #include "fastllm-nvfp4-utils.cuh"
 
 #include <cuda_bf16.h>
@@ -19,22 +20,21 @@ __global__ void FastllmNvfp4QuantKernel(
         uint8_t *__restrict__ outputScales, int rows, int columns,
         int paddedColumns,
         int roundedRows, int kTiles, float globalScale) {
-    const int group = blockIdx.y * blockDim.x + threadIdx.x;
-    const int groups = paddedColumns / 16;
-    if (group >= groups) return;
+    const int pack = blockIdx.y * blockDim.x + threadIdx.x;
+    const int packs = paddedColumns / fastllm_nvfp4::kElementsPerThread;
+    if (pack >= packs) return;
     for (int row = blockIdx.x; row < roundedRows; row += gridDim.x) {
         fastllm_nvfp4::PackedVec<T> values;
-        const bool valid = row < rows && group < columns / 16;
-        const T *source = valid ? input + (size_t)row * columns + group * 16 : input;
-        fastllm_nvfp4::Load256OrZero(
-            reinterpret_cast<fastllm_nvfp4::U32x8 &>(values),
-            source, valid);
-        uint8_t *scale = fastllm_nvfp4::SwizzledScaleAddress(
-            row, group, kTiles, outputScales);
-        const uint64_t packed = fastllm_nvfp4::Quantize16(
-            values, globalScale, scale);
+        const int element = pack * fastllm_nvfp4::kElementsPerThread;
+        const bool valid = row < rows && element < columns;
+        const T *source = valid ? input + (size_t)row * columns + element : input;
+        fastllm_nvfp4::LoadOrZero(values, source, valid);
+        uint8_t *scale = fastllm_nvfp4::QuantScaleAddress(
+            row, pack, kTiles, outputScales);
+        const auto packed = fastllm_nvfp4::Quantize(values, globalScale, scale);
         if (row < rows) {
-            reinterpret_cast<uint64_t *>(output + (size_t)row * (paddedColumns / 2))[group] = packed;
+            fastllm_nvfp4::StoreFp4(
+                output + (size_t)row * (paddedColumns / 2) + element / 2, packed);
         }
     }
 }
@@ -45,26 +45,23 @@ __global__ void FastllmSiluMulNvfp4QuantKernel(
         uint8_t *__restrict__ outputScales, int rows, int hidden,
         int paddedHidden,
         int roundedRows, int kTiles, float globalScale) {
-    const int group = blockIdx.y * blockDim.x + threadIdx.x;
-    const int groups = paddedHidden / 16;
-    if (group >= groups) return;
+    const int pack = blockIdx.y * blockDim.x + threadIdx.x;
+    const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
+    if (pack >= packs) return;
     for (int row = blockIdx.x; row < roundedRows; row += gridDim.x) {
         fastllm_nvfp4::PackedVec<T> gate, up;
-        const bool valid = row < rows && group < hidden / 16;
+        const int element = pack * fastllm_nvfp4::kElementsPerThread;
+        const bool valid = row < rows && element < hidden;
         const T *rowInput = valid ? input + (size_t)row * hidden * 2 : input;
-        fastllm_nvfp4::Load256OrZero(
-            reinterpret_cast<fastllm_nvfp4::U32x8 &>(gate),
-            rowInput + group * 16, valid);
-        fastllm_nvfp4::Load256OrZero(
-            reinterpret_cast<fastllm_nvfp4::U32x8 &>(up),
-            rowInput + hidden + group * 16, valid);
+        fastllm_nvfp4::LoadOrZero(gate, rowInput + element, valid);
+        fastllm_nvfp4::LoadOrZero(up, rowInput + hidden + element, valid);
         auto activated = fastllm_nvfp4::SiluMul(gate, up);
-        uint8_t *scale = fastllm_nvfp4::SwizzledScaleAddress(
-            row, group, kTiles, outputScales);
-        const uint64_t packed = fastllm_nvfp4::Quantize16(
-            activated, globalScale, scale);
+        uint8_t *scale = fastllm_nvfp4::QuantScaleAddress(
+            row, pack, kTiles, outputScales);
+        const auto packed = fastllm_nvfp4::Quantize(activated, globalScale, scale);
         if (row < rows) {
-            reinterpret_cast<uint64_t *>(output + (size_t)row * (paddedHidden / 2))[group] = packed;
+            fastllm_nvfp4::StoreFp4(
+                output + (size_t)row * (paddedHidden / 2) + element / 2, packed);
         }
     }
 }
@@ -110,12 +107,12 @@ template <typename T>
 static bool LaunchQuant(const void *input, uint8_t *output, uint8_t *scales,
                         int rows, int columns, int paddedColumns, float globalScale,
                         cudaStream_t stream) {
-    const int groups = paddedColumns / 16;
-    const int threads = std::min(256, groups);
+    const int packs = paddedColumns / fastllm_nvfp4::kElementsPerThread;
+    const int threads = std::min(256, packs);
     const int roundedRows = (rows + 127) / 128 * 128;
     const int kTiles = (paddedColumns + 63) / 64;
     dim3 block(threads);
-    dim3 grid(std::min(roundedRows, 128), (groups + threads - 1) / threads);
+    dim3 grid(std::min(roundedRows, 128), (packs + threads - 1) / threads);
     FastllmNvfp4QuantKernel<T><<<grid, block, 0, stream>>>(
         static_cast<const T *>(input), output, scales, rows, columns,
         paddedColumns, roundedRows, kTiles, globalScale);
@@ -126,12 +123,12 @@ template <typename T>
 static bool LaunchSiluMulQuant(const void *input, uint8_t *output, uint8_t *scales,
                                int rows, int hidden, int paddedHidden, float globalScale,
                                cudaStream_t stream) {
-    const int groups = paddedHidden / 16;
-    const int threads = std::min(256, groups);
+    const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
+    const int threads = std::min(256, packs);
     const int roundedRows = (rows + 127) / 128 * 128;
     const int kTiles = (paddedHidden + 63) / 64;
     dim3 block(threads);
-    dim3 grid(std::min(roundedRows, 128), (groups + threads - 1) / threads);
+    dim3 grid(std::min(roundedRows, 128), (packs + threads - 1) / threads);
     FastllmSiluMulNvfp4QuantKernel<T><<<grid, block, 0, stream>>>(
         static_cast<const T *>(input), output, scales, rows, hidden,
         paddedHidden, roundedRows, kTiles, globalScale);
