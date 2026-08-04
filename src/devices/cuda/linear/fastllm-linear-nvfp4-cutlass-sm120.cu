@@ -27,6 +27,21 @@ void TraceFailure(const char *stage, cutlass::Status status) {
                      stage, cutlassGetStatusString(status));
     }
 }
+
+template <typename Gemm>
+void TraceInitializeDetails(size_t workspaceBytes) {
+    if (!TraceEnabled()) return;
+    using Kernel = typename Gemm::GemmKernel;
+    int device = 0;
+    int maxOptinSharedMemory = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&maxOptinSharedMemory,
+                           cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    std::fprintf(stderr,
+                 "[fastllm][nvfp4][sm120] required_smem=%d max_optin_smem=%d workspace=%zu\n",
+                 int(Kernel::SharedStorageSize), maxOptinSharedMemory,
+                 workspaceBytes);
+}
 struct ConfigMedium {
     using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
     using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
@@ -109,7 +124,10 @@ bool Run(const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
     if (status != cutlass::Status::kSuccess) TraceFailure("can_implement", status);
     if (status == cutlass::Status::kSuccess) {
         status = gemm.initialize(args, workspace, stream);
-        if (status != cutlass::Status::kSuccess) TraceFailure("initialize", status);
+        if (status != cutlass::Status::kSuccess) {
+            TraceFailure("initialize", status);
+            TraceInitializeDetails<Gemm>(bytes);
+        }
     }
     if (status == cutlass::Status::kSuccess) {
         status = gemm.run(stream);

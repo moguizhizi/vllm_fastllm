@@ -74,6 +74,17 @@ static void Trace(const char *path, const char *reason, int n, int m, int k, int
     }
 }
 
+static bool TraceSynchronize(const char *stage) {
+    if (!TraceEnabled()) return true;
+    const cudaError_t status = cudaStreamSynchronize(cudaStreamPerThread);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "[fastllm][nvfp4] stage=%s status=%s\n",
+                     stage, cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
 static bool SemanticsSupported(const fastllm::Data &input,
                                const fastllm::Data &weight,
                                const fastllm::Data &bias,
@@ -272,6 +283,10 @@ static bool RunCutlassNvfp4W4A4(
         Trace("fallback", "weight cache unavailable", n, m, k, arch);
         return false;
     }
+    if (!TraceSynchronize("weight repack")) {
+        Trace("fallback", "weight repack", n, m, k, arch);
+        return false;
+    }
     ActivationScratch *activation = GetActivationScratch(n, cache->paddedColumns);
     const bool paddedOutput = cache->paddedRows != k;
     OutputScratch *padded = paddedOutput
@@ -298,6 +313,7 @@ static bool RunCutlassNvfp4W4A4(
             : FastllmCudaNvfp4QuantizeActivationPadded(
                   inputData, input.dataType, activation->activation, activation->scales,
                   n, m, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread);
+        if (ok) ok = TraceSynchronize(failureStage);
     }
     if (ok) {
         failureStage = arch < 120 ? "SM100 CUTLASS GEMM" : "SM120 CUTLASS GEMM";
