@@ -2065,7 +2065,11 @@ namespace fastllm {
         if (this->cudaDataBorrowed || this->multiDeviceData) {
             return false;
         }
-        CudaFreeForData(*this, this->cudaData);
+        // The CUTLASS copy is the persistent weight after repacking.  Returning
+        // the source to FastLLM's cache only marks the allocation idle, so a
+        // large model can still exhaust physical VRAM while building caches.
+        // Remove this one-shot source allocation from the pool immediately.
+        FastllmCudaForceFree(this->cudaData);
         this->cudaData = nullptr;
         this->cudaDataBorrowed = false;
         return true;
