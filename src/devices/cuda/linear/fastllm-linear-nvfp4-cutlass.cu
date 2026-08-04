@@ -171,7 +171,7 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
 static void RestoreOriginalWeightForFallback(fastllm::Data &weight) {
     if (weight.cudaData == nullptr &&
         !weight.RestoreCudaDataForRepackedWeight()) {
-        ErrorInFastLLM(
+        fastllm::ErrorInFastLLM(
             "NVFP4 W4A4 fallback requires the original CPU/mmap weight, "
             "but the released CUDA source cannot be restored.\n");
     }
