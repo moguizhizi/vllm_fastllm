@@ -79,11 +79,12 @@ def strip_trailing_eos(tokenizer, token_ids):
 def run_vllm(args):
     try:
         from transformers import AutoTokenizer
-        from vllm import LLM, SamplingParams
+        from vllm.entrypoints.llm import LLM
+        from vllm.sampling_params import SamplingParams
     except ImportError as error:
         raise RuntimeError(
-            "vLLM mode needs a Python environment containing vllm and transformers; "
-            "set NVFP4_VLLM_PYTHON=/path/to/python if needed") from error
+            "vLLM mode failed to import its offline LLM API; verify the vLLM "
+            "installation or set NVFP4_VLLM_PYTHON=/path/to/python") from error
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     prompt = render_prompt(tokenizer, get_messages(args.case_index))
