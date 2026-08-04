@@ -156,10 +156,10 @@ require_model() {
 
 run_forward() {
     require_model
-    run_logged forward_check env FASTLLM_CUDA_NVFP4_TRACE=1 \
-        python test/basic/forward_check.py --model "${model_path}" \
-        --tokens 8 --hf_device cuda --flm_dtype auto \
-        --flm_atype bfloat16 --flm_device cuda
+    run_logged forward_check_vllm env FASTLLM_CUDA_NVFP4_TRACE=1 \
+        python test/nvfp4/forward_check_vllm.py --model "${model_path}" \
+        --tokens 8 --flm-dtype auto --flm-atype bfloat16 \
+        --flm-device cuda --result-dir "${log_dir}/forward-vllm-results"
 }
 
 run_model() {

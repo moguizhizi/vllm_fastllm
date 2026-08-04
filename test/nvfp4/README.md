@@ -1,6 +1,7 @@
 # NVFP4 验证
 
-本目录只增加测试入口，不复制 `forward_check.py`、`prefill.py`、`decode.py`。
+本目录增加 NVFP4 专用的 vLLM 对照测试入口，不修改通用 `forward_check.py`、
+`prefill.py`、`decode.py`。
 运行脚本会把命令、UTC 时间、工作目录和完整输出一并写入 `test/nvfp4/logs/`。
 
 ## 调用条件
@@ -28,7 +29,7 @@
 ## 权重显存生命周期
 
 首次命中 W4A4 时，FastLLM 将 `NVFP4_BLOCK_16` 重排为 CUTLASS FP4 权重和
-E4M3 scale。重排流同步完成后，原始 `cudaData` 会被归还给 CUDA 内存池，后续按
+E4M3 scale。重排流同步完成后，原始 `cudaData` 会从 CUDA 内存池移除并真正释放，后续按
 `Data + device + shape` 命中重排缓存，不再保留两份 GPU 权重。CPU/mmap 原始数据
 继续保留；W4A4 失败需要 legacy fallback 时，会按需恢复原始 CUDA 权重。
 
@@ -37,7 +38,7 @@ E4M3 scale。重排流同步完成后，原始 `cudaData` 会被归还给 CUDA �
 
 ## 模型和显卡
 
-- dense W4A4 首选：`nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4`；B200/B300（SM100）或 RTX PRO 6000 Blackwell（SM120，96GB）。这是最小、最便于 forward_check 的 W4A4 模型。
+- dense W4A4 首选：`nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4`；B200/B300（SM100）或 RTX PRO 6000 Blackwell（SM120，96GB）。
 - grouped MoE W4A4：`nvidia/Qwen3-30B-A3B-NVFP4`；当前路径用 B200/B300（SM100）。它不是“小总参数模型”，但 active 参数约 3B，是目前更现实的 MoE 检查点。
 - Marlin W4A16：`nm-testing/fp4_nvfp4a16-e2e`；A100、H100、RTX 4090 等 SM75-SM99 GPU。
 
@@ -81,10 +82,14 @@ Marlin 算子功能与性能：
 NVFP4_GPU_PROFILE=preblackwell test/nvfp4/run_nvfp4_tests.sh ops
 ```
 
-forward_check：
+forward_check 只使用 vLLM 作为参考实现。vLLM 和 FastLLM 在两个独立进程中依次
+加载同一个 NVFP4 模型，避免两份模型同时占用显存；检查输入 token、贪心生成 token、
+首 token 以及 top-k logprob。运行环境必须能 `import vllm`。若 vLLM 安装在另一个
+Python 环境，用 `NVFP4_VLLM_PYTHON` 指定：
 
 ```bash
 NVFP4_MODEL=/models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
+NVFP4_VLLM_PYTHON=/path/to/vllm/python \
   test/nvfp4/run_nvfp4_tests.sh forward
 ```
 
@@ -114,7 +119,9 @@ op_dense_w4a4_prefill_perf.log
 op_swiglu_fp4_quant.log
 op_swiglu_fp4_quant_fp16.log
 op_swiglu_fp4_quant_perf.log
-forward_check.log
+forward_check_vllm.log
+forward-vllm-results/vllm.json
+forward-vllm-results/fastllm.json
 model_prefill.log
 model_decode.log
 ```
