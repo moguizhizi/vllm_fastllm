@@ -79,6 +79,10 @@ run_ops_functional() {
             --op nvfp4_swiglu_quant --device cuda:0 \
             --param rows=32 --param hidden=1024 --param input_type=bf16 \
             --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        run_logged op_swiglu_fp4_quant_fp16 "${optest}" \
+            --op nvfp4_swiglu_quant --device cuda:0 \
+            --param rows=32 --param hidden=1024 --param input_type=fp16 \
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         if [[ "${gpu_profile}" == sm100 ]]; then
             run_logged op_grouped_moe_w4a4_check env \
                 FASTLLM_CUDA_NVFP4_TRACE=1 \
