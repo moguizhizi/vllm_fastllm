@@ -612,6 +612,13 @@ namespace fastllm {
 
         void FreeSpace(); // 回收设备上的内存
 
+        // Repacked CUDA weights can replace the original device allocation while
+        // the logical tensor remains on CUDA.  The host/mmap copy is retained so
+        // a legacy fallback can restore the original representation on demand.
+        bool ReleaseCudaDataForRepackedWeight();
+
+        bool RestoreCudaDataForRepackedWeight();
+
         void UpdateUnitSize(); // 更新unitSize
 
         void Resize(const std::vector <int> &dims); // 更改尺寸

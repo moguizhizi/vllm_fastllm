@@ -94,8 +94,7 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
             down->dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
             gate->blockM != 16 || down->blockM != 16 ||
             gate->dims != std::vector<int>({inter * 2, hidden}) ||
-            down->dims != std::vector<int>({hidden, inter}) ||
-            gate->cudaData == nullptr || down->cudaData == nullptr) return false;
+            down->dims != std::vector<int>({hidden, inter})) return false;
     }
 
     w1.dataDevice = fastllm::DataDevice::CUDA;
@@ -243,6 +242,17 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
         ok = Run<__nv_bfloat16>(input, w1, w2, output, weights, weightsBatch,
             routeRows, routeScales, routePositions, expertStarts, expertCounts,
             batch, topk, totalTasks, hidden, inter);
+    if (!ok) {
+        for (int i = 2; i < weightsBatch; ++i) {
+            fastllm::Data *weight = weights[i];
+            if (weight != nullptr && weight->dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
+                weight->cudaData == nullptr &&
+                !weight->RestoreCudaDataForRepackedWeight()) {
+                ErrorInFastLLM(
+                    "NVFP4 grouped MoE fallback cannot restore an original weight.\n");
+            }
+        }
+    }
     const char *trace = std::getenv("FASTLLM_CUDA_NVFP4_TRACE");
     if (trace && trace[0] != '\0' && trace[0] != '0') {
         std::fprintf(stderr,

@@ -2024,6 +2024,7 @@ namespace fastllm {
 
     void Data::FreeSpace() {
 #ifdef USE_CUDA
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2053,6 +2054,73 @@ namespace fastllm {
             this->cudaData = nullptr;
             this->cudaDataBorrowed = false;
         }
+#endif
+    }
+
+    bool Data::ReleaseCudaDataForRepackedWeight() {
+#ifdef USE_CUDA
+        if (this->dataDevice != DataDevice::CUDA || this->cudaData == nullptr) {
+            return true;
+        }
+        if (this->cudaDataBorrowed || this->multiDeviceData) {
+            return false;
+        }
+        CudaFreeForData(*this, this->cudaData);
+        this->cudaData = nullptr;
+        this->cudaDataBorrowed = false;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Data::RestoreCudaDataForRepackedWeight() {
+#ifdef USE_CUDA
+        if (this->cudaData != nullptr) {
+            return true;
+        }
+        if (this->dataDevice != DataDevice::CUDA || this->cudaDataBorrowed ||
+            this->multiDeviceData || this->expansionBytes == 0) {
+            return false;
+        }
+        if (this->cpuData == nullptr && this->numasData.empty()) {
+            return false;
+        }
+        int device = this->dataDeviceIds.empty()
+            ? FastllmCudaGetDevice() : this->dataDeviceIds[0];
+        FastllmCudaSetDevice(device);
+        this->cudaData = CudaMallocForData(*this, this->expansionBytes);
+        this->cudaDataBorrowed = false;
+        if (this->cudaData == nullptr) {
+            return false;
+        }
+        if (this->cpuData != nullptr) {
+            FastllmCudaCopyFromHostToDevice(
+                this->cudaData, this->cpuData, this->expansionBytes);
+            return true;
+        }
+        if (this->dims.size() != 2 || this->numasData.empty()) {
+            CudaFreeForData(*this, this->cudaData);
+            this->cudaData = nullptr;
+            return false;
+        }
+        const int numaCnt = this->numasData.size();
+        const int rows = this->dims[0];
+        if (rows % numaCnt != 0) {
+            CudaFreeForData(*this, this->cudaData);
+            this->cudaData = nullptr;
+            return false;
+        }
+        const int rowsPerNuma = rows / numaCnt;
+        const size_t bytesPerRow = GetDataBytes(this->dataType, 1, this->dims[1]);
+        for (int i = 0; i < numaCnt; ++i) {
+            FastllmCudaCopyFromHostToDevice(
+                (uint8_t *)this->cudaData + (size_t)i * rowsPerNuma * bytesPerRow,
+                this->numasData[i], (size_t)rowsPerNuma * bytesPerRow);
+        }
+        return true;
+#else
+        return false;
 #endif
     }
 
@@ -2575,6 +2643,14 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
+        if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
+            this->dataType == DataType::NVFP4_BLOCK_16 &&
+            !this->RestoreCudaDataForRepackedWeight()) {
+            ErrorInFastLLM(
+                "ToDevice Error: cannot restore the original NVFP4 weight "
+                "after releasing its repacked CUDA source.\n");
+        }
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2659,7 +2735,7 @@ namespace fastllm {
                     if (this->cpuData == nullptr) {
                         this->cpuData = new uint8_t[expansionBytes];
                     }
-                    if (copyData) {
+                    if (copyData && this->cudaData != nullptr) {
                         FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
                     }
 

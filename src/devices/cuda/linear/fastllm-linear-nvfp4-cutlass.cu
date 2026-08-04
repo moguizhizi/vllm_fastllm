@@ -13,7 +13,6 @@
 namespace {
 
 struct WeightCache {
-    const void *source = nullptr;
     uint8_t *weight = nullptr;
     uint8_t *scales = nullptr;
     float *alpha = nullptr;
@@ -128,12 +127,14 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
     WeightCache &cache = weightCaches[key];
     const int paddedM = RoundUp(m, 32);
     const int paddedK = RoundUp(k, 32);
-    if (cache.source == weight.cudaData && cache.sourceRows == k &&
-        cache.sourceColumns == m && cache.paddedRows == paddedK &&
+    if (cache.sourceRows == k && cache.sourceColumns == m &&
+        cache.paddedRows == paddedK &&
         cache.paddedColumns == paddedM &&
         cache.weight != nullptr && cache.scales != nullptr && cache.alpha != nullptr) return &cache;
     if (FastllmCudaGraphIsCapturing()) return nullptr;
     ReleaseCache(cache);
+    if (weight.cudaData == nullptr &&
+        !weight.RestoreCudaDataForRepackedWeight()) return nullptr;
     cache.weight = static_cast<uint8_t *>(FastllmCudaMalloc((size_t)paddedK * paddedM / 2));
     cache.scales = static_cast<uint8_t *>(FastllmCudaMalloc(
         FastllmCudaNvfp4SwizzledScaleBytes(paddedK, paddedM)));
@@ -149,12 +150,31 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
                         cudaStreamPerThread) != cudaSuccess) {
         ReleaseCache(cache); return nullptr;
     }
-    cache.source = weight.cudaData;
+    const cudaError_t syncStatus = cudaStreamSynchronize(cudaStreamPerThread);
+    if (syncStatus != cudaSuccess) {
+        ReleaseCache(cache);
+        return nullptr;
+    }
     cache.sourceRows = k;
     cache.sourceColumns = m;
     cache.paddedRows = paddedK;
     cache.paddedColumns = paddedM;
+    const bool released = weight.ReleaseCudaDataForRepackedWeight();
+    if (released && TraceEnabled()) {
+        std::fprintf(stderr,
+                     "[fastllm][nvfp4] weight_source=released bytes=%zu name=%s\n",
+                     (size_t)weight.expansionBytes, weight.name.c_str());
+    }
     return &cache;
+}
+
+static void RestoreOriginalWeightForFallback(fastllm::Data &weight) {
+    if (weight.cudaData == nullptr &&
+        !weight.RestoreCudaDataForRepackedWeight()) {
+        ErrorInFastLLM(
+            "NVFP4 W4A4 fallback requires the original CPU/mmap weight, "
+            "but the released CUDA source cannot be restored.\n");
+    }
 }
 
 static ActivationScratch *GetActivationScratch(int n, int m) {
@@ -347,14 +367,18 @@ bool TryCudaCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k) {
-    return RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, false);
+    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, false);
+    if (!ok) RestoreOriginalWeightForFallback(weight);
+    return ok;
 }
 
 bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k) {
-    return RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, true);
+    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, true);
+    if (!ok) RestoreOriginalWeightForFallback(weight);
+    return ok;
 }
 
 void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight) {
