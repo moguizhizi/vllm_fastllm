@@ -81,8 +81,8 @@ bool Run(const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
          int m, int n, int k, cudaStream_t stream) {
     using KC = KernelConfig<Config, Out>;
     using Gemm = typename KC::Gemm;
-    using ElementA = typename KC::ElementA;
-    using ElementB = typename KC::ElementB;
+    using ElementA = typename Gemm::ElementA;
+    using ElementB = typename Gemm::ElementB;
     using SFA = cutlass::float_ue4m3_t;
     using SFB = cutlass::float_ue4m3_t;
     using StrideA = typename Gemm::GemmKernel::StrideA;

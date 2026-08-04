@@ -61,6 +61,8 @@ bool Run(const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
          int m, int n, int k, cudaStream_t stream) {
     using KC = KernelConfig<Config, Out>;
     using Gemm = typename KC::Gemm;
+    using ElementA = typename Gemm::ElementA;
+    using ElementB = typename Gemm::ElementB;
     using StrideA = typename Gemm::GemmKernel::StrideA;
     using StrideB = typename Gemm::GemmKernel::StrideB;
     using StrideD = typename Gemm::GemmKernel::StrideD;
@@ -72,8 +74,8 @@ bool Run(const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
     auto layoutB = BlockScale::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1},
-        {reinterpret_cast<const typename KC::ElementA *>(a), strideA,
-         reinterpret_cast<const typename KC::ElementB *>(b), strideB,
+        {reinterpret_cast<const ElementA *>(a), strideA,
+         reinterpret_cast<const ElementB *>(b), strideB,
          reinterpret_cast<const cutlass::float_ue4m3_t *>(scaleA), layoutA,
          reinterpret_cast<const cutlass::float_ue4m3_t *>(scaleB), layoutB},
         {{}, d, strideD, d, strideD}};
