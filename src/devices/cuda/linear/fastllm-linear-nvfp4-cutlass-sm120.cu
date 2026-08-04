@@ -29,18 +29,32 @@ void TraceFailure(const char *stage, cutlass::Status status) {
 }
 
 template <typename Gemm>
-void TraceInitializeDetails(size_t workspaceBytes) {
-    if (!TraceEnabled()) return;
+cudaError_t ConfigureAndTraceKernel(size_t workspaceBytes) {
     using Kernel = typename Gemm::GemmKernel;
     int device = 0;
     int maxOptinSharedMemory = 0;
     cudaGetDevice(&device);
     cudaDeviceGetAttribute(&maxOptinSharedMemory,
                            cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    std::fprintf(stderr,
-                 "[fastllm][nvfp4][sm120] required_smem=%d max_optin_smem=%d workspace=%zu\n",
-                 int(Kernel::SharedStorageSize), maxOptinSharedMemory,
-                 workspaceBytes);
+    cudaFuncAttributes attributes{};
+    const cudaError_t getStatus = cudaFuncGetAttributes(
+        &attributes, cutlass::device_kernel<Kernel>);
+    const cudaError_t setStatus = getStatus == cudaSuccess
+        ? cudaFuncSetAttribute(cutlass::device_kernel<Kernel>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               int(Kernel::SharedStorageSize))
+        : getStatus;
+    if (TraceEnabled()) {
+        std::fprintf(stderr,
+                     "[fastllm][nvfp4][sm120] required_smem=%d max_optin_smem=%d workspace=%zu "
+                     "static_smem=%zu max_dynamic_smem=%d binary=%d ptx=%d func_get=%s func_set=%s\n",
+                     int(Kernel::SharedStorageSize), maxOptinSharedMemory,
+                     workspaceBytes, attributes.sharedSizeBytes,
+                     attributes.maxDynamicSharedSizeBytes,
+                     attributes.binaryVersion, attributes.ptxVersion,
+                     cudaGetErrorString(getStatus), cudaGetErrorString(setStatus));
+    }
+    return setStatus;
 }
 struct ConfigMedium {
     using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
@@ -123,10 +137,15 @@ bool Run(const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
     cutlass::Status status = gemm.can_implement(args);
     if (status != cutlass::Status::kSuccess) TraceFailure("can_implement", status);
     if (status == cutlass::Status::kSuccess) {
-        status = gemm.initialize(args, workspace, stream);
-        if (status != cutlass::Status::kSuccess) {
-            TraceFailure("initialize", status);
-            TraceInitializeDetails<Gemm>(bytes);
+        const cudaError_t attributeStatus = ConfigureAndTraceKernel<Gemm>(bytes);
+        if (attributeStatus != cudaSuccess) {
+            status = cutlass::Status::kErrorInternal;
+            TraceFailure("configure_kernel", status);
+        } else {
+            status = gemm.initialize(args, workspace, stream);
+            if (status != cutlass::Status::kSuccess) {
+                TraceFailure("initialize", status);
+            }
         }
     }
     if (status == cutlass::Status::kSuccess) {
