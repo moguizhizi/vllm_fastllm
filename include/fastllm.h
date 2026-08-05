@@ -619,12 +619,16 @@ namespace fastllm {
 
         void FreeSpace(); // 回收设备上的内存
 
-        // CUDA 权重完成重排后，可以释放原始设备端分配，
-        // 但逻辑张量仍保持在 CUDA 设备上。保留 host/mmap 副本，
-        // 以便传统 fallback 路径按需恢复原始权重格式。
+        // CUDA后端warmup成功后释放原始设备端分配，逻辑张量仍位于CUDA。
+        // host/mmap副本只用于显式换卡后的后端重建；正式推理不再按调用
+        // 恢复原始权重并切换fallback。
         bool ReleaseCudaDataForRepackedWeight();
 
         bool RestoreCudaDataForRepackedWeight();
+
+        // 跨GPU重建重排权重时，直接把host/mmap源恢复到目标GPU，
+        // 避免先恢复到旧GPU再进行一次GPU间复制。
+        bool RestoreCudaDataForRepackedWeight(int targetDevice);
 
         void UpdateUnitSize(); // 更新unitSize
 

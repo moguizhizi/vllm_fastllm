@@ -923,6 +923,8 @@ namespace fastllm {
 
     void Data::FakeFrom(const Data &ori, size_t offset) {
 #ifdef USE_CUDA
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -945,6 +947,10 @@ namespace fastllm {
 
     void Data::CopyFrom(const Data &ori) {
 #ifdef USE_CUDA
+        if (this != &ori) {
+            FastllmCudaReleaseNvfp4W4A4Cache(this);
+            FastllmCudaReleaseNvfp4MarlinCache(this);
+        }
         if (this != &ori && !this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2029,6 +2035,7 @@ namespace fastllm {
     void Data::FreeSpace() {
 #ifdef USE_CUDA
         FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2069,10 +2076,14 @@ namespace fastllm {
         if (this->cudaDataBorrowed || this->multiDeviceData) {
             return false;
         }
-        // The CUTLASS copy is the persistent weight after repacking.  Returning
-        // the source to FastLLM's cache only marks the allocation idle, so a
-        // large model can still exhaust physical VRAM while building caches.
-        // Remove this one-shot source allocation from the pool immediately.
+        if (this->cpuData == nullptr && this->numasData.empty()) {
+            // 固定后端和跨GPU重建都依赖可恢复的host/mmap源。没有源时不能
+            // 丢弃唯一的原始表示。
+            return false;
+        }
+        // warmup成功后，重排权重成为持久表示。普通内存池释放只会把原始
+        // 分配标记为空闲，大模型逐层重排时仍可能耗尽物理显存，因此这里
+        // 立即从池中真正移除这份一次性原始分配。
         FastllmCudaForceFree(this->cudaData);
         this->cudaData = nullptr;
         this->cudaDataBorrowed = false;
@@ -2084,6 +2095,16 @@ namespace fastllm {
 
     bool Data::RestoreCudaDataForRepackedWeight() {
 #ifdef USE_CUDA
+        int device = this->dataDeviceIds.empty()
+            ? FastllmCudaGetDevice() : this->dataDeviceIds[0];
+        return this->RestoreCudaDataForRepackedWeight(device);
+#else
+        return false;
+#endif
+    }
+
+    bool Data::RestoreCudaDataForRepackedWeight(int targetDevice) {
+#ifdef USE_CUDA
         if (this->cudaData != nullptr) {
             return true;
         }
@@ -2094,9 +2115,7 @@ namespace fastllm {
         if (this->cpuData == nullptr && this->numasData.empty()) {
             return false;
         }
-        int device = this->dataDeviceIds.empty()
-            ? FastllmCudaGetDevice() : this->dataDeviceIds[0];
-        FastllmCudaSetDevice(device);
+        FastllmCudaSetDevice(targetDevice);
         this->cudaData = CudaMallocForData(*this, this->expansionBytes);
         this->cudaDataBorrowed = false;
         if (this->cudaData == nullptr) {
@@ -2128,6 +2147,7 @@ namespace fastllm {
         }
         return true;
 #else
+        (void)targetDevice;
         return false;
 #endif
     }
@@ -2653,12 +2673,37 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
             this->dataType == DataType::NVFP4_BLOCK_16 &&
+            device == DataDevice::CUDA && copyData) {
+            const int sourceDevice = this->dataDeviceIds.empty()
+                ? FastllmCudaGetDevice() : this->dataDeviceIds[0];
+            const int destDevice = deviceIds.empty()
+                ? FastllmCudaGetDevice() : deviceIds[0];
+            if (sourceDevice != destDevice) {
+                // 重排cache属于具体GPU。先销毁旧GPU的后端状态，再把保留的
+                // host/mmap源直接上传到目标GPU；首次Linear会在目标GPU完成
+                // warmup、重排并重新释放这份临时原始权重。
+                FastllmCudaReleaseNvfp4W4A4Cache(this);
+                FastllmCudaReleaseNvfp4MarlinCache(this);
+                if (!this->RestoreCudaDataForRepackedWeight(destDevice)) {
+                    ErrorInFastLLM(
+                        "ToDevice Error: cannot restore NVFP4 weight directly "
+                        "on the destination CUDA device.\n");
+                }
+                this->dataDeviceIds = deviceIds.empty()
+                    ? std::vector<int>({destDevice}) : deviceIds;
+                this->dataDevice = device;
+                return;
+            }
+        }
+        if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
+            this->dataType == DataType::NVFP4_BLOCK_16 &&
             !this->RestoreCudaDataForRepackedWeight()) {
             ErrorInFastLLM(
                 "ToDevice Error: cannot restore the original NVFP4 weight "
                 "after releasing its repacked CUDA source.\n");
         }
         FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2720,12 +2765,15 @@ namespace fastllm {
                         if (ownedCpuDataCopy) {
                             delete[] cpuData;
                         }
-                        if ((this->isModelWeight || this->isKVCache) && this->mapFile == nullptr) {
+                        if ((this->isModelWeight || this->isKVCache) &&
+                            this->mapFile == nullptr &&
+                            this->dataType != DataType::NVFP4_BLOCK_16) {
                             delete[] this->cpuData;
                             this->cpuData = nullptr;
                         }
 #else
-                        if (this->isModelWeight || this->isKVCache) {
+                        if ((this->isModelWeight || this->isKVCache) &&
+                            this->dataType != DataType::NVFP4_BLOCK_16) {
                             delete[] this->cpuData;
                             this->cpuData = nullptr;
                         }

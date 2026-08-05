@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 
@@ -39,6 +40,22 @@ std::mutex cacheMutex;
 std::map<std::pair<const fastllm::Data *, int>, WeightCache> weightCaches;
 std::map<int, ActivationScratch> activationScratch;
 std::map<int, OutputScratch> outputScratch;
+
+enum class BackendState : uint8_t {
+    Uninitialized,
+    Cutlass,
+    Rejected,
+};
+
+enum class FusionState : uint8_t {
+    Uninitialized,
+    Enabled,
+    Disabled,
+};
+
+std::mutex stateMutex;
+std::map<std::pair<const fastllm::Data *, int>, BackendState> backendStates;
+std::map<std::pair<const fastllm::Data *, int>, FusionState> fusionStates;
 
 static int RoundUp(int value, int alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -74,8 +91,8 @@ static void Trace(const char *path, const char *reason, int n, int m, int k, int
     }
 }
 
-static bool TraceSynchronize(const char *stage) {
-    if (!TraceEnabled()) return true;
+static bool TraceSynchronize(const char *stage, bool force = false) {
+    if (!force && !TraceEnabled()) return true;
     const cudaError_t status = cudaStreamSynchronize(cudaStreamPerThread);
     if (status != cudaSuccess) {
         std::fprintf(stderr, "[fastllm][nvfp4] stage=%s status=%s\n",
@@ -89,9 +106,12 @@ static bool SemanticsSupported(const fastllm::Data &input,
                                const fastllm::Data &weight,
                                const fastllm::Data &bias,
                                const fastllm::Data &output,
-                               int n, int m, int k, const char **reason) {
-    if (!Enabled()) { *reason = "disabled"; return false; }
-    if (n < MinRows()) { *reason = "below W4A4 row threshold"; return false; }
+                               int n, int m, int k, bool checkSelectionPolicy,
+                               const char **reason) {
+    if (checkSelectionPolicy && !Enabled()) { *reason = "disabled"; return false; }
+    if (checkSelectionPolicy && n < MinRows()) {
+        *reason = "below W4A4 row threshold"; return false;
+    }
     if (input.dataType != fastllm::DataType::FLOAT16 &&
         input.dataType != fastllm::DataType::BFLOAT16) {
         *reason = "activation is not FP16/BF16"; return false;
@@ -115,7 +135,39 @@ static bool SemanticsSupported(const fastllm::Data &input,
     if (weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m) {
         *reason = "weight shape mismatch"; return false;
     }
+    if (weight.cudaData != nullptr &&
+        (weight.cudaDataBorrowed || weight.multiDeviceData ||
+         (weight.cpuData == nullptr && weight.numasData.empty()))) {
+        *reason = "original CUDA weight has no releasable host source"; return false;
+    }
     return true;
+}
+
+static int CurrentDevice() {
+    int device = 0;
+    return cudaGetDevice(&device) == cudaSuccess ? device : -1;
+}
+
+static BackendState GetBackendState(const fastllm::Data &weight, int device) {
+    std::lock_guard<std::mutex> guard(stateMutex);
+    auto it = backendStates.find({&weight, device});
+    return it == backendStates.end() ? BackendState::Uninitialized : it->second;
+}
+
+static void SetBackendState(const fastllm::Data &weight, int device, BackendState state) {
+    std::lock_guard<std::mutex> guard(stateMutex);
+    backendStates[{&weight, device}] = state;
+}
+
+static FusionState GetFusionState(const fastllm::Data &weight, int device) {
+    std::lock_guard<std::mutex> guard(stateMutex);
+    auto it = fusionStates.find({&weight, device});
+    return it == fusionStates.end() ? FusionState::Uninitialized : it->second;
+}
+
+static void SetFusionState(const fastllm::Data &weight, int device, FusionState state) {
+    std::lock_guard<std::mutex> guard(stateMutex);
+    fusionStates[{&weight, device}] = state;
 }
 
 static void ReleaseCache(WeightCache &cache) {
@@ -125,7 +177,8 @@ static void ReleaseCache(WeightCache &cache) {
     cache = WeightCache();
 }
 
-static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
+static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k,
+                                   bool releaseSourceAfterRepack) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
     std::lock_guard<std::mutex> guard(cacheMutex);
@@ -170,8 +223,13 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
     cache.sourceColumns = m;
     cache.paddedRows = paddedK;
     cache.paddedColumns = paddedM;
-    const bool released = weight.ReleaseCudaDataForRepackedWeight();
-    if (released && TraceEnabled()) {
+    const bool released = !releaseSourceAfterRepack ||
+                          weight.ReleaseCudaDataForRepackedWeight();
+    if (!released) {
+        ReleaseCache(cache);
+        return nullptr;
+    }
+    if (releaseSourceAfterRepack && released && TraceEnabled()) {
         std::fprintf(stderr,
                      "[fastllm][nvfp4] weight_source=released bytes=%zu name=%s\n",
                      (size_t)weight.expansionBytes, weight.name.c_str());
@@ -179,11 +237,16 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
     return &cache;
 }
 
-static void RestoreOriginalWeightForFallback(fastllm::Data &weight) {
-    if (weight.cudaData == nullptr &&
-        !weight.RestoreCudaDataForRepackedWeight()) {
-        throw ("NVFP4 W4A4 fallback requires the original CPU/mmap weight, "
-               "but the released CUDA source cannot be restored.");
+static void ReleaseWeightCacheForDevice(const fastllm::Data *weight, int device) {
+    std::lock_guard<std::mutex> guard(cacheMutex);
+    auto it = weightCaches.find({weight, device});
+    if (it != weightCaches.end()) {
+        int originalDevice = 0;
+        cudaGetDevice(&originalDevice);
+        cudaSetDevice(device);
+        ReleaseCache(it->second);
+        weightCaches.erase(it);
+        cudaSetDevice(originalDevice);
     }
 }
 
@@ -284,7 +347,7 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
             (size_t)outFeatures * (inFeatures / 16) ||
         !std::isfinite(weight.nvfp4GlobalScale) ||
         weight.nvfp4GlobalScale <= 0.0f) return false;
-    WeightCache *cache = GetWeightCache(weight, inFeatures, outFeatures);
+    WeightCache *cache = GetWeightCache(weight, inFeatures, outFeatures, true);
     if (cache == nullptr || cache->paddedColumns != inFeatures ||
         cache->paddedRows != outFeatures) return false;
     *packedWeight = cache->weight;
@@ -296,12 +359,14 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
 static bool RunCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
-        int n, int m, int k, bool siluMulInput) {
+        int n, int m, int k, bool siluMulInput,
+        bool checkSelectionPolicy, bool validateWarmup) {
     const int arch = RuntimeArch();
     const char *reason = "unsupported";
     const bool supportedArch = arch >= 100 && arch < 130;
     if (!supportedArch ||
-        !SemanticsSupported(input, weight, bias, output, n, m, k, &reason)) {
+        !SemanticsSupported(input, weight, bias, output, n, m, k,
+                            checkSelectionPolicy, &reason)) {
         Trace("fallback", !supportedArch ? "runtime SM is not 100-129" : reason,
               n, m, k, arch);
         return false;
@@ -312,7 +377,7 @@ static bool RunCutlassNvfp4W4A4(
         return false;
     }
 
-    WeightCache *cache = GetWeightCache(weight, m, k);
+    WeightCache *cache = GetWeightCache(weight, m, k, false);
     if (cache == nullptr) {
         Trace("fallback", "weight cache unavailable", n, m, k, arch);
         return false;
@@ -368,6 +433,10 @@ static bool RunCutlassNvfp4W4A4(
         ok = FinalizeOutput(gemmOutput, outputData, static_cast<const float *>(biasData),
                             output.dataType, n, k, cache->paddedRows);
     }
+    if (ok && validateWarmup) {
+        failureStage = "warmup validation";
+        ok = TraceSynchronize(failureStage, true);
+    }
 
     if (biasData != nullptr) FastllmCudaFinishInput(bias, biasData);
     if (inputData != nullptr) FastllmCudaFinishInput(input, inputData);
@@ -381,8 +450,38 @@ bool TryCudaCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k) {
-    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, false);
-    if (!ok) RestoreOriginalWeightForFallback(weight);
+    if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+        weight.blockM != 16) return false;
+    const int device = CurrentDevice();
+    if (device < 0) return false;
+    const BackendState state = GetBackendState(weight, device);
+    if (state == BackendState::Rejected) {
+        Trace("fallback", "CUTLASS backend rejected during warmup", n, m, k,
+              RuntimeArch());
+        return false;
+    }
+    const bool warmup = state == BackendState::Uninitialized;
+    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, false,
+                                  warmup, warmup);
+    if (ok && warmup) {
+        if (!weight.ReleaseCudaDataForRepackedWeight()) {
+            ReleaseWeightCacheForDevice(&weight, device);
+            SetBackendState(weight, device, BackendState::Rejected);
+            return false;
+        }
+        SetBackendState(weight, device, BackendState::Cutlass);
+        if (TraceEnabled()) {
+            std::fprintf(stderr,
+                "[fastllm][nvfp4] backend=cutlass state=fixed device=%d name=%s\n",
+                device, weight.name.c_str());
+        }
+    } else if (!ok && warmup) {
+        ReleaseWeightCacheForDevice(&weight, device);
+        SetBackendState(weight, device, BackendState::Rejected);
+    } else if (!ok) {
+        throw std::runtime_error(
+            "NVFP4 CUTLASS backend failed after warmup; runtime fallback is disabled");
+    }
     return ok;
 }
 
@@ -390,19 +489,69 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k) {
-    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, true);
-    if (!ok) RestoreOriginalWeightForFallback(weight);
+    const int device = CurrentDevice();
+    if (device < 0) return false;
+    const BackendState backend = GetBackendState(weight, device);
+    const FusionState fusion = GetFusionState(weight, device);
+    if (backend == BackendState::Rejected || fusion == FusionState::Disabled) return false;
+
+    const bool backendWarmup = backend == BackendState::Uninitialized;
+    const bool fusionWarmup = fusion == FusionState::Uninitialized;
+    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, true,
+                                  backendWarmup, backendWarmup || fusionWarmup);
+    if (ok) {
+        if (backendWarmup) {
+            if (!weight.ReleaseCudaDataForRepackedWeight()) {
+                ReleaseWeightCacheForDevice(&weight, device);
+                SetBackendState(weight, device, BackendState::Rejected);
+                SetFusionState(weight, device, FusionState::Disabled);
+                return false;
+            }
+            SetBackendState(weight, device, BackendState::Cutlass);
+        }
+        if (fusionWarmup) SetFusionState(weight, device, FusionState::Enabled);
+    } else if (fusionWarmup) {
+        // 融合能力单独降级。保留Linear后端的未初始化状态，随后由普通
+        // SwiGLU + Linear路径独立完成CUTLASS warmup和后端选择。
+        SetFusionState(weight, device, FusionState::Disabled);
+    } else {
+        throw std::runtime_error(
+            "NVFP4 fused SwiGLU backend failed after warmup; runtime fallback is disabled");
+    }
     return ok;
 }
 
 void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight) {
-    std::lock_guard<std::mutex> guard(cacheMutex);
-    for (auto it = weightCaches.begin(); it != weightCaches.end();) {
-        if (it->first.first == weight) {
-            ReleaseCache(it->second);
-            it = weightCaches.erase(it);
-        } else {
-            ++it;
+    {
+        std::lock_guard<std::mutex> guard(cacheMutex);
+        bool hasCache = false;
+        for (const auto &entry : weightCaches) {
+            if (entry.first.first == weight) { hasCache = true; break; }
+        }
+        if (hasCache) {
+            int originalDevice = 0;
+            cudaGetDevice(&originalDevice);
+            for (auto it = weightCaches.begin(); it != weightCaches.end();) {
+                if (it->first.first == weight) {
+                    cudaSetDevice(it->first.second);
+                    ReleaseCache(it->second);
+                    it = weightCaches.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            cudaSetDevice(originalDevice);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        for (auto it = backendStates.begin(); it != backendStates.end();) {
+            if (it->first.first == weight) it = backendStates.erase(it);
+            else ++it;
+        }
+        for (auto it = fusionStates.begin(); it != fusionStates.end();) {
+            if (it->first.first == weight) it = fusionStates.erase(it);
+            else ++it;
         }
     }
 }
