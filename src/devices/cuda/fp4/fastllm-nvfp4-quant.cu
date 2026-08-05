@@ -66,38 +66,38 @@ __global__ void FastllmSiluMulNvfp4QuantKernel(
     }
 }
 
-// Repack FastLLM's interleaved NVFP4_BLOCK_16 storage
-//   [8-byte packed E2M1 values][4-byte FP32 scale]
-// into the two operands consumed by CUTLASS block-scaled GEMM:
-//   a dense row-major FP4 matrix and a separately swizzled E4M3 scale matrix.
+// 将 FastLLM 交错存储的 NVFP4_BLOCK_16 数据
+//   [8 字节 E2M1 打包值][4 字节 FP32 缩放因子]
+// 重排为 CUTLASS 块缩放 GEMM 使用的两个输入：
+//   连续行主序 FP4 权重矩阵，以及独立交错排列的 E4M3 缩放因子矩阵。
 __global__ void FastllmNvfp4Block16ToCutlassKernel(
         const uint8_t *__restrict__ source, uint8_t *__restrict__ packedWeight,
         uint8_t *__restrict__ weightScales, int rows, int columns,
         int paddedRows, int paddedColumns,
         int sourceBytesPerRow, int kTiles) {
-    // One logical scale group covers 16 adjacent values along the K dimension.
+    // K 维每相邻 16 个权重共享一个缩放因子。
     const int group = blockIdx.y * blockDim.x + threadIdx.x;
     const int groups = paddedColumns / 16;
     if (group >= groups) return;
-    // CUTLASS scale layout pads the row dimension to 128. Visiting the complete
-    // tile also zero-initializes scale entries outside the padded weight matrix.
+    // CUTLASS 缩放因子布局要求行维度补齐到 128；遍历完整分块，
+    // 同时将补齐权重矩阵之外的缩放因子初始化为零。
     for (int row = blockIdx.x; row < ((paddedRows + 127) / 128) * 128; row += gridDim.x) {
         uint64_t packed = 0;
         uint8_t scaleByte = 0;
         if (row < rows && group < columns / 16) {
             const uint8_t *block = source + (size_t)row * sourceBytesPerRow
                                  + (size_t)group * (8 + sizeof(float));
-            // NVFP4_BLOCK_16 stores 8 packed bytes plus one float scale, so
-            // adjacent blocks are 12 bytes apart. Odd blocks are only
-            // 4-byte aligned and must not be read through a uint64_t pointer.
+            // NVFP4_BLOCK_16 每块存储 8 字节打包权重和一个 FP32 缩放因子，
+            // 相邻块间隔 12 字节。奇数块仅按 4 字节对齐，不能通过
+            // uint64_t 指针直接读取。
             const uint32_t packedLo = *reinterpret_cast<const uint32_t *>(block);
             const uint32_t packedHi = *reinterpret_cast<const uint32_t *>(block + 4);
             packed = uint64_t(packedLo) | (uint64_t(packedHi) << 32);
-            // CUTLASS consumes one E4M3 scale for each 16-value FP4 group.
+            // CUTLASS 为每组 16 个 FP4 权重读取一个 E4M3 缩放因子。
             __nv_fp8_e4m3 scale(*reinterpret_cast<const float *>(block + 8));
             scaleByte = reinterpret_cast<const uint8_t &>(scale);
         }
-        // Logical padding is represented by zero FP4 values and zero scales.
+        // 补齐区域使用零 FP4 权重和零缩放因子。
         if (row < paddedRows) {
             reinterpret_cast<uint64_t *>(
                 packedWeight + (size_t)row * (paddedColumns / 2))[group] = packed;
