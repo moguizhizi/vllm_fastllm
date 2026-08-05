@@ -12,7 +12,7 @@
 | 动态激活 FP4 | SM100 或 SM120-SM129；FP16/BF16 输入；列数为 16 的倍数；dense 正式入口还受上述 K/N、M 条件约束 |
 | SwiGLU+FP4 融合 | SM100 或 SM120-SM129；FP16/BF16 gate/up；hidden 为 16 的倍数；已接入 Dense `SwigluLinearAdd` 和 grouped MoE |
 | grouped MoE W4A4 | CUDA 12.8+；当前仅 SM100；FP16/BF16；SwiGLU；仅 `NVFP4_BLOCK_16` experts；hidden/inter 为 32 的倍数；expert 数 1-256；batch 默认至少 16；无 shared expert/EP |
-| dense Marlin W4A16 | SM75-SM99；FP16 输入/输出；权重 `NVFP4_BLOCK_16`、blockM=16；无 bias；M>=2；K/N 为 64 的倍数 |
+| dense Marlin W4A16 | SM75-SM99；FP16 输入/输出；权重 `NVFP4_BLOCK_16`、blockM=16；无 bias；M>=1；K/N 为 64 的倍数 |
 
 环境变量：
 
@@ -28,13 +28,20 @@
 
 ## 权重显存生命周期
 
-首次命中 W4A4 时，FastLLM 将 `NVFP4_BLOCK_16` 重排为 CUTLASS FP4 权重和
-E4M3 scale。重排流同步完成后，原始 `cudaData` 会从 CUDA 内存池移除并真正释放，后续按
-`Data + device + shape` 命中重排缓存，不再保留两份 GPU 权重。CPU/mmap 原始数据
-继续保留；W4A4 失败需要 legacy fallback 时，会按需恢复原始 CUDA 权重。
+每个 `Data + device` 第一次执行就是后端 warmup。CUTLASS/Marlin 完成重排并实际运行
+成功后，后端状态才固定，随后真正释放原始 `cudaData`；warmup 失败则销毁候选重排
+cache、保留原始权重，并固定使用 legacy。正式推理开始后不再通过修改环境变量切换
+已固定后端，运行阶段 kernel 失败直接报错。
 
-`ops-functional` 的 dense 用例会同时检查：原始 CUDA 权重已释放，以及关闭 W4A4
-后 fallback 能恢复原始权重。
+SwiGLU 融合能力单独记录：融合 warmup 失败只关闭融合，随后执行普通 SwiGLU，再由
+Linear 独立选择 CUTLASS/Marlin/legacy。它不会把 Linear 一起降级。
+
+CPU/mmap 原始数据继续保留，用于目标GPU重建。权重从GPU0移动到GPU1时先销毁GPU0
+cache，再把host源直接上传到GPU1；GPU1第一次Linear重新warmup、重排并释放临时源，
+不再执行“host→GPU0原始权重→GPU1”的中转。
+
+`ops-functional` 会检查：warmup成功后释放原始CUDA权重、正式推理不切换后端、warmup
+失败后固定legacy、融合拒绝不影响Linear；存在两张GPU时还检查跨GPU重建。
 
 ## 模型和显卡
 

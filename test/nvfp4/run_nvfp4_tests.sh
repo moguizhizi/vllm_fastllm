@@ -74,8 +74,27 @@ run_ops_functional() {
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=1 --param in=1008 --param out=1000 \
             --param bias=1 --param input_type=bf16 \
-            --param check_release=1 --param check_fallback=1 \
+            --param check_release=1 --param check_fixed_backend=1 \
+            --param check_fusion_separation=1 \
             --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        run_logged op_dense_w4a4_warmup_fallback env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            FASTLLM_CUDA_NVFP4_W4A4=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=1 --param in=1008 --param out=1000 \
+            --param bias=1 --param input_type=bf16 \
+            --param check_warmup_fallback=1 \
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        if [[ $(nvidia-smi -L 2>/dev/null | wc -l) -ge 2 ]]; then
+            run_logged op_dense_w4a4_device_move env \
+                FASTLLM_CUDA_NVFP4_TRACE=1 \
+                FASTLLM_CUDA_NVFP4_W4A4=1 \
+                "${optest}" --op linear_nvfp4 --device cuda:0 \
+                --param batch=1 --param in=1024 --param out=1024 \
+                --param bias=0 --param input_type=bf16 \
+                --param check_release=1 --param check_device_move=1 \
+                --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        fi
         run_logged op_swiglu_fp4_quant "${optest}" \
             --op nvfp4_swiglu_quant --device cuda:0 \
             --param rows=32 --param hidden=1024 --param input_type=bf16 \
@@ -100,6 +119,12 @@ run_ops_functional() {
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=8 --param in=1024 --param out=1024 \
+            --param bias=0 --param input_type=fp16 --warmup 0 --iters 1 \
+            --atol 0.05 --rtol 0.05
+        run_logged op_dense_marlin_w4a16_decode env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=1 --param in=1024 --param out=1024 \
             --param bias=0 --param input_type=fp16 --warmup 0 --iters 1 \
             --atol 0.05 --rtol 0.05
     fi

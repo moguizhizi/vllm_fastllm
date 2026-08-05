@@ -2086,7 +2086,10 @@ namespace {
         int batch = 0, in = 0, out = 0;
         bool useBias = false;
         bool checkRelease = false;
-        bool checkFallback = false;
+        bool checkFixedBackend = false;
+        bool checkWarmupFallback = false;
+        bool checkDeviceMove = false;
+        bool checkFusionSeparation = false;
         fastllm::DataType inputType = fastllm::DataType::FLOAT16;
         std::vector<float> inputValues;
         std::vector<float> biasValues;
@@ -2102,7 +2105,10 @@ namespace {
             out = params.GetInt("out");
             useBias = params.GetInt("bias") != 0;
             checkRelease = params.GetInt("check_release") != 0;
-            checkFallback = params.GetInt("check_fallback") != 0;
+            checkFixedBackend = params.GetInt("check_fixed_backend") != 0;
+            checkWarmupFallback = params.GetInt("check_warmup_fallback") != 0;
+            checkDeviceMove = params.GetInt("check_device_move") != 0;
+            checkFusionSeparation = params.GetInt("check_fusion_separation") != 0;
             const std::string dtype = params.GetString("input_type");
             inputType = dtype == "bf16" ? fastllm::DataType::BFLOAT16
                                          : fastllm::DataType::FLOAT16;
@@ -2199,26 +2205,80 @@ namespace {
             MakeWeight(weight);
             input.ToDevice(fastllm::DataDevice::CUDA);
             weight.ToDevice(fastllm::DataDevice::CUDA);
+            if (checkFusionSeparation) {
+                fastllm::Data malformed(
+                    inputType, {batch, in * 2 - 16},
+                    std::vector<float>((size_t)batch * (in * 2 - 16), 0.25f));
+                malformed.ToDevice(fastllm::DataDevice::CUDA);
+                fastllm::Data fusedOutput;
+                fusedOutput.dataType = inputType;
+                fusedOutput.UpdateUnitSize();
+                fusedOutput.Resize({batch, out});
+                if (FastllmCudaCutlassNvfp4W4A4FromSwiglu(
+                        malformed, weight, bias, fusedOutput, batch, in, out)) {
+                    throw std::runtime_error(
+                        "malformed NVFP4 SwiGLU unexpectedly used the fused backend");
+                }
+            }
+            const char *oldValue = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
+            const bool hadOldValue = oldValue != nullptr;
+            const std::string savedValue = hadOldValue ? oldValue : "";
+            if (checkWarmupFallback) setenv("FASTLLM_CUDA_NVFP4_W4A4", "0", 1);
             fastllm::Linear(input, weight, bias, output);
+            if (checkWarmupFallback) {
+                if (hadOldValue) setenv("FASTLLM_CUDA_NVFP4_W4A4", savedValue.c_str(), 1);
+                else unsetenv("FASTLLM_CUDA_NVFP4_W4A4");
+            }
             if (checkRelease && FastllmCudaRuntimeArch() >= 100 &&
                 FastllmCudaRuntimeArch() < 130 && weight.cudaData != nullptr) {
                 throw std::runtime_error(
                     "NVFP4 W4A4 retained the original CUDA weight after repack");
             }
             fastllm::Data nativeOutput = ConvertToFloat32Data(output);
-            if (checkFallback && FastllmCudaRuntimeArch() >= 100 &&
+            if (checkFixedBackend && FastllmCudaRuntimeArch() >= 100 &&
                 FastllmCudaRuntimeArch() < 130) {
-                const char *oldValue = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
-                const bool hadOldValue = oldValue != nullptr;
-                const std::string savedValue = hadOldValue ? oldValue : "";
                 setenv("FASTLLM_CUDA_NVFP4_W4A4", "0", 1);
-                fastllm::Data fallbackOutput;
-                fastllm::Linear(input, weight, bias, fallbackOutput);
+                fastllm::Data fixedOutput;
+                fastllm::Linear(input, weight, bias, fixedOutput);
                 if (hadOldValue) setenv("FASTLLM_CUDA_NVFP4_W4A4", savedValue.c_str(), 1);
                 else unsetenv("FASTLLM_CUDA_NVFP4_W4A4");
+                if (weight.cudaData != nullptr) {
+                    throw std::runtime_error(
+                        "NVFP4 changed a fixed CUTLASS backend during inference");
+                }
+            }
+            if (checkWarmupFallback && weight.cudaData == nullptr) {
+                throw std::runtime_error(
+                    "NVFP4 warmup fallback did not retain the original CUDA weight");
+            }
+            if (checkWarmupFallback) {
+                fastllm::Data fixedLegacyOutput;
+                fastllm::Linear(input, weight, bias, fixedLegacyOutput);
                 if (weight.cudaData == nullptr) {
                     throw std::runtime_error(
-                        "NVFP4 fallback did not restore the original CUDA weight");
+                        "NVFP4 warmup fallback was not fixed to the legacy backend");
+                }
+            }
+            if (checkDeviceMove) {
+                int deviceCount = 0;
+                cudaGetDeviceCount(&deviceCount);
+                if (deviceCount >= 2 && FastllmCudaRuntimeArch() >= 100 &&
+                    FastllmCudaRuntimeArch() < 130) {
+                    input.ToDevice(fastllm::DataDevice::CUDA, {1});
+                    weight.ToDevice(fastllm::DataDevice::CUDA, {1});
+                    if (useBias) bias.ToDevice(fastllm::DataDevice::CUDA, {1});
+                    if (weight.cudaData == nullptr) {
+                        throw std::runtime_error(
+                            "NVFP4 device move did not restore directly on the destination GPU");
+                    }
+                    FastllmCudaSetDevice(1);
+                    fastllm::Data movedOutput;
+                    fastllm::Linear(input, weight, bias, movedOutput);
+                    if (weight.cudaData != nullptr) {
+                        throw std::runtime_error(
+                            "NVFP4 destination warmup retained the original CUDA weight");
+                    }
+                    FastllmCudaSetDevice(0);
                 }
             }
             return nativeOutput;
@@ -2295,13 +2355,16 @@ namespace {
             "NVFP4 dense: native W4A4 on SM100+, Marlin W4A16 on SM75-SM99",
             []() {
                 OpTestParams params;
-                params.Add("batch", "1", "rows; W4A4 supports decode M=1, Marlin requires >=2");
+                params.Add("batch", "1", "rows; W4A4 and Marlin support decode M=1");
                 params.Add("in", "1008", "input features, multiple of 16; CUTLASS pads to 32");
                 params.Add("out", "1000", "output features; CUTLASS pads to 32 and slices");
                 params.Add("bias", "1", "add FP32 bias after W4A4 GEMM");
                 params.Add("input_type", "fp16", "fp16 or bf16; Marlin accepts fp16 only");
                 params.Add("check_release", "0", "require W4A4 to release the original CUDA weight");
-                params.Add("check_fallback", "0", "disable W4A4 after repack and verify fallback restore");
+                params.Add("check_fixed_backend", "0", "verify inference cannot switch a warmed CUTLASS backend");
+                params.Add("check_warmup_fallback", "0", "force first-use fallback and verify legacy remains fixed");
+                params.Add("check_device_move", "0", "on 2+ GPUs, rebuild the fixed backend on GPU 1");
+                params.Add("check_fusion_separation", "0", "verify fused SwiGLU rejection does not reject Linear CUTLASS");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
