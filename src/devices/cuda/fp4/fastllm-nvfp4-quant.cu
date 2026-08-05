@@ -66,12 +66,13 @@ __global__ void FastllmSiluMulNvfp4QuantKernel(
     }
 }
 
-// 将 FastLLM 交错存储的 NVFP4_BLOCK_16 数据
-//   [8 字节 E2M1 打包值][4 字节 FP32 缩放因子]
-// 重排为 CUTLASS 块缩放 GEMM 使用的两个输入：
-//   连续行主序 FP4 权重矩阵，以及独立交错排列的 E4M3 缩放因子矩阵。
+// 将 FastLLM 的 FP4 权重和 checkpoint 原始 E4M3 group scale
+// 重排为 CUTLASS 块缩放 GEMM 要求的两个布局。
+// 这里只搬运并改变布局，不对 scale 做解码或二次量化。
 __global__ void FastllmNvfp4Block16ToCutlassKernel(
-        const uint8_t *__restrict__ source, uint8_t *__restrict__ packedWeight,
+        const uint8_t *__restrict__ source,
+        const uint8_t *__restrict__ groupScales,
+        uint8_t *__restrict__ packedWeight,
         uint8_t *__restrict__ weightScales, int rows, int columns,
         int paddedRows, int paddedColumns,
         int sourceBytesPerRow, int kTiles) {
@@ -87,15 +88,13 @@ __global__ void FastllmNvfp4Block16ToCutlassKernel(
         if (row < rows && group < columns / 16) {
             const uint8_t *block = source + (size_t)row * sourceBytesPerRow
                                  + (size_t)group * (8 + sizeof(float));
-            // NVFP4_BLOCK_16 每块存储 8 字节打包权重和一个 FP32 缩放因子，
-            // 相邻块间隔 12 字节。奇数块仅按 4 字节对齐，不能通过
-            // uint64_t 指针直接读取。
+            // 旧 fallback 仍使用 12 字节 block；此处只读其中的 8 字节 FP4。
+            // 相邻 block 间隔 12 字节，因此用两次 32-bit 读取避免非对齐 uint64_t 访问。
             const uint32_t packedLo = *reinterpret_cast<const uint32_t *>(block);
             const uint32_t packedHi = *reinterpret_cast<const uint32_t *>(block + 4);
             packed = uint64_t(packedLo) | (uint64_t(packedHi) << 32);
-            // CUTLASS 为每组 16 个 FP4 权重读取一个 E4M3 缩放因子。
-            __nv_fp8_e4m3 scale(*reinterpret_cast<const float *>(block + 8));
-            scaleByte = reinterpret_cast<const uint8_t &>(scale);
+            // 原始 E4M3 字节直接进入 CUTLASS swizzled scale 布局。
+            scaleByte = groupScales[(size_t)row * (columns / 16) + group];
         }
         // 补齐区域使用零 FP4 权重和零缩放因子。
         if (row < paddedRows) {
@@ -221,19 +220,23 @@ bool FastllmCudaSiluMulNvfp4QuantizePadded(
 }
 
 bool FastllmCudaNvfp4Block16ToCutlass(
-        const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
+        const uint8_t *source, const uint8_t *groupScales,
+        uint8_t *packedWeight, uint8_t *weightScales,
         int rows, int columns, void *streamPtr) {
     return FastllmCudaNvfp4Block16ToCutlassPadded(
-        source, packedWeight, weightScales, rows, columns, rows, columns,
+        source, groupScales, packedWeight, weightScales,
+        rows, columns, rows, columns,
         streamPtr);
 }
 
 bool FastllmCudaNvfp4Block16ToCutlassPadded(
-        const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
+        const uint8_t *source, const uint8_t *groupScales,
+        uint8_t *packedWeight, uint8_t *weightScales,
         int rows, int columns, int paddedRows, int paddedColumns,
         void *streamPtr) {
     if (!FastllmNvfp4RuntimeSupported() || source == nullptr || packedWeight == nullptr ||
-        weightScales == nullptr || rows <= 0 || columns <= 0 || columns % 16 != 0) {
+        groupScales == nullptr || weightScales == nullptr ||
+        rows <= 0 || columns <= 0 || columns % 16 != 0) {
         return false;
     }
     if (paddedRows < rows || paddedColumns < columns || paddedRows % 32 != 0 ||
@@ -246,7 +249,7 @@ bool FastllmCudaNvfp4Block16ToCutlassPadded(
               (groups + threads - 1) / threads);
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
     FastllmNvfp4Block16ToCutlassKernel<<<grid, threads, 0, stream>>>(
-        source, packedWeight, weightScales, rows, columns,
+        source, groupScales, packedWeight, weightScales, rows, columns,
         paddedRows, paddedColumns, sourceBytesPerRow, kTiles);
     return cudaGetLastError() == cudaSuccess;
 }

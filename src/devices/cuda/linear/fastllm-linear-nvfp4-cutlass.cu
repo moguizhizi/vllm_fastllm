@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -99,12 +100,17 @@ static bool SemanticsSupported(const fastllm::Data &input,
     if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 || weight.blockM != 16) {
         *reason = "weight is not NVFP4_BLOCK_16"; return false;
     }
+    if (m <= 0 || k <= 0 || m % 16 != 0) {
+        *reason = "K is not compatible with NVFP4 block-16"; return false;
+    }
+    const size_t expectedScales = (size_t)k * ((size_t)m / 16);
+    if (weight.nvfp4GroupScales.size() != expectedScales ||
+        !std::isfinite(weight.nvfp4GlobalScale) || weight.nvfp4GlobalScale <= 0.0f) {
+        *reason = "original E4M3/global scales are unavailable"; return false;
+    }
     if (!bias.dims.empty() &&
         (bias.dataType != fastllm::DataType::FLOAT32 || bias.Count(0) != (uint64_t)k)) {
         *reason = "bias must be empty or FP32 with N elements"; return false;
-    }
-    if (m <= 0 || k <= 0 || m % 16 != 0) {
-        *reason = "K is not compatible with NVFP4 block-16"; return false;
     }
     if (weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m) {
         *reason = "weight shape mismatch"; return false;
@@ -139,19 +145,24 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k) {
     cache.scales = static_cast<uint8_t *>(FastllmCudaMalloc(
         FastllmCudaNvfp4SwizzledScaleBytes(paddedK, paddedM)));
     cache.alpha = static_cast<float *>(FastllmCudaMalloc(sizeof(float)));
+    const size_t sourceScaleBytes = (size_t)k * (m / 16);
+    uint8_t *sourceScales = static_cast<uint8_t *>(FastllmCudaMalloc(sourceScaleBytes));
     if (cache.weight == nullptr || cache.scales == nullptr || cache.alpha == nullptr) {
+        if (sourceScales != nullptr) FastllmCudaFree(sourceScales);
         ReleaseCache(cache); return nullptr;
     }
-    const float one = 1.0f;
-    if (!FastllmCudaNvfp4Block16ToCutlassPadded(
-            static_cast<const uint8_t *>(weight.cudaData), cache.weight,
-            cache.scales, k, m, paddedK, paddedM, (void *)cudaStreamPerThread) ||
-        cudaMemcpyAsync(cache.alpha, &one, sizeof(one), cudaMemcpyHostToDevice,
-                        cudaStreamPerThread) != cudaSuccess) {
-        ReleaseCache(cache); return nullptr;
-    }
+    const bool queued = sourceScales != nullptr &&
+        cudaMemcpyAsync(sourceScales, weight.nvfp4GroupScales.data(), sourceScaleBytes,
+                        cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess &&
+        FastllmCudaNvfp4Block16ToCutlassPadded(
+            static_cast<const uint8_t *>(weight.cudaData), sourceScales, cache.weight,
+            cache.scales, k, m, paddedK, paddedM, (void *)cudaStreamPerThread) &&
+        cudaMemcpyAsync(cache.alpha, &weight.nvfp4GlobalScale,
+                        sizeof(weight.nvfp4GlobalScale), cudaMemcpyHostToDevice,
+                        cudaStreamPerThread) == cudaSuccess;
     const cudaError_t syncStatus = cudaStreamSynchronize(cudaStreamPerThread);
-    if (syncStatus != cudaSuccess) {
+    if (sourceScales != nullptr) FastllmCudaFree(sourceScales);
+    if (!queued || syncStatus != cudaSuccess) {
         ReleaseCache(cache);
         return nullptr;
     }
@@ -268,7 +279,11 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
     if (packedWeight == nullptr || scales == nullptr || alpha == nullptr ||
         weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
         weight.blockM != 16 || inFeatures <= 0 || outFeatures <= 0 ||
-        inFeatures % 32 != 0 || outFeatures % 32 != 0) return false;
+        inFeatures % 32 != 0 || outFeatures % 32 != 0 ||
+        weight.nvfp4GroupScales.size() !=
+            (size_t)outFeatures * (inFeatures / 16) ||
+        !std::isfinite(weight.nvfp4GlobalScale) ||
+        weight.nvfp4GlobalScale <= 0.0f) return false;
     WeightCache *cache = GetWeightCache(weight, inFeatures, outFeatures);
     if (cache == nullptr || cache->paddedColumns != inFeatures ||
         cache->paddedRows != outFeatures) return false;

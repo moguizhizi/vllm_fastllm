@@ -585,10 +585,12 @@ bool FastllmCudaSiluMulNvfp4QuantizePadded(
     int rows, int hidden, int paddedHidden,
     float globalScale, void *streamPtr = nullptr);
 bool FastllmCudaNvfp4Block16ToCutlass(
-    const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
+    const uint8_t *source, const uint8_t *groupScales,
+    uint8_t *packedWeight, uint8_t *weightScales,
     int rows, int columns, void *streamPtr = nullptr);
 bool FastllmCudaNvfp4Block16ToCutlassPadded(
-    const uint8_t *source, uint8_t *packedWeight, uint8_t *weightScales,
+    const uint8_t *source, const uint8_t *groupScales,
+    uint8_t *packedWeight, uint8_t *weightScales,
     int rows, int columns, int paddedRows, int paddedColumns,
     void *streamPtr = nullptr);
 bool FastllmCudaNvfp4CutlassGemmSm100(

@@ -4826,6 +4826,7 @@ namespace fastllm {
         mergeData.groupCnt = input0.groupCnt;
         mergeData.blockK = input0.blockK;
         mergeData.blockM = input0.blockM;
+        mergeData.nvfp4GlobalScale = input0.nvfp4GlobalScale;
         mergeData.Allocate();
 
         uint64_t offset = 0;
@@ -4835,6 +4836,15 @@ namespace fastllm {
             mergeData.scales = AppendVector(mergeData.scales, input->scales);
             mergeData.mins = AppendVector(mergeData.mins, input->mins);
             mergeData.halfScales = AppendVector(mergeData.halfScales, input->halfScales);
+            if (mergeData.dataType == DataType::NVFP4_BLOCK_16) {
+                if (!input->nvfp4GroupScales.empty() &&
+                    input->nvfp4GlobalScale == mergeData.nvfp4GlobalScale) {
+                    mergeData.nvfp4GroupScales = AppendVector(
+                        mergeData.nvfp4GroupScales, input->nvfp4GroupScales);
+                } else {
+                    mergeData.nvfp4GroupScales.clear();
+                }
+            }
             memcpy(mergeData.cpuData + offset, input->cpuData, input->GetBytes());
             offset += input->GetBytes();
         }

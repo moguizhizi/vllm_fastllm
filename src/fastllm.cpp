@@ -965,6 +965,8 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        this->nvfp4GroupScales = ori.nvfp4GroupScales;
+        this->nvfp4GlobalScale = ori.nvfp4GlobalScale;
         if (ori.dataType == DataType::INT4_W4A8) {
             this->group = ori.group;
             this->groupCnt = ori.groupCnt;
@@ -1407,6 +1409,8 @@ namespace fastllm {
             int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
+        data.nvfp4GroupScales.clear();
+        data.nvfp4GlobalScale = 1.0f;
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
              dataType == DataType::NVFP4_BLOCK_16_E8M0 ||

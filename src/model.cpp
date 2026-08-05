@@ -796,6 +796,8 @@ namespace fastllm {
         uint8_t *buffer = nullptr;
         float *minsBuffer = nullptr, *scalesBuffer = nullptr;
         int blockK, blockM;
+        std::vector<uint8_t> nvfp4GroupScales;
+        float nvfp4GlobalScale = 1.0f;
 
         SafeTensorItem() {} 
 
@@ -937,6 +939,9 @@ namespace fastllm {
                         }
                     }
 
+                    nvfp4GroupScales.clear();
+                    nvfp4GlobalScale = 1.0f;
+
                     size_t blockBytes = dstType == DataType::NVFP4_BLOCK_16 ? 8 + sizeof(float) : 9;
                     size_t scaleCols = (m - 1) / 16 + 1;
                     size_t outputBytes = GetDataBytes(dstType, n, m);
@@ -963,6 +968,12 @@ namespace fastllm {
                     AssertInFastLLM(ret == scale.bytes,
                                     "CreateBufferWithScale error: read NVFP4_BLOCK_16 scale failed.");
 
+                    if (dstType == DataType::NVFP4_BLOCK_16) {
+                        // 保留 checkpoint 中的 E4M3 group scale 和 FP32 global scale。
+                        // inline FP32 effective scale 暂时保留，仅用于现有 CPU/CUDA fallback。
+                        nvfp4GlobalScale = scale2Value;
+                    }
+
                     buffer = new uint8_t[outputBytes];
                     memset(buffer, 0, outputBytes);
                     for (int i = 0; i < n; i++) {
@@ -981,6 +992,9 @@ namespace fastllm {
                                 memcpy(dstBlock + 8, &curScale, sizeof(float));
                             }
                         }
+                    }
+                    if (dstType == DataType::NVFP4_BLOCK_16) {
+                        nvfp4GroupScales = std::move(scaleBytes);
                     }
                     return;
                 }
@@ -1983,6 +1997,8 @@ namespace fastllm {
         weight.mins.clear();
         weight.zeros.clear();
         weight.halfScales.clear();
+        weight.nvfp4GroupScales.clear();
+        weight.nvfp4GlobalScale = 1.0f;
         weight.perChannelsConfigs.clear();
         weight.disableGGUFRepack = false;
         weight.blockK = -1;
@@ -3254,6 +3270,7 @@ namespace fastllm {
                                         mergeData.groupCnt = model->weight[input0].groupCnt;
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
+                                        mergeData.nvfp4GlobalScale = model->weight[input0].nvfp4GlobalScale;
 
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
@@ -3268,6 +3285,16 @@ namespace fastllm {
                                                 mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
                                                 mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
                                                 mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                if (mergeData.dataType == DataType::NVFP4_BLOCK_16) {
+                                                    if (!model->weight[input].nvfp4GroupScales.empty() &&
+                                                        model->weight[input].nvfp4GlobalScale == mergeData.nvfp4GlobalScale) {
+                                                        mergeData.nvfp4GroupScales = AppendVector(
+                                                            mergeData.nvfp4GroupScales,
+                                                            model->weight[input].nvfp4GroupScales);
+                                                    } else {
+                                                        mergeData.nvfp4GroupScales.clear();
+                                                    }
+                                                }
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
                                                 } else {
@@ -4176,6 +4203,11 @@ namespace fastllm {
                                     model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                             tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                             curGroupCnt, tensor.blockK, tensor.blockM);
+                                    if (oriDataType == DataType::NVFP4_BLOCK_16) {
+                                        model->weight[weightName].nvfp4GroupScales =
+                                            std::move(tensor.nvfp4GroupScales);
+                                        model->weight[weightName].nvfp4GlobalScale = tensor.nvfp4GlobalScale;
+                                    }
                                 }
                                 if (isW4A8PackedTensor) {
                                     std::string reason;
@@ -4306,6 +4338,7 @@ namespace fastllm {
                                         }
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
+                                        mergeData.nvfp4GlobalScale = model->weight[input0].nvfp4GlobalScale;
 
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
@@ -4323,6 +4356,16 @@ namespace fastllm {
                                                 mergeData.w4a8GroupScales = AppendVector(
                                                     mergeData.w4a8GroupScales,
                                                     model->weight[input].w4a8GroupScales);
+                                                if (mergeData.dataType == DataType::NVFP4_BLOCK_16) {
+                                                    if (!model->weight[input].nvfp4GroupScales.empty() &&
+                                                        model->weight[input].nvfp4GlobalScale == mergeData.nvfp4GlobalScale) {
+                                                        mergeData.nvfp4GroupScales = AppendVector(
+                                                            mergeData.nvfp4GroupScales,
+                                                            model->weight[input].nvfp4GroupScales);
+                                                    } else {
+                                                        mergeData.nvfp4GroupScales.clear();
+                                                    }
+                                                }
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
                                                 } else {
@@ -4852,6 +4895,11 @@ namespace fastllm {
                             weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                 tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                 curGroupCnt, tensor.blockK, tensor.blockM);
+                            if (oriDataType == DataType::NVFP4_BLOCK_16) {
+                                weights[weightName].nvfp4GroupScales =
+                                    std::move(tensor.nvfp4GroupScales);
+                                weights[weightName].nvfp4GlobalScale = tensor.nvfp4GlobalScale;
+                            }
                             tensor.ClearBuffer();
                         }
                     }, st, end)

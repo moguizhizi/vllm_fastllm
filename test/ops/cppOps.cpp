@@ -2091,6 +2091,10 @@ namespace {
         std::vector<float> inputValues;
         std::vector<float> biasValues;
         std::vector<uint8_t> weightBytes;
+        std::vector<uint8_t> groupScales;
+        // 故意使用不能被 E4M3 精确表示的 global scale，
+        // 防止测试意外放过“合并后再量化 group scale”的旧实现。
+        float globalScale = 0.01f;
 
         explicit LinearNvfp4Fixture(const OpTestParams &params) {
             batch = params.GetInt("batch");
@@ -2120,6 +2124,7 @@ namespace {
             const size_t rowBytes = fastllm::GetDataBytes(
                 fastllm::DataType::NVFP4_BLOCK_16, 1, in);
             weightBytes.resize((size_t)out * rowBytes);
+            groupScales.resize((size_t)out * (in / 16));
             for (int row = 0; row < out; ++row) {
                 for (int group = 0; group < in / 16; ++group) {
                     uint8_t *block = weightBytes.data() + (size_t)row * rowBytes +
@@ -2132,7 +2137,9 @@ namespace {
                         if ((row + group + pair * 2) & 2) high |= 8;
                         block[pair] = uint8_t(low | (high << 4));
                     }
-                    float scale = 0.00390625f * float(1 + ((row * 7 + group * 3) % 8));
+                    const uint8_t scaleByte = uint8_t(0x28 + ((row * 7 + group * 3) % 16));
+                    groupScales[(size_t)row * (in / 16) + group] = scaleByte;
+                    float scale = DecodeFp8E4M3(scaleByte) * globalScale;
                     std::memcpy(block + 8, &scale, sizeof(scale));
                 }
             }
@@ -2151,6 +2158,8 @@ namespace {
             weight.Resize({out, in});
             weight.Allocate(true);
             std::memcpy(weight.cpuData, weightBytes.data(), weightBytes.size());
+            weight.nvfp4GroupScales = groupScales;
+            weight.nvfp4GlobalScale = globalScale;
         }
 
         fastllm::Data MakeBias() const {
@@ -3577,6 +3586,8 @@ namespace {
             weight.Allocate(false);
             const size_t rowBytes = fastllm::GetDataBytes(
                 fastllm::DataType::NVFP4_BLOCK_16, 1, cols);
+            weight.nvfp4GlobalScale = 0.01f;
+            weight.nvfp4GroupScales.resize((size_t)rows * (cols / 16));
             for (int row = 0; row < rows; ++row) {
                 for (int group = 0; group < cols / 16; ++group) {
                     uint8_t *dst = weight.cpuData + (size_t)row * rowBytes +
@@ -3588,7 +3599,9 @@ namespace {
                         if ((group + pair + seed) & 1) high |= 8;
                         dst[pair] = uint8_t(low | (high << 4));
                     }
-                    float scale = 0.001953125f * float(1 + ((row + group + seed) % 8));
+                    const uint8_t scaleByte = uint8_t(0x28 + ((row + group + seed) % 16));
+                    weight.nvfp4GroupScales[(size_t)row * (cols / 16) + group] = scaleByte;
+                    float scale = DecodeFp8E4M3(scaleByte) * weight.nvfp4GlobalScale;
                     std::memcpy(dst + 8, &scale, sizeof(scale));
                 }
             }

@@ -313,7 +313,7 @@ namespace fastllm {
         FP8_E4M3_PERCHANNEL = 1003, // fp8, per channel量化
         INT4_GROUP128 = 1004, // int4, per group量化，group = 128
         INT8_PERCHANNEL = 1005, // int8, per channel量化
-        NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1, blockM = 16, inline float scale per block
+        NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1 + effective FP32 scale; original E4M3/global scales are kept in Data metadata
         NVFP4_BLOCK_16_E8M0 = 1007, // packed fp4 e2m1, blockM = 16, inline e8m0 scale per block
         // Symmetric group-32 INT4. Four groups form one compact block:
         // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
@@ -512,6 +512,13 @@ namespace fastllm {
 
         // FP8的分组量化， [blockK, blockM]的小矩阵为一组
         int blockK = -1, blockM = -1;
+
+        // compressed-tensors / ModelOpt NVFP4 的原始两级 scale。
+        // group scale 保持 checkpoint 中的 E4M3 字节；global scale 保持为 FP32 乘数。
+        // compressed-tensors 存的是 divisor，加载时只做一次取倒数转换。
+        // NVFP4_BLOCK_16 中的 inline FP32 scale 仅供旧 fallback 路径使用。
+        std::vector <uint8_t> nvfp4GroupScales;
+        float nvfp4GlobalScale = 1.0f;
 
         // 以下为每个通道/分组的量化参数
         // 1. 若不使用分通道量化，那么总组数 = 1
