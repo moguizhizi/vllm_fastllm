@@ -95,6 +95,7 @@ def run_vllm(args):
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=True,
+        linear_backend="cutlass",
     )
     params = SamplingParams(
         temperature=0.0,
