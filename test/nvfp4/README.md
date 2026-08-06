@@ -28,24 +28,26 @@
 
 ## 权重显存生命周期
 
-每个 `Data + device` 第一次执行就是后端 warmup。CUTLASS/Marlin 完成重排并实际运行
-成功后，后端状态才固定，随后真正释放原始 `cudaData`；warmup 失败则销毁候选重排
-cache、保留原始权重，并固定使用 legacy。正式推理开始后不再通过修改环境变量切换
-已固定后端，运行阶段 kernel 失败直接报错。
+每个NVFP4 `Data + device` 在权重进入GPU时选择候选后端。dense CUTLASS候选会立即
+完成重排并释放原始 `cudaData`，状态记为Prepared；首个真实GEMM同步验证成功后固定
+为Cutlass。验证失败则销毁候选cache、从CPU/mmap恢复原始权重，并固定使用legacy。
+正式推理开始后不再通过修改环境变量切换已固定后端，运行阶段kernel失败直接报错。
 
 dense W4A4 的首次后端选择不设置 M 门槛。M 只用于选择 CUTLASS 内部 tile/config，
-不会导致 CUTLASS 与 legacy 在不同 batch 之间切换。warmup 仍负责验证重排、量化、
-GEMM 和异步 CUDA 状态，只有验证成功后才能释放原始 CUDA 权重。
+不会导致CUTLASS与legacy在不同batch之间切换。上传阶段负责重排并释放原始CUDA
+权重；首个真实GEMM仍负责验证激活量化、GEMM、后处理和异步CUDA状态。
 
 SwiGLU 融合能力单独记录：融合 warmup 失败只关闭融合，随后执行普通 SwiGLU，再由
 Linear 独立选择 CUTLASS/Marlin/legacy。它不会把 Linear 一起降级。
 
-CPU/mmap 原始数据继续保留，用于目标GPU重建。权重从GPU0移动到GPU1时先销毁GPU0
-cache，再把host源直接上传到GPU1；GPU1第一次Linear重新warmup、重排并释放临时源，
+CPU/mmap 原始数据继续保留，用于目标GPU重建。NVFP4权重进入GPU时逐个完成上传、
+预重排和原始CUDA表示释放，首个真实Linear只负责同步验证GEMM并固定后端。权重从
+GPU0移动到GPU1时先销毁GPU0 cache，再从host源直接上传到GPU1并立即预重排，
 不再执行“host→GPU0原始权重→GPU1”的中转。
 
-`ops-functional` 会检查：warmup成功后释放原始CUDA权重、正式推理不切换后端、warmup
-失败后固定legacy、融合拒绝不影响Linear；存在两张GPU时还检查跨GPU重建。
+`ops-functional` 会检查：上传预重排后立即释放原始CUDA权重、正式推理不切换后端、
+首次GEMM验证失败后恢复并固定legacy、融合拒绝不影响Linear；存在两张GPU时还检查
+跨GPU直接重建。
 
 ## 模型和显卡
 

@@ -2205,6 +2205,11 @@ namespace {
             MakeWeight(weight);
             input.ToDevice(fastllm::DataDevice::CUDA);
             weight.ToDevice(fastllm::DataDevice::CUDA);
+            if (checkRelease && FastllmCudaRuntimeArch() >= 100 &&
+                FastllmCudaRuntimeArch() < 130 && weight.cudaData != nullptr) {
+                throw std::runtime_error(
+                    "NVFP4 upload-time prepack retained the original CUDA weight");
+            }
             if (checkFusionSeparation) {
                 fastllm::Data malformed(
                     inputType, {batch, in * 2 - 16},
@@ -2223,12 +2228,25 @@ namespace {
             const char *oldValue = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
             const bool hadOldValue = oldValue != nullptr;
             const std::string savedValue = hadOldValue ? oldValue : "";
-            if (checkWarmupFallback) setenv("FASTLLM_CUDA_NVFP4_W4A4", "0", 1);
-            fastllm::Linear(input, weight, bias, output);
             if (checkWarmupFallback) {
-                if (hadOldValue) setenv("FASTLLM_CUDA_NVFP4_W4A4", savedValue.c_str(), 1);
-                else unsetenv("FASTLLM_CUDA_NVFP4_W4A4");
+                // 权重已在ToDevice阶段预重排。用错误的激活宽度触发首次
+                // GEMM验证失败，检查cache销毁、原始权重恢复和Legacy固定。
+                fastllm::Data malformed(
+                    inputType, {batch, in - 16},
+                    std::vector<float>((size_t)batch * (in - 16), 0.25f));
+                malformed.ToDevice(fastllm::DataDevice::CUDA);
+                fastllm::Data rejectedOutput;
+                rejectedOutput.dataType = inputType;
+                rejectedOutput.UpdateUnitSize();
+                rejectedOutput.Resize({batch, out});
+                if (TryCudaCutlassNvfp4W4A4(
+                        malformed, weight, bias, rejectedOutput,
+                        batch, out, in)) {
+                    throw std::runtime_error(
+                        "malformed NVFP4 warmup unexpectedly used CUTLASS");
+                }
             }
+            fastllm::Linear(input, weight, bias, output);
             if (checkRelease && FastllmCudaRuntimeArch() >= 100 &&
                 FastllmCudaRuntimeArch() < 130 && weight.cudaData != nullptr) {
                 throw std::runtime_error(
@@ -2267,9 +2285,9 @@ namespace {
                     input.ToDevice(fastllm::DataDevice::CUDA, {1});
                     weight.ToDevice(fastllm::DataDevice::CUDA, {1});
                     if (useBias) bias.ToDevice(fastllm::DataDevice::CUDA, {1});
-                    if (weight.cudaData == nullptr) {
+                    if (weight.cudaData != nullptr) {
                         throw std::runtime_error(
-                            "NVFP4 device move did not restore directly on the destination GPU");
+                            "NVFP4 device move retained the destination original CUDA weight");
                     }
                     FastllmCudaSetDevice(1);
                     fastllm::Data movedOutput;
@@ -2362,7 +2380,7 @@ namespace {
                 params.Add("input_type", "fp16", "fp16 or bf16; Marlin accepts fp16 only");
                 params.Add("check_release", "0", "require W4A4 to release the original CUDA weight");
                 params.Add("check_fixed_backend", "0", "verify inference cannot switch a warmed CUTLASS backend");
-                params.Add("check_warmup_fallback", "0", "force first-use fallback and verify legacy remains fixed");
+                params.Add("check_warmup_fallback", "0", "force first GEMM validation failure and verify legacy remains fixed");
                 params.Add("check_device_move", "0", "on 2+ GPUs, rebuild the fixed backend on GPU 1");
                 params.Add("check_fusion_separation", "0", "verify fused SwiGLU rejection does not reject Linear CUTLASS");
                 return params;
