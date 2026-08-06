@@ -718,9 +718,10 @@ bool TryCudaCutlassNvfp4W4A4(
     bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, m, n, k, false,
                                   checkBackendPolicy, warmup);
     if (ok && warmup) {
-        // warmup成功后，CUTLASS重排权重成为该GPU上的持久表示。
-        // 释放原始CUDA权重，避免同时保存原始格式和重排格式。
-        if (!weight.ReleaseCudaDataForRepackedWeight()) {
+        // Uninitialized直达路径直到warmup成功才释放原始CUDA权重；Prepared
+        // 路径已在ToDevice预重排阶段释放，不再重复调用释放接口。
+        if (state == BackendState::Uninitialized &&
+            !weight.ReleaseCudaDataForRepackedWeight()) {
             ReleaseWeightCacheForDevice(&weight, device);
             SetBackendState(weight, device, BackendState::Rejected);
             return false;
@@ -766,7 +767,10 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
                                   backendWarmup || fusionWarmup);
     if (ok) {
         if (backendWarmup) {
-            if (!weight.ReleaseCudaDataForRepackedWeight()) {
+            // 与普通Linear一致：只有未经过ToDevice预重排的直达路径需要
+            // 在首次融合GEMM成功后释放原始CUDA权重。
+            if (backend == BackendState::Uninitialized &&
+                !weight.ReleaseCudaDataForRepackedWeight()) {
                 ReleaseWeightCacheForDevice(&weight, device);
                 SetBackendState(weight, device, BackendState::Rejected);
                 SetFusionState(weight, device, FusionState::Disabled);
