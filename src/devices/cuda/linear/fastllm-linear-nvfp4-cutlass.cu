@@ -367,11 +367,35 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
     return true;
 }
 
+/**
+ * 执行一次NVFP4 W4A4 CUTLASS线性计算。
+ *
+ * 本函数只负责单次计算，不决定后端的最终生命周期。执行流程为：检查
+ * GPU与张量语义、取得CUTLASS重排权重、准备临时缓冲区、将FP16/BF16
+ * 激活动态量化为NVFP4、调用对应架构的CUTLASS GEMM，最后处理padding
+ * 和bias。首次后端选择时可强制同步，以便在释放原始权重前发现异步错误。
+ *
+ * @param input                FP16或BF16输入；普通路径形状为[n, m]，融合
+ *                             路径形状为[n, 2 * m]。
+ * @param weight               NVFP4_BLOCK_16权重，逻辑形状为[k, m]。
+ * @param bias                 可选FP32偏置，长度为k。
+ * @param output               输出张量，逻辑形状为[n, k]。
+ * @param n                    激活行数，通常为本次参与计算的token数。
+ * @param m                    输入特征数。
+ * @param k                    输出特征数。
+ * @param siluMulInput         true表示把SwiGLU计算与激活量化融合。
+ * @param checkSelectionPolicy true表示同时检查开关和最小行数等选择策略；
+ *                             后端固定后的正式计算传false。
+ * @param validateWarmup       true表示末尾强制同步，验证首次warmup的异步错误。
+ * @return true表示本次CUTLASS计算及必要的后处理成功；false表示某个阶段
+ *         不满足条件或执行失败，具体阶段通过Trace记录。
+ */
 static bool RunCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k, bool siluMulInput,
         bool checkSelectionPolicy, bool validateWarmup) {
+    // 先检查运行架构、数据类型、权重格式、scale元数据和维度语义。
     const int arch = RuntimeArch();
     const char *reason = "unsupported";
     const bool supportedArch = arch >= 100 && arch < 130;
@@ -388,6 +412,8 @@ static bool RunCutlassNvfp4W4A4(
         return false;
     }
 
+    // 获取或创建当前GPU专属的CUTLASS格式权重。此处暂不释放原始权重；
+    // 是否释放由外层后端生命周期函数在warmup成功后决定。
     WeightCache *cache = GetWeightCache(weight, m, k, false);
     if (cache == nullptr) {
         Trace("fallback", "weight cache unavailable", n, m, k, arch);
@@ -397,6 +423,9 @@ static bool RunCutlassNvfp4W4A4(
         Trace("fallback", "weight repack", n, m, k, arch);
         return false;
     }
+
+    // 激活量化需要补齐后的A和scale缓冲区；输出特征被补齐时，GEMM先
+    // 写入临时输出，随后再切回真实的k列。
     ActivationScratch *activation = GetActivationScratch(n, cache->paddedColumns);
     const bool paddedOutput = cache->paddedRows != k;
     OutputScratch *padded = paddedOutput
@@ -406,6 +435,7 @@ static bool RunCutlassNvfp4W4A4(
         return false;
     }
 
+    // 接入FastLLM张量的设备指针，并为可选bias取得输入指针。
     void *inputData = FastllmCudaPrepareInput(input);
     void *outputData = FastllmCudaPrepareOutput(output);
     void *biasData = bias.dims.empty() ? nullptr : FastllmCudaPrepareInput(bias);
@@ -414,6 +444,8 @@ static bool RunCutlassNvfp4W4A4(
     bool ok = inputData != nullptr && outputData != nullptr &&
               (bias.dims.empty() || biasData != nullptr);
     if (ok) {
+        // 普通路径只做动态NVFP4量化；融合路径先计算SwiGLU，再直接生成
+        // CUTLASS所需的NVFP4激活和E4M3 block scale。
         failureStage = siluMulInput ? "SwiGLU activation quantization" :
                                       "activation quantization";
         ok = siluMulInput
@@ -426,6 +458,8 @@ static bool RunCutlassNvfp4W4A4(
         if (ok) ok = TraceSynchronize(failureStage);
     }
     if (ok) {
+        // SM100/SM120使用各自实例化的CUTLASS内核。GEMM直接消费NVFP4
+        // 激活、NVFP4权重、两侧block scale以及权重global scale。
         failureStage = arch < 120 ? "SM100 CUTLASS GEMM" : "SM120 CUTLASS GEMM";
         ok = arch < 120
             ? FastllmCudaNvfp4CutlassGemmSm100(
@@ -440,15 +474,19 @@ static bool RunCutlassNvfp4W4A4(
                   (void *)cudaStreamPerThread);
     }
     if (ok && (paddedOutput || biasData != nullptr)) {
+        // 去掉输出N维padding，并在需要时同时加上FP32 bias。
         failureStage = "output finalize";
         ok = FinalizeOutput(gemmOutput, outputData, static_cast<const float *>(biasData),
                             output.dataType, n, k, cache->paddedRows);
     }
     if (ok && validateWarmup) {
+        // CUDA调用通常异步返回。首次warmup必须同步，避免内核实际失败后
+        // 外层仍将CUTLASS标记为固定后端并释放原始CUDA权重。
         failureStage = "warmup validation";
         ok = TraceSynchronize(failureStage, true);
     }
 
+    // 与PrepareInput/PrepareOutput成对收尾，并记录本次最终路径或失败阶段。
     if (biasData != nullptr) FastllmCudaFinishInput(bias, biasData);
     if (inputData != nullptr) FastllmCudaFinishInput(input, inputData);
     if (outputData != nullptr) FastllmCudaFinishOutput(output, outputData);
