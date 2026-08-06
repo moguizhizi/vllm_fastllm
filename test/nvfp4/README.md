@@ -21,7 +21,8 @@
 
 - `FASTLLM_CUDA_NVFP4_W4A4=0`：关闭 dense W4A4。
 - `FASTLLM_CUDA_NVFP4_SWIGLU_QUANT=0`：关闭 Dense SwiGLU+FP4 量化融合。
-- `FASTLLM_CUDA_NVFP4_TRACE=1`：在 log 中打印命中或回退原因。
+- `FASTLLM_CUDA_NVFP4_TRACE=1`：在 log 中打印命中或回退原因；该模式会
+  插入CUDA流同步，只用于功能诊断，不用于正式性能测试。
 - `FASTLLM_CUDA_MOE_NVFP4_W4A4=0`：关闭 grouped MoE W4A4。
 - `FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=N`：grouped MoE 门槛，默认 16。
 

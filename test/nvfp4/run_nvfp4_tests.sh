@@ -189,11 +189,13 @@ run_forward() {
 
 run_model() {
     require_model
-    run_logged model_prefill env FASTLLM_CUDA_NVFP4_TRACE=1 \
+    # TRACE会在量化等阶段插入cudaStreamSynchronize，只用于功能诊断。
+    # 性能测试显式清除它，避免外部export的环境变量污染prefill/decode结果。
+    run_logged model_prefill env -u FASTLLM_CUDA_NVFP4_TRACE \
         python test/benchmark/prefill.py "${model_path}" \
         --dtype auto --atype bfloat16 --device cuda --moe_device cuda \
         --prompt-repeat 256 --max-tokens 16
-    run_logged model_decode env FASTLLM_CUDA_NVFP4_TRACE=1 \
+    run_logged model_decode env -u FASTLLM_CUDA_NVFP4_TRACE \
         python test/benchmark/decode.py "${model_path}" \
         --dtype auto --atype bfloat16 --device cuda --moe_device cuda \
         --batch-size 32 --max_batch 32 --prefill-length 512 --max-tokens 64
