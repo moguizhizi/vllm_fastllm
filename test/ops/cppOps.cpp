@@ -1975,8 +1975,8 @@ namespace {
             }
         }
 
-        fastllm::Data DequantizedBuffers(const uint8_t *sourcePacked,
-                                         const uint8_t *sourceScales) const {
+        fastllm::Data DequantizedBuffers(uint8_t *sourcePacked,
+                                         uint8_t *sourceScales) const {
             ForceDeviceSync();
             std::vector<uint8_t> hostPacked(packedBytes), hostScales(scaleBytes);
             FastllmCudaCopyFromDeviceToHost(hostPacked.data(), sourcePacked, packedBytes);
@@ -2293,8 +2293,7 @@ namespace {
                 }
             }
             if (checkDeviceMove) {
-                int deviceCount = 0;
-                cudaGetDeviceCount(&deviceCount);
+                int deviceCount = FastllmCudaGetDeviceCount();
                 if (deviceCount >= 2 && FastllmCudaRuntimeArch() >= 100 &&
                     FastllmCudaRuntimeArch() < 130) {
                     input.ToDevice(fastllm::DataDevice::CUDA, {1});
