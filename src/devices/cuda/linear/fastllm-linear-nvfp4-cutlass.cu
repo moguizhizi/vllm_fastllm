@@ -148,6 +148,17 @@ static int CurrentDevice() {
     return cudaGetDevice(&device) == cudaSuccess ? device : -1;
 }
 
+/**
+ * 获取指定NVFP4权重在指定GPU上的CUTLASS后端状态。
+ *
+ * 状态以“Data对象地址 + CUDA设备号”为键保存，因此同一权重移动到
+ * 另一张GPU后会拥有独立的后端生命周期。读取过程由stateMutex保护；
+ * 如果尚未登记状态，则返回Uninitialized，但不会向状态表插入新记录。
+ *
+ * @param weight 用于标识模型权重对象。
+ * @param device CUDA设备号。
+ * @return 当前后端状态：Uninitialized、Cutlass或Rejected。
+ */
 static BackendState GetBackendState(const fastllm::Data &weight, int device) {
     std::lock_guard<std::mutex> guard(stateMutex);
     auto it = backendStates.find({&weight, device});
