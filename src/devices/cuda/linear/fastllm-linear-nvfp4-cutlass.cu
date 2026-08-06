@@ -188,52 +188,96 @@ static void ReleaseCache(WeightCache &cache) {
     cache = WeightCache();
 }
 
-static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int k,
+/**
+ * 获取或创建指定权重在当前GPU上的CUTLASS格式cache。
+ *
+ * 参数采用标准GEMM语义：output[M,N] = input[M,K] * weight[N,K]^T。
+ * cache中保存重排后的NVFP4权重、swizzle后的E4M3 group scale和FP32
+ * global scale。权重表示只由N/K决定，M不会参与cache匹配或权重重排；
+ * 保留M参数是为了与上层CUTLASS执行接口保持一致。
+ *
+ * 创建cache时，如果原始CUDA权重已释放，会先从host/mmap源临时恢复。
+ * releaseSourceAfterRepack为true时，重排成功后立即释放这份原始CUDA
+ * 权重；为false时，由外层warmup生命周期在验证成功后决定是否释放。
+ *
+ * @param weight                   NVFP4_BLOCK_16原始权重及两级scale元数据。
+ * @param m                        GEMM的M维；不影响权重cache，仅保持接口一致。
+ * @param n                        GEMM的N维，即输出特征数和权重行数。
+ * @param k                        GEMM的K维，即输入特征数和权重列数。
+ * @param releaseSourceAfterRepack 是否在重排成功后立即释放原始CUDA权重。
+ * @return 成功时返回当前GPU对应的WeightCache；失败时返回nullptr。
+ */
+static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int n, int k,
                                    bool releaseSourceAfterRepack) {
+    // M不改变B矩阵的内容或布局，因此不进入cache键和重排尺寸计算。
+    (void)m;
+
+    // 每张GPU保存独立cache，避免跨设备复用无效的CUDA指针。
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
     std::lock_guard<std::mutex> guard(cacheMutex);
     auto key = std::make_pair((const fastllm::Data *)&weight, device);
     WeightCache &cache = weightCaches[key];
-    const int paddedM = RoundUp(m, 32);
     const int paddedK = RoundUp(k, 32);
-    if (cache.sourceRows == k && cache.sourceColumns == m &&
-        cache.paddedRows == paddedK &&
-        cache.paddedColumns == paddedM &&
+    const int paddedN = RoundUp(n, 32);
+
+    // N/K及已分配内容完全匹配时直接复用，不重复上传和重排权重。
+    if (cache.sourceRows == n && cache.sourceColumns == k &&
+        cache.paddedRows == paddedN &&
+        cache.paddedColumns == paddedK &&
         cache.weight != nullptr && cache.scales != nullptr && cache.alpha != nullptr) return &cache;
+
+    // CUDA Graph捕获期间不能安全地分配、释放或重建持久权重cache。
     if (FastllmCudaGraphIsCapturing()) return nullptr;
     ReleaseCache(cache);
+
+    // 原始CUDA表示可能已被上一次成功warmup释放；需要重建cache时，
+    // 从保留的host/mmap源恢复一份临时原始权重。
     if (weight.cudaData == nullptr &&
         !weight.RestoreCudaDataForRepackedWeight()) return nullptr;
-    cache.weight = static_cast<uint8_t *>(FastllmCudaMalloc((size_t)paddedK * paddedM / 2));
+
+    // 分配CUTLASS持久权重、scale和global scale。sourceScales只是把host
+    // 中的原始E4M3 group scale送入重排kernel的临时设备缓冲区。
+    cache.weight = static_cast<uint8_t *>(FastllmCudaMalloc((size_t)paddedN * paddedK / 2));
     cache.scales = static_cast<uint8_t *>(FastllmCudaMalloc(
-        FastllmCudaNvfp4SwizzledScaleBytes(paddedK, paddedM)));
+        FastllmCudaNvfp4SwizzledScaleBytes(paddedN, paddedK)));
     cache.alpha = static_cast<float *>(FastllmCudaMalloc(sizeof(float)));
-    const size_t sourceScaleBytes = (size_t)k * (m / 16);
+    const size_t sourceScaleBytes = (size_t)n * (k / 16);
     uint8_t *sourceScales = static_cast<uint8_t *>(FastllmCudaMalloc(sourceScaleBytes));
     if (cache.weight == nullptr || cache.scales == nullptr || cache.alpha == nullptr) {
         if (sourceScales != nullptr) FastllmCudaFree(sourceScales);
         ReleaseCache(cache); return nullptr;
     }
+
+    // 保留原始两级缩放：group scale只做布局重排，不重新量化；FP32
+    // global scale单独复制到alpha，由CUTLASS GEMM直接消费。
     const bool queued = sourceScales != nullptr &&
         cudaMemcpyAsync(sourceScales, weight.nvfp4GroupScales.data(), sourceScaleBytes,
                         cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess &&
         FastllmCudaNvfp4Block16ToCutlassPadded(
             static_cast<const uint8_t *>(weight.cudaData), sourceScales, cache.weight,
-            cache.scales, k, m, paddedK, paddedM, (void *)cudaStreamPerThread) &&
+            cache.scales, n, k, paddedN, paddedK, (void *)cudaStreamPerThread) &&
         cudaMemcpyAsync(cache.alpha, &weight.nvfp4GlobalScale,
                         sizeof(weight.nvfp4GlobalScale), cudaMemcpyHostToDevice,
                         cudaStreamPerThread) == cudaSuccess;
+
+    // sourceScales和可能恢复的原始权重都有生命周期要求，因此等待上传与
+    // 重排完成后再释放临时缓冲区，并把异步错误转换为cache创建失败。
     const cudaError_t syncStatus = cudaStreamSynchronize(cudaStreamPerThread);
     if (sourceScales != nullptr) FastllmCudaFree(sourceScales);
     if (!queued || syncStatus != cudaSuccess) {
         ReleaseCache(cache);
         return nullptr;
     }
-    cache.sourceRows = k;
-    cache.sourceColumns = m;
-    cache.paddedRows = paddedK;
-    cache.paddedColumns = paddedM;
+
+    // 记录cache对应的原始N/K和补齐尺寸，供后续调用精确判断能否复用。
+    cache.sourceRows = n;
+    cache.sourceColumns = k;
+    cache.paddedRows = paddedN;
+    cache.paddedColumns = paddedK;
+
+    // 预重排路径可在此直接释放原始CUDA权重；普通Linear路径会等warmup
+    // GEMM验证成功后再由外层释放，保留一次性降级机会。
     const bool released = !releaseSourceAfterRepack ||
                           weight.ReleaseCudaDataForRepackedWeight();
     if (!released) {
@@ -358,7 +402,8 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
             (size_t)outFeatures * (inFeatures / 16) ||
         !std::isfinite(weight.nvfp4GlobalScale) ||
         weight.nvfp4GlobalScale <= 0.0f) return false;
-    WeightCache *cache = GetWeightCache(weight, inFeatures, outFeatures, true);
+    // 这里只预重排权重，没有真实激活M维；M不影响权重cache，传1即可。
+    WeightCache *cache = GetWeightCache(weight, 1, outFeatures, inFeatures, true);
     if (cache == nullptr || cache->paddedColumns != inFeatures ||
         cache->paddedRows != outFeatures) return false;
     *packedWeight = cache->weight;
@@ -416,7 +461,7 @@ static bool RunCutlassNvfp4W4A4(
 
     // 获取或创建当前GPU专属的CUTLASS格式权重。此处暂不释放原始权重；
     // 是否释放由外层后端生命周期函数在warmup成功后决定。
-    WeightCache *cache = GetWeightCache(weight, k, n, false);
+    WeightCache *cache = GetWeightCache(weight, m, n, k, false);
     if (cache == nullptr) {
         Trace("fallback", "weight cache unavailable", m, k, n, arch);
         return false;
