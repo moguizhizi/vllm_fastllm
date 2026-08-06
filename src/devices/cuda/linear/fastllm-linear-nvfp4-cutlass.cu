@@ -24,6 +24,14 @@ struct WeightCache {
     int paddedColumns = 0;
 };
 
+/**
+ * NVFP4 W4A4动态激活量化使用的GPU临时缓冲区。
+ *
+ * activation保存按两个E2M1元素打包为一个字节的[M, paddedK]激活；
+ * scales保存与激活对应、已按CUTLASS要求完成swizzle的E4M3 block scale。
+ * 两个Bytes字段记录当前分配容量，用于同一GPU上的后续计算复用和扩容，
+ * 不表示某一次计算实际使用的元素数量。缓冲区按GPU持久复用，只扩不缩。
+ */
 struct ActivationScratch {
     uint8_t *activation = nullptr;
     uint8_t *scales = nullptr;
