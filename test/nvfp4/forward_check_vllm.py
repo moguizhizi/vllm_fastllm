@@ -141,14 +141,18 @@ def generate_fastllm_token_ids(model, tokenizer, prompt, max_tokens):
 
 
 def run_fastllm(args):
+    from transformers import AutoTokenizer
+
+    # 在加载FastLLM动态库前取得同一份HF tokenizer，避免FastLLM内部
+    # tokenizer探测失败后丢失具体异常，导致forward check无法继续。
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     from ftllm import llm
 
     llm.set_device_map(args.flm_device)
     model = llm.model(args.model, dtype=args.flm_dtype)
     model.set_atype(args.flm_atype)
-    tokenizer = model.hf_tokenizer
-    if tokenizer is None:
-        raise RuntimeError("FastLLM did not load the Hugging Face tokenizer")
+    if model.hf_tokenizer is not None:
+        tokenizer = model.hf_tokenizer
     prompt = render_prompt(tokenizer, get_messages(args.case_index))
     model.direct_query = True
     logits = model.response_logits(prompt, tokenizer=tokenizer)
