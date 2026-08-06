@@ -375,14 +375,16 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
  * 激活动态量化为NVFP4、调用对应架构的CUTLASS GEMM，最后处理padding
  * 和bias。首次后端选择时可强制同步，以便在释放原始权重前发现异步错误。
  *
- * @param input                FP16或BF16输入；普通路径形状为[n, m]，融合
- *                             路径形状为[n, 2 * m]。
- * @param weight               NVFP4_BLOCK_16权重，逻辑形状为[k, m]。
- * @param bias                 可选FP32偏置，长度为k。
- * @param output               输出张量，逻辑形状为[n, k]。
- * @param n                    激活行数，通常为本次参与计算的token数。
- * @param m                    输入特征数。
- * @param k                    输出特征数。
+ * 参数采用标准GEMM语义：output[M,N] = input[M,K] * weight[N,K]^T。
+ *
+ * @param input                FP16或BF16输入；普通路径形状为[m, k]，融合
+ *                             路径形状为[m, 2 * k]。
+ * @param weight               NVFP4_BLOCK_16权重，逻辑形状为[n, k]。
+ * @param bias                 可选FP32偏置，长度为n。
+ * @param output               输出张量，逻辑形状为[m, n]。
+ * @param m                    GEMM的M维，激活行数，通常为token数。
+ * @param n                    GEMM的N维，输出特征数。
+ * @param k                    GEMM的K维，输入特征数。
  * @param siluMulInput         true表示把SwiGLU计算与激活量化融合。
  * @param checkSelectionPolicy true表示同时检查开关和最小行数等选择策略；
  *                             后端固定后的正式计算传false。
@@ -393,45 +395,45 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
 static bool RunCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
-        int n, int m, int k, bool siluMulInput,
+        int m, int n, int k, bool siluMulInput,
         bool checkSelectionPolicy, bool validateWarmup) {
     // 先检查运行架构、数据类型、权重格式、scale元数据和维度语义。
     const int arch = RuntimeArch();
     const char *reason = "unsupported";
     const bool supportedArch = arch >= 100 && arch < 130;
     if (!supportedArch ||
-        !SemanticsSupported(input, weight, bias, output, n, m, k,
+        !SemanticsSupported(input, weight, bias, output, m, k, n,
                             checkSelectionPolicy, &reason)) {
         Trace("fallback", !supportedArch ? "runtime SM is not 100-129" : reason,
-              n, m, k, arch);
+              m, k, n, arch);
         return false;
     }
     if (input.dims.empty() ||
-        input.dims.back() != (siluMulInput ? m * 2 : m)) {
-        Trace("fallback", "activation shape mismatch", n, m, k, arch);
+        input.dims.back() != (siluMulInput ? k * 2 : k)) {
+        Trace("fallback", "activation shape mismatch", m, k, n, arch);
         return false;
     }
 
     // 获取或创建当前GPU专属的CUTLASS格式权重。此处暂不释放原始权重；
     // 是否释放由外层后端生命周期函数在warmup成功后决定。
-    WeightCache *cache = GetWeightCache(weight, m, k, false);
+    WeightCache *cache = GetWeightCache(weight, k, n, false);
     if (cache == nullptr) {
-        Trace("fallback", "weight cache unavailable", n, m, k, arch);
+        Trace("fallback", "weight cache unavailable", m, k, n, arch);
         return false;
     }
     if (!TraceSynchronize("weight repack")) {
-        Trace("fallback", "weight repack", n, m, k, arch);
+        Trace("fallback", "weight repack", m, k, n, arch);
         return false;
     }
 
     // 激活量化需要补齐后的A和scale缓冲区；输出特征被补齐时，GEMM先
-    // 写入临时输出，随后再切回真实的k列。
-    ActivationScratch *activation = GetActivationScratch(n, cache->paddedColumns);
-    const bool paddedOutput = cache->paddedRows != k;
+    // 写入临时输出，随后再切回真实的n列。
+    ActivationScratch *activation = GetActivationScratch(m, cache->paddedColumns);
+    const bool paddedOutput = cache->paddedRows != n;
     OutputScratch *padded = paddedOutput
-        ? GetOutputScratch((size_t)n * cache->paddedRows * sizeof(uint16_t)) : nullptr;
+        ? GetOutputScratch((size_t)m * cache->paddedRows * sizeof(uint16_t)) : nullptr;
     if (activation == nullptr || (paddedOutput && padded == nullptr)) {
-        Trace("fallback", "activation/output scratch unavailable", n, m, k, arch);
+        Trace("fallback", "activation/output scratch unavailable", m, k, n, arch);
         return false;
     }
 
@@ -451,10 +453,10 @@ static bool RunCutlassNvfp4W4A4(
         ok = siluMulInput
             ? FastllmCudaSiluMulNvfp4QuantizePadded(
                   inputData, input.dataType, activation->activation, activation->scales,
-                  n, m, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread)
+                  m, k, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread)
             : FastllmCudaNvfp4QuantizeActivationPadded(
                   inputData, input.dataType, activation->activation, activation->scales,
-                  n, m, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread);
+                  m, k, cache->paddedColumns, 1.0f, (void *)cudaStreamPerThread);
         if (ok) ok = TraceSynchronize(failureStage);
     }
     if (ok) {
@@ -465,19 +467,19 @@ static bool RunCutlassNvfp4W4A4(
             ? FastllmCudaNvfp4CutlassGemmSm100(
                   activation->activation, cache->weight, activation->scales, cache->scales,
                   cache->alpha, gemmOutput, output.dataType,
-                  n, cache->paddedRows, cache->paddedColumns,
+                  m, cache->paddedRows, cache->paddedColumns,
                   (void *)cudaStreamPerThread)
             : FastllmCudaNvfp4CutlassGemmSm120(
                   activation->activation, cache->weight, activation->scales, cache->scales,
                   cache->alpha, gemmOutput, output.dataType,
-                  n, cache->paddedRows, cache->paddedColumns,
+                  m, cache->paddedRows, cache->paddedColumns,
                   (void *)cudaStreamPerThread);
     }
     if (ok && (paddedOutput || biasData != nullptr)) {
         // 去掉输出N维padding，并在需要时同时加上FP32 bias。
         failureStage = "output finalize";
         ok = FinalizeOutput(gemmOutput, outputData, static_cast<const float *>(biasData),
-                            output.dataType, n, k, cache->paddedRows);
+                            output.dataType, m, n, cache->paddedRows);
     }
     if (ok && validateWarmup) {
         // CUDA调用通常异步返回。首次warmup必须同步，避免内核实际失败后
@@ -491,7 +493,7 @@ static bool RunCutlassNvfp4W4A4(
     if (inputData != nullptr) FastllmCudaFinishInput(input, inputData);
     if (outputData != nullptr) FastllmCudaFinishOutput(output, outputData);
     Trace(ok ? (siluMulInput ? "w4a4-swiglu-cutlass" : "w4a4-cutlass") : "fallback",
-          ok ? "success" : failureStage, n, m, k, arch);
+          ok ? "success" : failureStage, m, k, n, arch);
     return ok;
 }
 
@@ -540,8 +542,7 @@ bool TryCudaCutlassNvfp4W4A4(
     // 只有未初始化状态才执行带同步检查的warmup。后端固定后跳过
     // 选择策略检查，防止因不同batch行数在CUTLASS和Legacy之间切换。
     const bool warmup = state == BackendState::Uninitialized;
-    // RunCutlassNvfp4W4A4仍沿用FastLLM旧维度顺序：行数、输入特征、输出特征。
-    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, m, k, n, false,
+    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, m, n, k, false,
                                   warmup, warmup);
     if (ok && warmup) {
         // warmup成功后，CUTLASS重排权重成为该GPU上的持久表示。
@@ -583,7 +584,8 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
 
     const bool backendWarmup = backend == BackendState::Uninitialized;
     const bool fusionWarmup = fusion == FusionState::Uninitialized;
-    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, true,
+    // 融合入口仍使用FastLLM旧维度命名，在这里映射为标准GEMM M/N/K。
+    bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, k, m, true,
                                   backendWarmup, backendWarmup || fusionWarmup);
     if (ok) {
         if (backendWarmup) {
