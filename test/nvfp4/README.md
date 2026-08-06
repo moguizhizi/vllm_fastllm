@@ -20,7 +20,6 @@
 12.9+ 使用 PACK16/256-bit load；两条路径均由编译器版本自动选择，无需手动宏。
 
 - `FASTLLM_CUDA_NVFP4_W4A4=0`：关闭 dense W4A4。
-- `FASTLLM_CUDA_NVFP4_W4A4_MIN_ROWS=N`：调试时覆盖 dense W4A4 的 M 门槛，默认 1。
 - `FASTLLM_CUDA_NVFP4_SWIGLU_QUANT=0`：关闭 Dense SwiGLU+FP4 量化融合。
 - `FASTLLM_CUDA_NVFP4_TRACE=1`：在 log 中打印命中或回退原因。
 - `FASTLLM_CUDA_MOE_NVFP4_W4A4=0`：关闭 grouped MoE W4A4。
@@ -32,6 +31,10 @@
 成功后，后端状态才固定，随后真正释放原始 `cudaData`；warmup 失败则销毁候选重排
 cache、保留原始权重，并固定使用 legacy。正式推理开始后不再通过修改环境变量切换
 已固定后端，运行阶段 kernel 失败直接报错。
+
+dense W4A4 的首次后端选择不设置 M 门槛。M 只用于选择 CUTLASS 内部 tile/config，
+不会导致 CUTLASS 与 legacy 在不同 batch 之间切换。warmup 仍负责验证重排、量化、
+GEMM 和异步 CUDA 状态，只有验证成功后才能释放原始 CUDA 权重。
 
 SwiGLU 融合能力单独记录：融合 warmup 失败只关闭融合，随后执行普通 SwiGLU，再由
 Linear 独立选择 CUTLASS/Marlin/legacy。它不会把 Linear 一起降级。

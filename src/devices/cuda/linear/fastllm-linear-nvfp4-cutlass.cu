@@ -79,11 +79,6 @@ static bool TraceEnabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
-static int MinRows() {
-    const char *value = std::getenv("FASTLLM_CUDA_NVFP4_W4A4_MIN_ROWS");
-    return value == nullptr ? 1 : std::max(1, std::atoi(value));
-}
-
 static int RuntimeArch() {
     int device = 0, major = 0, minor = 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
@@ -114,12 +109,10 @@ static bool SemanticsSupported(const fastllm::Data &input,
                                const fastllm::Data &weight,
                                const fastllm::Data &bias,
                                const fastllm::Data &output,
-                               int n, int m, int k, bool checkSelectionPolicy,
+                               int n, int m, int k, bool checkBackendPolicy,
                                const char **reason) {
-    if (checkSelectionPolicy && !Enabled()) { *reason = "disabled"; return false; }
-    if (checkSelectionPolicy && n < MinRows()) {
-        *reason = "below W4A4 row threshold"; return false;
-    }
+    // 首次后端选择只检查显式开关，不使用运行时M作为CUTLASS准入条件。
+    if (checkBackendPolicy && !Enabled()) { *reason = "disabled"; return false; }
     if (input.dataType != fastllm::DataType::FLOAT16 &&
         input.dataType != fastllm::DataType::BFLOAT16) {
         *reason = "activation is not FP16/BF16"; return false;
@@ -466,8 +459,8 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
  * @param n                    GEMM的N维，输出特征数。
  * @param k                    GEMM的K维，输入特征数。
  * @param siluMulInput         true表示把SwiGLU计算与激活量化融合。
- * @param checkSelectionPolicy true表示同时检查开关和最小行数等选择策略；
- *                             后端固定后的正式计算传false。
+ * @param checkBackendPolicy   true表示首次选择时检查CUTLASS后端开关；后端
+ *                             选择不受M影响，固定后的正式计算传false。
  * @param validateWarmup       true表示末尾强制同步，验证首次warmup的异步错误。
  * @return true表示本次CUTLASS计算及必要的后处理成功；false表示某个阶段
  *         不满足条件或执行失败，具体阶段通过Trace记录。
@@ -476,14 +469,14 @@ static bool RunCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int m, int n, int k, bool siluMulInput,
-        bool checkSelectionPolicy, bool validateWarmup) {
+        bool checkBackendPolicy, bool validateWarmup) {
     // 先检查运行架构、数据类型、权重格式、scale元数据和维度语义。
     const int arch = RuntimeArch();
     const char *reason = "unsupported";
     const bool supportedArch = arch >= 100 && arch < 130;
     if (!supportedArch ||
         !SemanticsSupported(input, weight, bias, output, m, k, n,
-                            checkSelectionPolicy, &reason)) {
+                            checkBackendPolicy, &reason)) {
         Trace("fallback", !supportedArch ? "runtime SM is not 100-129" : reason,
               m, k, n, arch);
         return false;
@@ -620,8 +613,8 @@ bool TryCudaCutlassNvfp4W4A4(
         return false;
     }
 
-    // 只有未初始化状态才执行带同步检查的warmup。后端固定后跳过
-    // 选择策略检查，防止因不同batch行数在CUTLASS和Legacy之间切换。
+    // 只有未初始化状态才执行带同步检查的warmup。首次选择不设置M门槛；
+    // 后端固定后，不同M只选择CUTLASS内部配置，不再切换到Legacy。
     const bool warmup = state == BackendState::Uninitialized;
     bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, m, n, k, false,
                                   warmup, warmup);
