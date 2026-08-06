@@ -71,6 +71,7 @@ run_ops_functional() {
         run_logged op_dense_w4a4_decode_padding_bias env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             FASTLLM_CUDA_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=1 --param in=1008 --param out=1000 \
             --param bias=1 --param input_type=bf16 \
@@ -89,6 +90,7 @@ run_ops_functional() {
             run_logged op_dense_w4a4_device_move env \
                 FASTLLM_CUDA_NVFP4_TRACE=1 \
                 FASTLLM_CUDA_NVFP4_W4A4=1 \
+                FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
                 "${optest}" --op linear_nvfp4 --device cuda:0 \
                 --param batch=1 --param in=1024 --param out=1024 \
                 --param bias=0 --param input_type=bf16 \
@@ -146,6 +148,7 @@ run_ops_performance() {
         for dense_m in 1 16 64 128 256 512 1024; do
             run_logged "op_dense_w4a4_perf_m${dense_m}" env \
                 FASTLLM_CUDA_NVFP4_W4A4=1 \
+                FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
                 "${optest}" --op linear_nvfp4 --device cuda:0 \
                 --param batch="${dense_m}" --param in=4096 --param out=4096 \
                 --param bias=0 --param input_type=bf16 --param check_release=1 \

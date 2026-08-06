@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <type_traits>
 
@@ -77,6 +78,18 @@ static int RoundUp(int value, int alignment) {
 static bool Enabled() {
     const char *value = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
     return value == nullptr || value[0] == '\0' || value[0] != '0';
+}
+
+// 严格模式供算子验证和性能测试使用：Dense W4A4只允许CUTLASS，
+// 权重预重排、首次GEMM验证或固定后端任一阶段失败都直接报错。
+static bool StrictEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_NVFP4_W4A4_STRICT");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+[[noreturn]] static void ThrowStrict(const char *reason) {
+    throw std::runtime_error(
+        std::string("strict NVFP4 dense requires the CUTLASS backend: ") + reason);
 }
 
 static bool TraceEnabled() {
@@ -499,13 +512,19 @@ bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight) {
         return false;
     }
     const int device = CurrentDevice();
-    if (device < 0) return false;
+    if (device < 0) {
+        if (StrictEnabled()) ThrowStrict("no current CUDA device");
+        return false;
+    }
 
     const BackendState state = GetBackendState(weight, device);
     if (state == BackendState::Prepared || state == BackendState::Cutlass) {
         return true;
     }
-    if (state == BackendState::Rejected) return false;
+    if (state == BackendState::Rejected) {
+        if (StrictEnabled()) ThrowStrict("backend was already rejected");
+        return false;
+    }
 
     const int arch = RuntimeArch();
     const int n = weight.dims[0];
@@ -520,6 +539,7 @@ bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight) {
     if (!weightSupported) {
         SetBackendState(weight, device, BackendState::Rejected);
         Trace("fallback", "weight-load backend selection rejected", 1, k, n, arch);
+        if (StrictEnabled()) ThrowStrict("weight-load backend selection rejected");
         return false;
     }
 
@@ -529,6 +549,7 @@ bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight) {
         ReleaseWeightCacheForDevice(&weight, device);
         SetBackendState(weight, device, BackendState::Rejected);
         Trace("fallback", "weight-load prepack failed", 1, k, n, arch);
+        if (StrictEnabled()) ThrowStrict("weight-load prepack failed");
         return false;
     }
     SetBackendState(weight, device, BackendState::Prepared);
@@ -697,7 +718,10 @@ bool TryCudaCutlassNvfp4W4A4(
     if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
         weight.blockM != 16) return false;
     const int device = CurrentDevice();
-    if (device < 0) return false;
+    if (device < 0) {
+        if (StrictEnabled()) ThrowStrict("no current CUDA device");
+        return false;
+    }
 
     // 后端状态按“权重对象 + GPU”保存。同一份权重换到另一张GPU后，
     // 需要在目标GPU上重新完成一次后端选择和权重重排。
@@ -707,6 +731,7 @@ bool TryCudaCutlassNvfp4W4A4(
         // 避免每次Linear都重复创建cache并再次尝试失败。
         Trace("fallback", "CUTLASS backend rejected during warmup", m, k, n,
               RuntimeArch());
+        if (StrictEnabled()) ThrowStrict("backend rejected during warmup");
         return false;
     }
 
@@ -724,6 +749,7 @@ bool TryCudaCutlassNvfp4W4A4(
             !weight.ReleaseCudaDataForRepackedWeight()) {
             ReleaseWeightCacheForDevice(&weight, device);
             SetBackendState(weight, device, BackendState::Rejected);
+            if (StrictEnabled()) ThrowStrict("original CUDA weight release failed");
             return false;
         }
         SetBackendState(weight, device, BackendState::Cutlass);
@@ -739,6 +765,7 @@ bool TryCudaCutlassNvfp4W4A4(
             throw std::runtime_error(
                 "NVFP4 CUTLASS warmup failed and legacy weight restore failed");
         }
+        if (StrictEnabled()) ThrowStrict("first GEMM validation failed");
     } else if (!ok) {
         // 后端固定后再失败不能静默切换，否则同一层会在推理过程中
         // 改变权重表示和计算路径；此时直接报错暴露真实故障。
@@ -753,10 +780,18 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k) {
     const int device = CurrentDevice();
-    if (device < 0) return false;
+    if (device < 0) {
+        if (StrictEnabled()) ThrowStrict("no current CUDA device");
+        return false;
+    }
     const BackendState backend = GetBackendState(weight, device);
     const FusionState fusion = GetFusionState(weight, device);
-    if (backend == BackendState::Rejected || fusion == FusionState::Disabled) return false;
+    if (backend == BackendState::Rejected) {
+        if (StrictEnabled()) ThrowStrict("backend rejected before fused SwiGLU");
+        return false;
+    }
+    // 融合能力与Linear后端分开；融合关闭时仍允许普通SwiGLU后接严格CUTLASS Linear。
+    if (fusion == FusionState::Disabled) return false;
 
     const bool backendWarmup = backend == BackendState::Uninitialized ||
                                backend == BackendState::Prepared;
@@ -774,6 +809,7 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
                 ReleaseWeightCacheForDevice(&weight, device);
                 SetBackendState(weight, device, BackendState::Rejected);
                 SetFusionState(weight, device, FusionState::Disabled);
+                if (StrictEnabled()) ThrowStrict("original CUDA weight release failed");
                 return false;
             }
             SetBackendState(weight, device, BackendState::Cutlass);

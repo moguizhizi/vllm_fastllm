@@ -20,6 +20,8 @@
 12.9+ 使用 PACK16/256-bit load；两条路径均由编译器版本自动选择，无需手动宏。
 
 - `FASTLLM_CUDA_NVFP4_W4A4=0`：关闭 dense W4A4。
+- `FASTLLM_CUDA_NVFP4_W4A4_STRICT=1`：dense W4A4必须命中CUTLASS；预重排或
+  首次GEMM验证失败时直接报错，禁止Legacy/Marlin fallback。
 - `FASTLLM_CUDA_NVFP4_SWIGLU_QUANT=0`：关闭 Dense SwiGLU+FP4 量化融合。
 - `FASTLLM_CUDA_NVFP4_TRACE=1`：在 log 中打印命中或回退原因；该模式会
   插入CUDA流同步，只用于功能诊断，不用于正式性能测试。
