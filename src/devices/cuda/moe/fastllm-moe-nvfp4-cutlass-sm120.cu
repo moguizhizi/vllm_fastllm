@@ -15,7 +15,9 @@
 #include <climits>
 #include <vector>
 
-namespace {
+// NVCC 12.8会为__global__模板生成host stub。这里必须使用具名namespace，
+// 否则stub中的匿名namespace名称可能与CUTE头文件内部的匿名namespace冲突。
+namespace fastllm_nvfp4_moe_sm120 {
 using namespace cute;
 
 struct GroupedConfigSm120 {
@@ -184,7 +186,7 @@ bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
     FastllmCudaFree(strideD); FastllmCudaFree(layoutA); FastllmCudaFree(layoutB);
     return ok;
 }
-} // namespace
+} // namespace fastllm_nvfp4_moe_sm120
 #endif
 
 bool FastllmCudaNvfp4GroupedGemmSm120(
@@ -199,8 +201,8 @@ bool FastllmCudaNvfp4GroupedGemmSm120(
         n % 32 != 0 || k % 32 != 0 ||
         outputType != fastllm::DataType::BFLOAT16) return false;
     cudaStream_t stream = streamPtr ? static_cast<cudaStream_t>(streamPtr) : 0;
-    return RunGroupedSm120(a, b, scaleA, scaleB, alpha, d, rows,
-                           groups, n, k, stream);
+    return fastllm_nvfp4_moe_sm120::RunGroupedSm120(
+        a, b, scaleA, scaleB, alpha, d, rows, groups, n, k, stream);
 #else
     (void)a; (void)b; (void)scaleA; (void)scaleB; (void)alpha; (void)d;
     (void)rows; (void)groups; (void)n; (void)k; (void)outputType; (void)streamPtr;
