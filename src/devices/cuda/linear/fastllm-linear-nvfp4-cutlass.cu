@@ -45,6 +45,10 @@ struct OutputScratch {
 };
 
 std::mutex cacheMutex;
+// CUTLASS重排权重缓存。键为“逻辑权重Data对象地址 + CUDA设备号”，值中
+// 保存该权重在对应GPU上的打包E2M1权重、swizzle E4M3 group scale和
+// FP32 global scale。相同Data在不同GPU上必须分别重排，不能共享设备指针。
+// 所有读取、创建和销毁操作均由cacheMutex保护。
 std::map<std::pair<const fastllm::Data *, int>, WeightCache> weightCaches;
 std::map<int, ActivationScratch> activationScratch;
 std::map<int, OutputScratch> outputScratch;
@@ -293,6 +297,17 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int n, int k,
     return &cache;
 }
 
+/**
+ * 释放指定权重在指定GPU上的CUTLASS重排缓存。
+ *
+ * 函数只处理weightCaches中精确匹配“weight + device”的条目。释放前切换
+ * 到缓存所属GPU，避免在错误设备上释放CUDA指针；完成后恢复调用前设备。
+ * 本函数不会恢复原始CUDA权重，也不会修改BackendState或FusionState，
+ * 后端状态如何变化由调用方根据warmup、换卡或Data生命周期决定。
+ *
+ * @param weight 用于定位缓存的逻辑权重对象；不取得其所有权。
+ * @param device 缓存所属的CUDA设备号。
+ */
 static void ReleaseWeightCacheForDevice(const fastllm::Data *weight, int device) {
     std::lock_guard<std::mutex> guard(cacheMutex);
     auto it = weightCaches.find({weight, device});
