@@ -305,16 +305,41 @@ static void ReleaseWeightCacheForDevice(const fastllm::Data *weight, int device)
     }
 }
 
-static ActivationScratch *GetActivationScratch(int n, int m) {
+/**
+ * 获取或扩容当前GPU上的NVFP4激活临时缓冲区。
+ *
+ * 参数采用标准GEMM语义：output[M,N] = input[M,K] * weight[N,K]^T。
+ * scratch包含打包后的E2M1激活和对应的swizzle E4M3 block scale。
+ * 激活表示只由M/K决定，N不影响缓冲区大小；保留N参数是为了与上层
+ * CUTLASS执行接口保持一致。缓冲区按GPU复用，只扩容、不主动缩小。
+ *
+ * @param m GEMM的M维，即需要量化的激活行数。
+ * @param n GEMM的N维；不影响激活scratch，仅保持接口一致。
+ * @param k GEMM的K维；这里通常是补齐后的输入特征数。
+ * @return 成功时返回当前GPU对应的ActivationScratch；失败时返回nullptr。
+ */
+static ActivationScratch *GetActivationScratch(int m, int n, int k) {
+    // N不改变A矩阵及其scale的存储尺寸，因此不参与容量计算。
+    (void)n;
+
+    // 激活scratch包含CUDA指针，必须按当前GPU分别保存和复用。
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
-    const size_t activationBytes = (size_t)n * m / 2;
-    const size_t scaleBytes = FastllmCudaNvfp4SwizzledScaleBytes(n, m);
+
+    // 每个E2M1元素占4bit；scale空间按CUTLASS要求的M×K swizzle布局计算。
+    const size_t activationBytes = (size_t)m * k / 2;
+    const size_t scaleBytes = FastllmCudaNvfp4SwizzledScaleBytes(m, k);
     std::lock_guard<std::mutex> guard(cacheMutex);
     ActivationScratch &scratch = activationScratch[device];
+
+    // 已有缓冲区容量足够时直接复用，避免每层、每token重复分配显存。
     if (scratch.activationBytes >= activationBytes && scratch.scaleBytes >= scaleBytes &&
         scratch.activation != nullptr && scratch.scales != nullptr) return &scratch;
+
+    // CUDA Graph捕获期间不能进行动态显存分配或替换已有指针。
     if (FastllmCudaGraphIsCapturing()) return nullptr;
+
+    // 先完整申请新缓冲区；任一申请失败时保留旧scratch仍然有效。
     uint8_t *newActivation = static_cast<uint8_t *>(FastllmCudaMalloc(activationBytes));
     uint8_t *newScales = static_cast<uint8_t *>(FastllmCudaMalloc(scaleBytes));
     if (newActivation == nullptr || newScales == nullptr) {
@@ -322,6 +347,8 @@ static ActivationScratch *GetActivationScratch(int n, int m) {
         if (newScales != nullptr) FastllmCudaFree(newScales);
         return nullptr;
     }
+
+    // 新空间全部申请成功后再释放旧空间，并更新指针和容量记录。
     if (scratch.activation != nullptr) FastllmCudaFree(scratch.activation);
     if (scratch.scales != nullptr) FastllmCudaFree(scratch.scales);
     scratch.activation = newActivation;
@@ -473,7 +500,8 @@ static bool RunCutlassNvfp4W4A4(
 
     // 激活量化需要补齐后的A和scale缓冲区；输出特征被补齐时，GEMM先
     // 写入临时输出，随后再切回真实的n列。
-    ActivationScratch *activation = GetActivationScratch(m, cache->paddedColumns);
+    ActivationScratch *activation = GetActivationScratch(
+        m, n, cache->paddedColumns);
     const bool paddedOutput = cache->paddedRows != n;
     OutputScratch *padded = paddedOutput
         ? GetOutputScratch((size_t)m * cache->paddedRows * sizeof(uint16_t)) : nullptr;
