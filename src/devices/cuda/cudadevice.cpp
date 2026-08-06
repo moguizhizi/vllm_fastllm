@@ -3416,7 +3416,8 @@ namespace fastllm {
                 "Linear error: symmetric INT8 W8A8 requires an SM90 CUTLASS build, "
                 "signed I8 [N,K] weights, FP32 per-channel scales, K%16=0 and N%8=0.\n");
         }
-        if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, m, k)) {
+        // CUTLASS入口使用标准GEMM维度：M=token数，N=输出特征，K=输入特征。
+        if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m)) {
             return;
         }
         if (FastllmCudaTryMarlinHalfMatMulNVFP4(

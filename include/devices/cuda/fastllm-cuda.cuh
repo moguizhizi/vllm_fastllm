@@ -614,7 +614,7 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
 bool TryCudaCutlassNvfp4W4A4(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output,
-    int n, int m, int k);
+    int m, int n, int k);
 bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output,
