@@ -95,25 +95,35 @@ run_ops_functional() {
                 --param check_release=1 --param check_device_move=1 \
                 --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         fi
-        run_logged op_swiglu_fp4_quant "${optest}" \
-            --op nvfp4_swiglu_quant --device cuda:0 \
-            --param rows=32 --param hidden=1024 --param input_type=bf16 \
-            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        local quant_k
+        for quant_k in 4096 7168 14336; do
+            run_logged "op_swiglu_fp4_quant_bf16_k${quant_k}" "${optest}" \
+                --op nvfp4_swiglu_quant --device cuda:0 \
+                --param rows=32 --param hidden="${quant_k}" --param input_type=bf16 \
+                --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        done
         run_logged op_swiglu_fp4_quant_fp16 "${optest}" \
             --op nvfp4_swiglu_quant --device cuda:0 \
             --param rows=32 --param hidden=1024 --param input_type=fp16 \
             --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
-        if [[ "${gpu_profile}" == sm100 ]]; then
-            run_logged op_grouped_moe_w4a4_check env \
-                FASTLLM_CUDA_NVFP4_TRACE=1 \
-                FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
-                FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=16 \
-                "${optest}" --op mergemoe_fp8 --device cuda:0 \
-                --param weight_type=nvfp4 --param path=check_nvfp4 \
-                --param batch=32 --param topk=2 --param experts=8 \
-                --param hidden=256 --param inter=256 --param input_type=bf16 \
-                --warmup 0 --iters 1
-        fi
+        local moe_m moe_topk moe_experts
+        for moe_m in 2 64 224; do
+            for moe_topk in 1 8; do
+                for moe_experts in 40 64; do
+                    run_logged "op_grouped_moe_w4a4_check_m${moe_m}_k${moe_topk}_e${moe_experts}" env \
+                        FASTLLM_CUDA_NVFP4_TRACE=1 \
+                        FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
+                        FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT=1 \
+                        FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=1 \
+                        "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                        --param weight_type=nvfp4 --param path=check_nvfp4 \
+                        --param batch="${moe_m}" --param topk="${moe_topk}" \
+                        --param experts="${moe_experts}" \
+                        --param hidden=256 --param inter=256 --param input_type=bf16 \
+                        --warmup 0 --iters 1
+                done
+            done
+        done
     else
         run_logged op_dense_marlin_w4a16_check env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
@@ -132,32 +142,38 @@ run_ops_functional() {
 
 run_ops_performance() {
     if [[ "${gpu_profile}" == sm100 || "${gpu_profile}" == sm120 ]]; then
-        run_logged op_dense_w4a4_decode_perf env \
-            FASTLLM_CUDA_NVFP4_W4A4=1 \
-            "${optest}" --op linear_nvfp4 --device cuda:0 \
-            --param batch=1 --param in=1024 --param out=1024 \
-            --param bias=0 --param input_type=bf16 --warmup 20 --iters 200 \
-            --atol 0.20 --rtol 0.20
-        run_logged op_dense_w4a4_prefill_perf env \
-            FASTLLM_CUDA_NVFP4_W4A4=1 \
-            "${optest}" --op linear_nvfp4 --device cuda:0 \
-            --param batch=32 --param in=1024 --param out=1024 \
-            --param bias=0 --param input_type=bf16 --warmup 20 --iters 200 \
-            --atol 0.20 --rtol 0.20
-        run_logged op_swiglu_fp4_quant_perf "${optest}" \
-            --op nvfp4_swiglu_quant --device cuda:0 \
-            --param rows=32 --param hidden=1024 --param input_type=bf16 \
-            --warmup 20 --iters 200 --atol 0.20 --rtol 0.20
-        if [[ "${gpu_profile}" == sm100 ]]; then
-            run_logged op_grouped_moe_w4a4_perf env \
-                FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
-                FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=16 \
-                "${optest}" --op mergemoe_fp8 --device cuda:0 \
-                --param weight_type=nvfp4 --param path=operator \
-                --param batch=32 --param topk=2 --param experts=8 \
-                --param hidden=256 --param inter=256 --param input_type=bf16 \
-                --warmup 20 --iters 200
-        fi
+        local dense_m quant_k moe_m moe_topk moe_experts
+        for dense_m in 1 16 64 128 256 512 1024; do
+            run_logged "op_dense_w4a4_perf_m${dense_m}" env \
+                FASTLLM_CUDA_NVFP4_W4A4=1 \
+                "${optest}" --op linear_nvfp4 --device cuda:0 \
+                --param batch="${dense_m}" --param in=4096 --param out=4096 \
+                --param bias=0 --param input_type=bf16 --param check_release=1 \
+                --param performance_only=1 \
+                --warmup 5 --iters 20 --atol 0.20 --rtol 0.20
+        done
+        for quant_k in 4096 7168 14336; do
+            run_logged "op_swiglu_fp4_quant_perf_k${quant_k}" "${optest}" \
+                --op nvfp4_swiglu_quant --device cuda:0 \
+                --param rows=32 --param hidden="${quant_k}" --param input_type=bf16 \
+                --warmup 20 --iters 200 --atol 0.20 --rtol 0.20
+        done
+        for moe_m in 2 64 224; do
+            for moe_topk in 1 8; do
+                for moe_experts in 40 64; do
+                    run_logged "op_grouped_moe_w4a4_perf_m${moe_m}_k${moe_topk}_e${moe_experts}" env \
+                        FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
+                        FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT=1 \
+                        FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=1 \
+                        "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                        --param weight_type=nvfp4 --param path=operator \
+                        --param batch="${moe_m}" --param topk="${moe_topk}" \
+                        --param experts="${moe_experts}" \
+                        --param hidden=256 --param inter=256 --param input_type=bf16 \
+                        --warmup 20 --iters 200
+                done
+            done
+        done
     else
         run_logged op_dense_marlin_w4a16_perf env \
             "${optest}" --op linear_nvfp4 --device cuda:0 \

@@ -1975,12 +1975,12 @@ namespace {
             }
         }
 
-        fastllm::Data Dequantized() {
-            Run();
+        fastllm::Data DequantizedBuffers(const uint8_t *sourcePacked,
+                                         const uint8_t *sourceScales) const {
             ForceDeviceSync();
             std::vector<uint8_t> hostPacked(packedBytes), hostScales(scaleBytes);
-            FastllmCudaCopyFromDeviceToHost(hostPacked.data(), packed, packedBytes);
-            FastllmCudaCopyFromDeviceToHost(hostScales.data(), scales, scaleBytes);
+            FastllmCudaCopyFromDeviceToHost(hostPacked.data(), sourcePacked, packedBytes);
+            FastllmCudaCopyFromDeviceToHost(hostScales.data(), sourceScales, scaleBytes);
             static const float e2m1[16] = {
                 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -2005,21 +2005,36 @@ namespace {
             return fastllm::Data(fastllm::DataType::FLOAT32, {rows, hidden}, values);
         }
 
+        fastllm::Data Dequantized() {
+            Run();
+            return DequantizedBuffers(packed, scales);
+        }
+
         fastllm::Data Reference() const {
-            fastllm::Data source(input);
-            fastllm::ToDataType(source, fastllm::DataType::FLOAT32);
-            source.ToDevice(fastllm::DataDevice::CPU);
-            std::vector<float> x = ToFloatVector(source);
-            std::vector<float> result((size_t)rows * hidden);
-            for (int row = 0; row < rows; ++row) {
-                for (int col = 0; col < hidden; ++col) {
-                    float gate = x[(size_t)row * hidden * 2 + col];
-                    float up = x[(size_t)row * hidden * 2 + hidden + col];
-                    result[(size_t)row * hidden + col] =
-                        gate / (1.0f + std::exp(-gate)) * up;
-                }
+            // 对照路径与 vLLM 测试一致：普通 SwiGLU，再单独做 NVFP4 动态量化。
+            fastllm::Data ordinary;
+            ordinary.dataDevice = fastllm::DataDevice::CUDA;
+            ordinary.dataType = inputType;
+            ordinary.UpdateUnitSize();
+            ordinary.Resize({rows, hidden});
+            ordinary.Allocate(false);
+            if (!FastllmCudaSwiglu(input, ordinary)) {
+                throw std::runtime_error("ordinary SwiGLU launch failed");
             }
-            return fastllm::Data(fastllm::DataType::FLOAT32, {rows, hidden}, result);
+            uint8_t *referencePacked = static_cast<uint8_t *>(FastllmCudaMalloc(packedBytes));
+            uint8_t *referenceScales = static_cast<uint8_t *>(FastllmCudaMalloc(scaleBytes));
+            if (!referencePacked || !referenceScales ||
+                !FastllmCudaNvfp4QuantizeActivation(
+                    ordinary.cudaData, inputType, referencePacked, referenceScales,
+                    rows, hidden, 1.0f, nullptr)) {
+                FastllmCudaFree(referencePacked);
+                FastllmCudaFree(referenceScales);
+                throw std::runtime_error("separate NVFP4 activation quantization failed");
+            }
+            fastllm::Data result = DequantizedBuffers(referencePacked, referenceScales);
+            FastllmCudaFree(referencePacked);
+            FastllmCudaFree(referenceScales);
+            return result;
         }
     };
 #endif
@@ -2296,6 +2311,12 @@ namespace {
                         throw std::runtime_error(
                             "NVFP4 destination warmup retained the original CUDA weight");
                     }
+                    ComparisonStats movedStats = CompareData(
+                        nativeOutput, ConvertToFloat32Data(movedOutput), 0.20f, 0.20f);
+                    if (!movedStats.passed) {
+                        throw std::runtime_error(
+                            "NVFP4 GPU 1 output differs from GPU 0 output");
+                    }
                     FastllmCudaSetDevice(0);
                 }
             }
@@ -2305,6 +2326,7 @@ namespace {
 
     struct LinearNvfp4BenchState {
         int batch = 0, in = 0, out = 0;
+        bool requireCutlass = false;
         fastllm::Data input, weight, bias, output;
 
         void Init(const OpTestParams &params) {
@@ -2312,6 +2334,7 @@ namespace {
             batch = fixture.batch;
             in = fixture.in;
             out = fixture.out;
+            requireCutlass = fixture.checkRelease;
             fastllm::Data hostInput = fixture.MakeInput();
             input.CopyFrom(hostInput);
             fixture.MakeWeight(weight);
@@ -2327,6 +2350,13 @@ namespace {
         void Run() {
             fastllm::Linear(input, weight, bias, output);
         }
+
+        void CheckRequiredBackend() const {
+            if (requireCutlass && weight.cudaData != nullptr) {
+                throw std::runtime_error(
+                    "strict NVFP4 dense benchmark fell back from CUTLASS");
+            }
+        }
     };
 
     static BenchmarkResult BenchmarkLinearNvfp4Cuda(
@@ -2338,6 +2368,7 @@ namespace {
         state->Init(params);
         for (int i = 0; i < warmup; ++i) state->Run();
         ForceDeviceSync();
+        state->CheckRequiredBackend();
         auto begin = Clock::now();
         for (int i = 0; i < iters; ++i) state->Run();
         ForceDeviceSync();
@@ -2383,6 +2414,7 @@ namespace {
                 params.Add("check_warmup_fallback", "0", "force first GEMM validation failure and verify legacy remains fixed");
                 params.Add("check_device_move", "0", "on 2+ GPUs, rebuild the fixed backend on GPU 1");
                 params.Add("check_fusion_separation", "0", "verify fused SwiGLU rejection does not reject Linear CUTLASS");
+                params.Add("performance_only", "0", "skip the O(MNK) CPU reference for large benchmark shapes");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
@@ -2403,6 +2435,11 @@ namespace {
             [](const OpTestParams &params, const std::string &device) {
 #ifdef USE_CUDA
                 ScopedFirstDevice guard(device);
+                if (params.GetInt("performance_only") != 0) {
+                    fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                    marker.Allocate(0.0f);
+                    return marker;
+                }
                 return LinearNvfp4Fixture(params).RunCuda();
 #else
                 (void)params; (void)device;
@@ -2419,6 +2456,11 @@ namespace {
                 return 2.0 * params.GetInt("batch") * params.GetInt("in") * params.GetInt("out");
             }};
         result.runReference = [](const OpTestParams &params, const std::string&) {
+            if (params.GetInt("performance_only") != 0) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            }
             return LinearNvfp4Fixture(params).Reference();
         };
         result.benchmarkOverride = BenchmarkLinearNvfp4Cuda;
@@ -3952,7 +3994,8 @@ namespace {
 #ifdef USE_CUDA
                 if (params.GetString("weight_type") == "nvfp4") {
                     int arch = FastllmCudaRuntimeArch();
-                    return arch == 100;
+                    return arch >= 100 && arch < 130 &&
+                           (arch < 120 || params.GetString("input_type") == "bf16");
                 }
 #endif
                 return true;

@@ -47,12 +47,20 @@ GPU0移动到GPU1时先销毁GPU0 cache，再从host源直接上传到GPU1并立
 
 `ops-functional` 会检查：上传预重排后立即释放原始CUDA权重、正式推理不切换后端、
 首次GEMM验证失败后恢复并固定legacy、融合拒绝不影响Linear；存在两张GPU时还检查
-跨GPU直接重建。
+跨GPU直接重建及GPU0/GPU1输出数值。SwiGLU用“普通SwiGLU+独立NVFP4量化”
+作为融合量化的对照；激活量化覆盖真实K=4096/7168/14336。SM100和SM120的
+grouped MoE覆盖M=2/64/224、topk=1/8、experts=40/64。
+
+`ops-performance` 的dense W4A4覆盖M=1/16/64/128/256/512/1024；grouped MoE
+使用同一组M/topk/experts矩阵。测试开启strict检查：CUTLASS失败时直接报错，
+不允许legacy fallback伪装成CUTLASS成绩。
 
 ## 模型和显卡
 
 - dense W4A4 首选：`nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4`；B200/B300（SM100）或 RTX PRO 6000 Blackwell（SM120，96GB）。
-- grouped MoE W4A4：`nvidia/Qwen3-30B-A3B-NVFP4`；当前路径用 B200/B300（SM100）。它不是“小总参数模型”，但 active 参数约 3B，是目前更现实的 MoE 检查点。
+- grouped MoE W4A4：`RedHatAI/Qwen3-30B-A3B-NVFP4`；模型卡明确给出vLLM
+  离线用法，Qwen3-MoE也由FastLLM支持。单卡约18GB权重，优先在RTX 5090
+  （SM120）验证，再在B200/B300（SM100）做架构交叉验证。
 - Marlin W4A16：`nm-testing/fp4_nvfp4a16-e2e`；A100、H100、RTX 4090 等 SM75-SM99 GPU。
 
 先由有对应 GPU 的机器完成构建。本次代码迁移按要求不在本机编译。
