@@ -1,4 +1,4 @@
-/* NVFP4 routed MoE integration around vLLM's SM100 grouped W4A4 CUTLASS GEMM. */
+/* NVFP4 routed MoE integration around vLLM's SM100/SM120 grouped W4A4 CUTLASS GEMM. */
 #include "fastllm-cuda.cuh"
 
 #include <cuda_bf16.h>
@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -62,12 +63,18 @@ static void ReleaseBuffers(std::vector<QuantBuffer> &buffers) {
 
 static int MinBatch() {
     const char *value = std::getenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH");
-    return value ? std::max(1, std::atoi(value)) : 16;
+    // 与vLLM一致，不按M过滤后端；环境变量仅保留给显式性能调优。
+    return value ? std::max(1, std::atoi(value)) : 1;
 }
 
 static bool Enabled() {
     const char *value = std::getenv("FASTLLM_CUDA_MOE_NVFP4_W4A4");
     return value == nullptr || value[0] == '\0' || value[0] != '0';
+}
+
+static bool StrictEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
 template <typename T>
@@ -80,7 +87,10 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     const fastllm::DataType dtype = std::is_same_v<T, half>
         ? fastllm::DataType::FLOAT16 : fastllm::DataType::BFLOAT16;
     const int experts = weightsBatch / 2 - 1;
+    const int arch = FastllmCudaRuntimeArch();
+    // vLLM 的 SM120 grouped kernel 固定输出 BF16；SM100 同时支持 FP16/BF16。
     if (input.dataType != dtype || input.dataDevice != fastllm::DataDevice::CUDA ||
+        (arch >= 120 && dtype != fastllm::DataType::BFLOAT16) ||
         batch < MinBatch() || topk <= 0 || totalTasks != batch * topk ||
         experts <= 0 || experts > 256 || hidden % 32 != 0 || inter % 32 != 0 ||
         routeRows == nullptr || routeScales == nullptr || routePositions == nullptr ||
@@ -175,9 +185,15 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
             d.push_back(static_cast<T *>(w1.cudaData) + (size_t)start * inter * 2);
         }
     }
-    if (ok) ok = FastllmCudaNvfp4GroupedGemmSm100(
-        a.data(), b.data(), scaleA.data(), scaleB.data(), alpha.data(), d.data(),
-        rows.data(), (int)rows.size(), inter * 2, hidden, dtype, (void *)stream);
+    if (ok) {
+        ok = arch >= 120
+            ? FastllmCudaNvfp4GroupedGemmSm120(
+                  a.data(), b.data(), scaleA.data(), scaleB.data(), alpha.data(), d.data(),
+                  rows.data(), (int)rows.size(), inter * 2, hidden, dtype, (void *)stream)
+            : FastllmCudaNvfp4GroupedGemmSm100(
+                  a.data(), b.data(), scaleA.data(), scaleB.data(), alpha.data(), d.data(),
+                  rows.data(), (int)rows.size(), inter * 2, hidden, dtype, (void *)stream);
+    }
 
     a.clear(); b.clear(); scaleA.clear(); scaleB.clear(); alpha.clear(); d.clear(); rows.clear();
     for (size_t i = 0; ok && i < activeExperts.size(); ++i) {
@@ -203,9 +219,15 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
             d.push_back(static_cast<T *>(w2.cudaData) + (size_t)start * hidden);
         }
     }
-    if (ok) ok = FastllmCudaNvfp4GroupedGemmSm100(
-        a.data(), b.data(), scaleA.data(), scaleB.data(), alpha.data(), d.data(),
-        rows.data(), (int)rows.size(), hidden, inter, dtype, (void *)stream);
+    if (ok) {
+        ok = arch >= 120
+            ? FastllmCudaNvfp4GroupedGemmSm120(
+                  a.data(), b.data(), scaleA.data(), scaleB.data(), alpha.data(), d.data(),
+                  rows.data(), (int)rows.size(), hidden, inter, dtype, (void *)stream)
+            : FastllmCudaNvfp4GroupedGemmSm100(
+                  a.data(), b.data(), scaleA.data(), scaleB.data(), alpha.data(), d.data(),
+                  rows.data(), (int)rows.size(), hidden, inter, dtype, (void *)stream);
+    }
     if (ok) {
         size_t elements = (size_t)batch * hidden;
         ReduceRoutes<<<(elements + 255) / 256, 256, 0, stream>>>(
@@ -231,7 +253,7 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
         const int *expertCounts, int batch, int topk, int totalTasks,
         int hidden, int inter) {
     int arch = FastllmCudaRuntimeArch();
-    if (!Enabled() || arch != 100 || weights == nullptr || weightsBatch < 4 ||
+    if (!Enabled() || arch < 100 || arch >= 130 || weights == nullptr || weightsBatch < 4 ||
         (weightsBatch & 1)) return false;
     bool ok = false;
     if (input.dataType == fastllm::DataType::FLOAT16)
@@ -250,6 +272,12 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
                 !weight->RestoreCudaDataForRepackedWeight()) {
                 throw ("NVFP4 grouped MoE fallback cannot restore an original weight.");
             }
+        }
+        // strict用于算子验证和性能测试：禁止Legacy静默兜底，确保测到的
+        // 一定是grouped CUTLASS，而不是“测试通过但实际跑了fallback”。
+        if (StrictEnabled()) {
+            throw std::runtime_error(
+                "strict NVFP4 grouped MoE requires the CUTLASS backend");
         }
     }
     const char *trace = std::getenv("FASTLLM_CUDA_NVFP4_TRACE");

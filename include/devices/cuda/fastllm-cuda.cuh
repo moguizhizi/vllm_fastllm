@@ -607,6 +607,12 @@ bool FastllmCudaNvfp4GroupedGemmSm100(
     const float *const *alpha, void *const *d, const int *rows,
     int groups, int n, int k, fastllm::DataType outputType,
     void *streamPtr = nullptr);
+bool FastllmCudaNvfp4GroupedGemmSm120(
+    const uint8_t *const *a, const uint8_t *const *b,
+    const uint8_t *const *scaleA, const uint8_t *const *scaleB,
+    const float *const *alpha, void *const *d, const int *rows,
+    int groups, int n, int k, fastllm::DataType outputType,
+    void *streamPtr = nullptr);
 bool FastllmCudaPrepareNvfp4W4A4Weight(
     fastllm::Data &weight, int inFeatures, int outFeatures,
     const uint8_t **packedWeight, const uint8_t **scales,

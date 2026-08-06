@@ -460,6 +460,7 @@ if (USE_CUDA)
             src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass-sm100.cu
             src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass-sm120.cu
             src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass-sm100.cu
+            src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass-sm120.cu
             src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass.cu
         )
     endif()
