@@ -30,8 +30,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
-    parser.add_argument("--min-topk-overlap", type=float, default=0.5)
-    parser.add_argument("--max-logprob-diff", type=float, default=1.0)
+    parser.add_argument("--min-topk-overlap", type=float, default=0.8)
+    parser.add_argument("--max-first-logprob-diff", type=float, default=0.1)
     parser.add_argument("--result-dir", default="")
     parser.add_argument(
         "--vllm-python", default=os.environ.get("NVFP4_VLLM_PYTHON", sys.executable))
@@ -179,18 +179,29 @@ def compare_results(args, vllm_result, fastllm_result):
     max_diff = max((abs(v_probs[token] - f_probs[token]) for token in common), default=float("inf"))
     first_vllm = vllm_result["generated_token_ids"][:1]
     first_fastllm = fastllm_result["generated_token_ids"][:1]
+    first_token_match = first_vllm == first_fastllm and bool(first_vllm)
+    first_token_logprob_diff = float("inf")
+    if first_token_match:
+        first_token = first_vllm[0]
+        if first_token in v_probs and first_token in f_probs:
+            first_token_logprob_diff = abs(
+                v_probs[first_token] - f_probs[first_token])
 
     print("\n== NVFP4 vLLM forward check ==")
     print(f"prompt_token_ids_match: {same_prompt}")
     print(f"generated_token_ids_match: {same_tokens}")
     print(f"vllm_token_ids: {vllm_result['generated_token_ids']}")
     print(f"fastllm_token_ids: {fastllm_result['generated_token_ids']}")
-    print(f"first_token_match: {first_vllm == first_fastllm}")
+    print(f"first_token_match: {first_token_match}")
+    print(f"first_token_logprob_diff: {first_token_logprob_diff:.6f}")
     print(f"first_top{args.top_logprobs}_overlap: {overlap:.4f}")
     print(f"common_topk_max_logprob_diff: {max_diff:.6f}")
 
-    passed = (same_prompt and same_tokens and first_vllm == first_fastllm and
-              overlap >= args.min_topk_overlap and max_diff <= args.max_logprob_diff)
+    # 不同推理引擎的量化、融合及浮点累加顺序可能不同，完整生成序列和
+    # 低概率尾部logprob仅用于诊断；首步决策及主要候选分布用于判定正确性。
+    passed = (same_prompt and first_token_match and
+              first_token_logprob_diff <= args.max_first_logprob_diff and
+              overlap >= args.min_topk_overlap)
     print(f"Summary: {'PASS' if passed else 'FAIL'}")
     return passed
 
