@@ -611,6 +611,7 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
     fastllm::Data &weight, int inFeatures, int outFeatures,
     const uint8_t **packedWeight, const uint8_t **scales,
     const float **alpha);
+bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight);
 bool TryCudaCutlassNvfp4W4A4(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output,
@@ -631,6 +632,9 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
 inline bool TryCudaCutlassNvfp4W4A4(
     const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
     fastllm::Data &, int, int, int) { return false; }
+inline bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &) {
+    return false;
+}
 inline bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
     const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
     fastllm::Data &, int, int, int) { return false; }

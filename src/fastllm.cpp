@@ -2692,6 +2692,9 @@ namespace fastllm {
                 this->dataDeviceIds = deviceIds.empty()
                     ? std::vector<int>({destDevice}) : deviceIds;
                 this->dataDevice = device;
+                // 目标GPU只短暂接收原始格式；立即在目标卡上构建最终
+                // CUTLASS表示并释放临时原始权重，避免经过GPU0中转。
+                FastllmCudaTryPrepackNvfp4W4A4Weight(*this);
                 return;
             }
         }
@@ -2836,6 +2839,16 @@ namespace fastllm {
             this->dataDeviceIds = deviceIds;
         };
         this->dataDevice = device;
+#ifdef USE_CUDA
+        if (device == DataDevice::CUDA && copyData &&
+            this->dataType == DataType::NVFP4_BLOCK_16 &&
+            this->cudaData != nullptr) {
+            // NVFP4权重逐个上传、逐个重排、逐个释放原始CUDA表示。
+            // 因此显存峰值只包含当前权重的双份表示，而不是整模型的
+            // 原始权重与全部CUTLASS权重同时驻留。
+            FastllmCudaTryPrepackNvfp4W4A4Weight(*this);
+        }
+#endif
     }
 
     // 临时移动到cuda 

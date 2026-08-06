@@ -55,6 +55,7 @@ std::map<int, OutputScratch> outputScratch;
 
 enum class BackendState : uint8_t {
     Uninitialized,
+    Prepared,
     Cutlass,
     Rejected,
 };
@@ -162,7 +163,7 @@ static int CurrentDevice() {
  *
  * @param weight 用于标识模型权重对象。
  * @param device CUDA设备号。
- * @return 当前后端状态：Uninitialized、Cutlass或Rejected。
+ * @return 当前后端状态：Uninitialized、Prepared、Cutlass或Rejected。
  */
 static BackendState GetBackendState(const fastllm::Data &weight, int device) {
     std::lock_guard<std::mutex> guard(stateMutex);
@@ -181,9 +182,32 @@ static FusionState GetFusionState(const fastllm::Data &weight, int device) {
     return it == fusionStates.end() ? FusionState::Uninitialized : it->second;
 }
 
+static void ReleaseWeightCacheForDevice(const fastllm::Data *weight, int device);
+
 static void SetFusionState(const fastllm::Data &weight, int device, FusionState state) {
     std::lock_guard<std::mutex> guard(stateMutex);
     fusionStates[{&weight, device}] = state;
+}
+
+/**
+ * 将当前GPU上的NVFP4后端固定为Legacy，并确保原始CUDA权重可用。
+ *
+ * 该函数只用于首次CUTLASS GEMM验证失败。预重排权重先被销毁，再从
+ * CPU/NUMA/mmap保存的原始格式恢复到当前GPU，避免失败后长期保留两份
+ * 设备权重。恢复成功后状态固定为Rejected，正式推理不再尝试CUTLASS。
+ *
+ * @param weight 首次CUTLASS验证失败的NVFP4权重。
+ * @param device 权重当前所在的CUDA设备号。
+ * @return true表示Legacy原始CUDA权重已经就绪。
+ */
+static bool RejectCutlassAndRestoreLegacy(fastllm::Data &weight, int device) {
+    ReleaseWeightCacheForDevice(&weight, device);
+    if (weight.cudaData == nullptr &&
+        !weight.RestoreCudaDataForRepackedWeight(device)) {
+        return false;
+    }
+    SetBackendState(weight, device, BackendState::Rejected);
+    return true;
 }
 
 static void ReleaseCache(WeightCache &cache) {
@@ -456,6 +480,64 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
 }
 
 /**
+ * 在NVFP4权重进入当前GPU时预先选择并构建dense CUTLASS W4A4后端。
+ *
+ * 本函数只依赖权重自身和当前GPU能力，不依赖运行时M。满足条件时按
+ * N/K完成padding、权重打包和scale重排，随后立即释放刚上传的原始CUDA
+ * 权重，把状态记为Prepared。首个真实Linear仍会执行一次同步GEMM验证：
+ * 成功后固定为Cutlass；失败则从host/mmap恢复原始权重并固定为Legacy。
+ *
+ * 该入口由Data::ToDevice逐个权重调用，因此任一时刻只需同时容纳当前层
+ * 的原始格式和最终CUTLASS格式，不再等整模型上传后才逐层重排。
+ *
+ * @param weight 已上传到当前GPU的NVFP4_BLOCK_16二维权重[N,K]。
+ * @return true表示已存在或成功创建CUTLASS格式；false表示固定走Legacy。
+ */
+bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight) {
+    if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+        weight.blockM != 16 || weight.dims.size() != 2) {
+        return false;
+    }
+    const int device = CurrentDevice();
+    if (device < 0) return false;
+
+    const BackendState state = GetBackendState(weight, device);
+    if (state == BackendState::Prepared || state == BackendState::Cutlass) {
+        return true;
+    }
+    if (state == BackendState::Rejected) return false;
+
+    const int arch = RuntimeArch();
+    const int n = weight.dims[0];
+    const int k = weight.dims[1];
+    const bool weightSupported = Enabled() && arch >= 100 && arch < 130 &&
+        n > 0 && k > 0 && k % 16 == 0 &&
+        weight.nvfp4GroupScales.size() == (size_t)n * (k / 16) &&
+        std::isfinite(weight.nvfp4GlobalScale) &&
+        weight.nvfp4GlobalScale > 0.0f && weight.cudaData != nullptr &&
+        !weight.cudaDataBorrowed && !weight.multiDeviceData &&
+        (weight.cpuData != nullptr || !weight.numasData.empty());
+    if (!weightSupported) {
+        SetBackendState(weight, device, BackendState::Rejected);
+        Trace("fallback", "weight-load backend selection rejected", 1, k, n, arch);
+        return false;
+    }
+
+    // 这里没有真实激活，M传1；权重重排和缓存匹配只由N/K决定。
+    WeightCache *cache = GetWeightCache(weight, 1, n, k, true);
+    if (cache == nullptr) {
+        ReleaseWeightCacheForDevice(&weight, device);
+        SetBackendState(weight, device, BackendState::Rejected);
+        Trace("fallback", "weight-load prepack failed", 1, k, n, arch);
+        return false;
+    }
+    SetBackendState(weight, device, BackendState::Prepared);
+    Trace("w4a4-cutlass", "weight prepacked; first GEMM validation pending",
+          1, k, n, arch);
+    return true;
+}
+
+/**
  * 执行一次NVFP4 W4A4 CUTLASS线性计算。
  *
  * 本函数只负责单次计算，不决定后端的最终生命周期。执行流程为：检查
@@ -628,11 +710,13 @@ bool TryCudaCutlassNvfp4W4A4(
         return false;
     }
 
-    // 只有未初始化状态才执行带同步检查的warmup。首次选择不设置M门槛；
-    // 后端固定后，不同M只选择CUTLASS内部配置，不再切换到Legacy。
-    const bool warmup = state == BackendState::Uninitialized;
+    // Uninitialized兼容未经过ToDevice预重排的直接调用；Prepared表示权重
+    // 已在上传阶段重排并释放原始CUDA表示。两种状态都只验证一次真实GEMM。
+    const bool warmup = state == BackendState::Uninitialized ||
+                        state == BackendState::Prepared;
+    const bool checkBackendPolicy = state == BackendState::Uninitialized;
     bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, m, n, k, false,
-                                  warmup, warmup);
+                                  checkBackendPolicy, warmup);
     if (ok && warmup) {
         // warmup成功后，CUTLASS重排权重成为该GPU上的持久表示。
         // 释放原始CUDA权重，避免同时保存原始格式和重排格式。
@@ -648,10 +732,12 @@ bool TryCudaCutlassNvfp4W4A4(
                 device, weight.name.c_str());
         }
     } else if (!ok && warmup) {
-        // 只允许在首次warmup阶段降级：销毁未通过验证的重排权重，
-        // 并永久标记为Rejected，使后续调用固定走Legacy路径。
-        ReleaseWeightCacheForDevice(&weight, device);
-        SetBackendState(weight, device, BackendState::Rejected);
+        // 只允许在首次warmup阶段降级。若上传阶段已经释放原始CUDA权重，
+        // 此处会销毁CUTLASS格式并从host/mmap恢复Legacy格式。
+        if (!RejectCutlassAndRestoreLegacy(weight, device)) {
+            throw std::runtime_error(
+                "NVFP4 CUTLASS warmup failed and legacy weight restore failed");
+        }
     } else if (!ok) {
         // 后端固定后再失败不能静默切换，否则同一层会在推理过程中
         // 改变权重表示和计算路径；此时直接报错暴露真实故障。
@@ -671,11 +757,13 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
     const FusionState fusion = GetFusionState(weight, device);
     if (backend == BackendState::Rejected || fusion == FusionState::Disabled) return false;
 
-    const bool backendWarmup = backend == BackendState::Uninitialized;
+    const bool backendWarmup = backend == BackendState::Uninitialized ||
+                               backend == BackendState::Prepared;
     const bool fusionWarmup = fusion == FusionState::Uninitialized;
     // 融合入口仍使用FastLLM旧维度命名，在这里映射为标准GEMM M/N/K。
     bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, k, m, true,
-                                  backendWarmup, backendWarmup || fusionWarmup);
+                                  backend == BackendState::Uninitialized,
+                                  backendWarmup || fusionWarmup);
     if (ok) {
         if (backendWarmup) {
             if (!weight.ReleaseCudaDataForRepackedWeight()) {
