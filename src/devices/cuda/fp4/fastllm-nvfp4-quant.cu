@@ -196,6 +196,29 @@ bool FastllmCudaSiluMulNvfp4Quantize(
         globalScale, streamPtr);
 }
 
+/**
+ * 融合执行SwiGLU并把结果动态量化为CUTLASS使用的NVFP4激活布局。
+ *
+ * 输入的每一行按[gate(hidden), up(hidden)]连续存放。kernel先计算
+ * SiLU(gate) * up，再以每16个元素一组生成E2M1 FP4值和E4M3 group
+ * scale。FP4结果按两个元素一个字节写入output；group scale直接写成
+ * CUTLASS要求的swizzle布局。hidden到paddedHidden之间的补齐区域写零。
+ *
+ * 本函数只负责参数检查、数据类型分派和异步kernel启动，不执行流同步；
+ * 调用方需要在warmup或依赖结果的边界检查异步CUDA错误。
+ *
+ * @param input        FP16或BF16输入，逻辑形状为[rows, 2 * hidden]。
+ * @param inputType    输入类型，仅支持FLOAT16和BFLOAT16。
+ * @param output       打包E2M1输出，容量至少为rows * paddedHidden / 2字节。
+ * @param outputScales swizzle E4M3 scale输出，容量至少为
+ *                     FastllmCudaNvfp4SwizzledScaleBytes(rows, paddedHidden)。
+ * @param rows         输入行数，通常为本次参与计算的token数。
+ * @param hidden       SwiGLU输出宽度，必须是16的倍数。
+ * @param paddedHidden CUTLASS使用的补齐宽度，必须不小于hidden且为32的倍数。
+ * @param globalScale  激活动态量化使用的正数全局缩放因子。
+ * @param streamPtr    CUDA流指针；为空时使用默认流。
+ * @return 参数、GPU架构和kernel启动均成功时返回true，否则返回false。
+ */
 bool FastllmCudaSiluMulNvfp4QuantizePadded(
         const void *input, fastllm::DataType inputType,
         uint8_t *output, uint8_t *outputScales,
