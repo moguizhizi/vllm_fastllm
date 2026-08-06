@@ -446,24 +446,54 @@ static bool RunCutlassNvfp4W4A4(
     return ok;
 }
 
+/**
+ * 尝试使用CUTLASS执行NVFP4 W4A4线性计算。
+ *
+ * 该函数同时负责当前权重在当前GPU上的后端生命周期管理：第一次调用
+ * 会执行带同步验证的warmup；成功后固定使用CUTLASS并释放原始CUDA
+ * 权重，失败后固定拒绝CUTLASS，由上层改走Legacy后端。后端一旦固定为
+ * CUTLASS，正式推理期间发生的执行错误将直接抛出，不再动态切换后端。
+ *
+ * @param input  FP16或BF16激活，逻辑形状为[n, m]。
+ * @param weight NVFP4_BLOCK_16权重，逻辑形状为[k, m]；可能在warmup
+ *               成功后释放其原始CUDA表示。
+ * @param bias   可选的FP32偏置，长度为k。
+ * @param output 输出张量，逻辑形状为[n, k]，类型与input相同。
+ * @param n      激活行数，通常是本次参与计算的token数。
+ * @param m      输入特征数。
+ * @param k      输出特征数。
+ * @return true表示本次已由CUTLASS完成；false表示CUTLASS未接管，调用方
+ *         应使用已经选定的其他后端。
+ */
 bool TryCudaCutlassNvfp4W4A4(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k) {
+    // 本入口只处理每16个权重共享一组缩放因子的NVFP4权重。
     if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
         weight.blockM != 16) return false;
     const int device = CurrentDevice();
     if (device < 0) return false;
+
+    // 后端状态按“权重对象 + GPU”保存。同一份权重换到另一张GPU后，
+    // 需要在目标GPU上重新完成一次后端选择和权重重排。
     const BackendState state = GetBackendState(weight, device);
     if (state == BackendState::Rejected) {
+        // 首次warmup已经确认CUTLASS不可用，后续固定交给Legacy路径，
+        // 避免每次Linear都重复创建cache并再次尝试失败。
         Trace("fallback", "CUTLASS backend rejected during warmup", n, m, k,
               RuntimeArch());
         return false;
     }
+
+    // 只有未初始化状态才执行带同步检查的warmup。后端固定后跳过
+    // 选择策略检查，防止因不同batch行数在CUTLASS和Legacy之间切换。
     const bool warmup = state == BackendState::Uninitialized;
     bool ok = RunCutlassNvfp4W4A4(input, weight, bias, output, n, m, k, false,
                                   warmup, warmup);
     if (ok && warmup) {
+        // warmup成功后，CUTLASS重排权重成为该GPU上的持久表示。
+        // 释放原始CUDA权重，避免同时保存原始格式和重排格式。
         if (!weight.ReleaseCudaDataForRepackedWeight()) {
             ReleaseWeightCacheForDevice(&weight, device);
             SetBackendState(weight, device, BackendState::Rejected);
@@ -476,9 +506,13 @@ bool TryCudaCutlassNvfp4W4A4(
                 device, weight.name.c_str());
         }
     } else if (!ok && warmup) {
+        // 只允许在首次warmup阶段降级：销毁未通过验证的重排权重，
+        // 并永久标记为Rejected，使后续调用固定走Legacy路径。
         ReleaseWeightCacheForDevice(&weight, device);
         SetBackendState(weight, device, BackendState::Rejected);
     } else if (!ok) {
+        // 后端固定后再失败不能静默切换，否则同一层会在推理过程中
+        // 改变权重表示和计算路径；此时直接报错暴露真实故障。
         throw std::runtime_error(
             "NVFP4 CUTLASS backend failed after warmup; runtime fallback is disabled");
     }
