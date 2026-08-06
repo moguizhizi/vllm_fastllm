@@ -184,6 +184,9 @@ run_ops_performance() {
             --param bias=0 --param input_type=fp16 --warmup 20 --iters 200 \
             --atol 0.05 --rtol 0.05
     fi
+    run_logged ops_performance_report python test/nvfp4/performance_report.py \
+        --log-dir "${log_dir}" \
+        --output-prefix "${log_dir}/ops-performance"
 }
 
 run_ops() {
@@ -208,16 +211,15 @@ run_forward() {
 
 run_model() {
     require_model
-    # TRACE会在量化等阶段插入cudaStreamSynchronize，只用于功能诊断。
-    # 性能测试显式清除它，避免外部export的环境变量污染prefill/decode结果。
-    run_logged model_prefill env -u FASTLLM_CUDA_NVFP4_TRACE \
-        python test/benchmark/prefill.py "${model_path}" \
-        --dtype auto --atype bfloat16 --device cuda --moe_device cuda \
-        --prompt-repeat 256 --max-tokens 16
-    run_logged model_decode env -u FASTLLM_CUDA_NVFP4_TRACE \
-        python test/benchmark/decode.py "${model_path}" \
-        --dtype auto --atype bfloat16 --device cuda --moe_device cuda \
-        --batch-size 32 --max_batch 32 --prefill-length 512 --max-tokens 64
+    # 两个框架分时加载同一模型，避免同时占用显存；使用相同的prompt、
+    # batch和输出长度，最终生成Markdown/CSV/JSON对比结果。
+    run_logged model_performance_compare env -u FASTLLM_CUDA_NVFP4_TRACE \
+        python test/nvfp4/model_performance_compare.py \
+        --model "${model_path}" \
+        --result-dir "${log_dir}/model-performance-results" \
+        --prefill-repeat 256 --prefill-max-tokens 16 \
+        --decode-batch-size 32 --decode-prefill-length 512 \
+        --decode-max-tokens 64
 }
 
 resolve_gpu_profile

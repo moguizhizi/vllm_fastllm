@@ -55,7 +55,8 @@ grouped MoE覆盖M=2/64/224、topk=1/8、experts=40/64。
 
 `ops-performance` 的dense W4A4覆盖M=1/16/64/128/256/512/1024；grouped MoE
 使用同一组M/topk/experts矩阵。测试开启strict检查：CUTLASS失败时直接报错，
-不允许legacy fallback伪装成CUTLASS成绩。
+不允许legacy fallback伪装成CUTLASS成绩。执行结束后自动生成
+`ops-performance.md`和`ops-performance.csv`，表格包含参数、延迟、带宽和算力。
 
 ## 模型和显卡
 
@@ -116,7 +117,10 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
   test/nvfp4/run_nvfp4_tests.sh forward
 ```
 
-整体模型 prefill/decode：
+整体模型 prefill/decode 会分时运行FastLLM和vLLM，避免同时加载两份模型。
+两边使用相同prompt、batch、最大生成长度和贪心采样，结果写入
+`model-performance-results/model-performance-compare.{md,csv,json}`。表格包含实际
+输入/输出token数、TTFT、Prefill吞吐、Decode batch吞吐、端到端吞吐和FT/vLLM比值：
 
 ```bash
 NVFP4_MODEL=/models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
@@ -145,8 +149,15 @@ op_swiglu_fp4_quant_perf.log
 forward_check_vllm.log
 forward-vllm-results/vllm.json
 forward-vllm-results/fastllm.json
-model_prefill.log
-model_decode.log
+ops-performance.md
+ops-performance.csv
+model_performance_compare.log
+model-performance-results/fastllm-prefill.log
+model-performance-results/fastllm-decode.log
+model-performance-results/vllm-server.log
+model-performance-results/model-performance-compare.md
+model-performance-results/model-performance-compare.csv
+model-performance-results/model-performance-compare.json
 ```
 
 指定已有 `optest` 或日志目录：
