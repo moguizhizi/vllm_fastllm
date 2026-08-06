@@ -142,15 +142,20 @@ def run_vllm(args, result_dir):
         "--max-num-seqs", str(args.decode_batch_size),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--trust-remote-code", "--enforce-eager",
+        "--linear-backend", "cutlass",
         "--enable-force-include-usage",
     ]
     env = os.environ.copy()
-    env["VLLM_NVFP4_GEMM_BACKEND"] = "cutlass"
+    # Linear固定使用vLLM原生CUTLASS；sampling单独禁用FlashInfer，避免
+    # CUDA 12.8环境在SM120上触发FlashInfer运行时JIT。
+    env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     env["VLLM_USE_FLASHINFER_MOE_FP4"] = "0"
     server_log = result_dir / "vllm-server.log"
     print(f"SUBPROCESS COMMAND: {shlex.join(command)}", flush=True)
     log_handle = server_log.open("w", encoding="utf-8")
     log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
+    log_handle.write("ENV: VLLM_USE_FLASHINFER_SAMPLER=0\n")
+    log_handle.write("ENV: VLLM_USE_FLASHINFER_MOE_FP4=0\n\n")
     log_handle.flush()
     process = subprocess.Popen(
         command, cwd=REPO_DIR, env=env, stdout=log_handle,
