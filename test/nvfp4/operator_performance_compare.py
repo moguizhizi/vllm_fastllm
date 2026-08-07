@@ -158,13 +158,13 @@ def make_dense_runner(case, torch, ops, float4_max, float8_max):
 
 
 def make_swiglu_runner(case, torch, ops, float4_max, float8_max):
-    from vllm.model_executor.layers.activation import SiluAndMul
-
     dtype = torch_dtype(case["dtype"], torch)
     rows, hidden = case["m"], case["k"]
     torch.manual_seed(7)
     source = torch.randn((rows, hidden * 2), device="cuda", dtype=dtype)
-    reference = SiluAndMul().forward_native(source)
+    # 等价于vLLM SiluAndMul.forward_native，但不实例化CustomOp；后者要求
+    # set_current_vllm_config上下文，而这里只需要计算固定的量化global scale。
+    reference = torch.nn.functional.silu(source[..., :hidden]) * source[..., hidden:]
     global_scale = (
         float8_max * float4_max / torch.abs(reference).max().to(torch.float32))
     packed, scales = ops.scaled_fp4_quant(reference, global_scale)
