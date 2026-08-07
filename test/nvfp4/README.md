@@ -60,6 +60,22 @@ Qwen3-8B的4096x6144、4096x24576、12288x4096真实Linear形状。grouped MoE
 不允许legacy fallback伪装成CUTLASS成绩。执行结束后自动生成
 `ops-performance.md`和`ops-performance.csv`，表格包含参数、延迟、带宽和算力。
 
+`ops-compare`保持上述FastLLM算子测试不变，再由独立的
+`operator_performance_compare.py`分进程运行相同shape、dtype、warmup和iters的
+vLLM算子。vLLM侧借鉴其`benchmark_nvfp4_gemm.py`、
+`benchmark_nvfp4_quant.py`和`benchmark_cutlass_moe_nvfp4.py`，覆盖Dense W4A4、
+SwiGLU+FP4量化和Grouped MoE W4A4；两边都在框架调用边界计时并在末尾同步GPU。
+结果按每个case交替显示FastLLM/vLLM，
+并计算`FastLLM speedup = vLLM latency / FastLLM latency`：
+
+```bash
+NVFP4_VLLM_PYTHON=/path/to/vllm/python \
+  test/nvfp4/run_nvfp4_tests.sh ops-compare
+```
+
+输出文件为`operator-performance-compare.{md,csv,json}`；vLLM子进程命令和输出
+保存在`operator-performance-compare-vllm.log`。
+
 ## 模型和显卡
 
 - dense W4A4 首选：`nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4`；B200/B300（SM100）或 RTX PRO 6000 Blackwell（SM120，96GB）。
@@ -157,6 +173,13 @@ forward-vllm-results/vllm.json
 forward-vllm-results/fastllm.json
 ops-performance.md
 ops-performance.csv
+operator_performance_compare.log
+operator-performance-compare-cases.json
+operator-performance-compare-vllm.log
+operator-performance-compare-vllm.json
+operator-performance-compare.md
+operator-performance-compare.csv
+operator-performance-compare.json
 model_performance_compare.log
 model-performance-results/shared-prompt-token-ids.json
 model-performance-results/fastllm.log

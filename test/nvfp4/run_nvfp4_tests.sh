@@ -238,6 +238,20 @@ run_ops() {
     run_ops_performance
 }
 
+run_ops_compare() {
+    if [[ "${gpu_profile}" != sm100 && "${gpu_profile}" != sm120 ]]; then
+        echo "NVFP4 W4A4 operator comparison requires SM100 or SM120." >&2
+        exit 2
+    fi
+    # 保持原FastLLM算子性能测试不变；完成后由独立脚本分进程运行
+    # 相同shape的vLLM算子，并汇总两边结果。
+    run_ops_performance
+    run_logged operator_performance_compare python \
+        test/nvfp4/operator_performance_compare.py \
+        --fastllm-log-dir "${log_dir}" \
+        --output-prefix "${log_dir}/operator-performance-compare"
+}
+
 require_model() {
     if [[ -z "${model_path}" ]]; then
         echo "NVFP4_MODEL must point to a downloaded NVFP4 Hugging Face model." >&2
@@ -272,11 +286,12 @@ case "${suite}" in
     build) run_build ;;
     ops-functional) run_ops_functional ;;
     ops-performance) run_ops_performance ;;
+    ops-compare|operator-performance) run_ops_compare ;;
     ops) run_ops ;;
     forward) run_forward ;;
     model-performance|model) run_model ;;
-    all) run_build; run_ops; run_forward; run_model ;;
-    *) echo "usage: $0 {build|ops-functional|ops-performance|ops|forward|model-performance|all}; NVFP4_GPU_PROFILE=auto|sm100|sm120|preblackwell" >&2; exit 2 ;;
+    all) run_build; run_ops_functional; run_ops_compare; run_forward; run_model ;;
+    *) echo "usage: $0 {build|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}; NVFP4_GPU_PROFILE=auto|sm100|sm120|preblackwell" >&2; exit 2 ;;
 esac
 
 printf 'Logs: %s\n' "${log_dir}"
