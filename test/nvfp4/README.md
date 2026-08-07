@@ -119,15 +119,14 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
   test/nvfp4/run_nvfp4_tests.sh forward
 ```
 
-整体模型 prefill/decode 会分时运行FastLLM和vLLM，避免同时加载两份模型。
-脚本用同一个AutoTokenizer提前套用chat template，再把完全相同的完整prompt通过
-`/v1/completions`交给两个后端，避免服务端重复套用不同chat template。若两个后端
-报告的prompt token数不同，测试直接失败，不生成性能结论。两边使用相同最大生成长度
-和贪心采样；Decode默认覆盖
-batch=1/2/4/8/16/32。vLLM关闭prefix caching，避免连续case复用相同prompt
-导致后续batch的TTFT和吞吐虚高。结果写入
-`model-performance-results/model-performance-compare.{md,csv,json}`。表格包含实际
-输入/输出token数、TTFT、Prefill吞吐、Decode batch吞吐、端到端吞吐和FT/vLLM比值：
+整体模型对比由独立的`model_performance_compare.py`执行，不修改FastLLM原有
+`test/benchmark/prefill.py`和`decode.py`。脚本只用AutoTokenizer构造一次固定
+token ID：Prefill默认4096个，Decode默认512个；FastLLM通过raw-token接口消费，
+vLLM通过`/v1/completions`消费，并校验vLLM返回的prompt token ID完全一致。
+因此两边不会再次套用不同的Chat Template。两个框架分时加载模型，Decode默认覆盖
+batch=1/2/4/8/16/32；vLLM关闭prefix caching。结果写入
+`model-performance-results/model-performance-compare.{md,csv,json}`，包含TTFT、
+TPOT、ITL、E2EL、Prefill/Output吞吐和FastLLM/vLLM比值：
 
 ```bash
 NVFP4_MODEL=/models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
@@ -159,17 +158,11 @@ forward-vllm-results/fastllm.json
 ops-performance.md
 ops-performance.csv
 model_performance_compare.log
-model-performance-results/fastllm-prefill.log
-model-performance-results/fastllm-decode-b1.log
-model-performance-results/fastllm-decode-b2.log
-model-performance-results/fastllm-decode-b4.log
-model-performance-results/fastllm-decode-b8.log
-model-performance-results/fastllm-decode-b16.log
-model-performance-results/fastllm-decode-b32.log
+model-performance-results/shared-prompt-token-ids.json
+model-performance-results/fastllm.log
+model-performance-results/fastllm-results.json
 model-performance-results/vllm-server.log
-model-performance-results/shared-prefill-prompt.txt
-model-performance-results/shared-decode-prompt.txt
-model-performance-results/shared-prompt-metadata.json
+model-performance-results/vllm-results.json
 model-performance-results/model-performance-compare.md
 model-performance-results/model-performance-compare.csv
 model-performance-results/model-performance-compare.json

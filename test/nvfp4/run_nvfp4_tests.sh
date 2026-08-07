@@ -255,14 +255,14 @@ run_forward() {
 
 run_model() {
     require_model
-    # 两个框架分时加载同一模型，避免同时占用显存；使用相同的prompt、
-    # batch和输出长度，最终生成Markdown/CSV/JSON对比结果。
+    # 独立脚本只生成一次固定token ID；两个框架分时加载模型并直接消费
+    # 同一组token，避免Chat Template差异和同时占用显存。
     run_logged model_performance_compare env -u FASTLLM_CUDA_NVFP4_TRACE \
         python test/nvfp4/model_performance_compare.py \
         --model "${model_path}" \
         --result-dir "${log_dir}/model-performance-results" \
-        --prefill-repeat 256 --prefill-max-tokens 16 \
-        --decode-batch-sizes 1,2,4,8,16,32 --decode-prefill-length 512 \
+        --prefill-input-tokens 4096 --prefill-max-tokens 16 \
+        --decode-batch-sizes 1,2,4,8,16,32 --decode-input-tokens 512 \
         --decode-max-tokens 64
 }
 
