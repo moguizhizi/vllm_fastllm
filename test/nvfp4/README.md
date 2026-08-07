@@ -120,7 +120,10 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
 ```
 
 整体模型 prefill/decode 会分时运行FastLLM和vLLM，避免同时加载两份模型。
-两边使用相同prompt、最大生成长度和贪心采样；Decode默认覆盖
+脚本用同一个AutoTokenizer提前套用chat template，再把完全相同的完整prompt通过
+`/v1/completions`交给两个后端，避免服务端重复套用不同chat template。若两个后端
+报告的prompt token数不同，测试直接失败，不生成性能结论。两边使用相同最大生成长度
+和贪心采样；Decode默认覆盖
 batch=1/2/4/8/16/32。vLLM关闭prefix caching，避免连续case复用相同prompt
 导致后续batch的TTFT和吞吐虚高。结果写入
 `model-performance-results/model-performance-compare.{md,csv,json}`。表格包含实际
@@ -164,6 +167,9 @@ model-performance-results/fastllm-decode-b8.log
 model-performance-results/fastllm-decode-b16.log
 model-performance-results/fastllm-decode-b32.log
 model-performance-results/vllm-server.log
+model-performance-results/shared-prefill-prompt.txt
+model-performance-results/shared-decode-prompt.txt
+model-performance-results/shared-prompt-metadata.json
 model-performance-results/model-performance-compare.md
 model-performance-results/model-performance-compare.csv
 model-performance-results/model-performance-compare.json

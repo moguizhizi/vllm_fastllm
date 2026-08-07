@@ -64,6 +64,43 @@ def decode_batch_cases(args):
     return list(dict.fromkeys(values))
 
 
+def render_shared_prompts(args, result_dir):
+    """用同一个AutoTokenizer渲染完整prompt，供两个后端原样复用。"""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    raw_prefill = PREFILL.build_long_context(
+        "FastLLM prefill benchmark context block. ", args.prefill_repeat,
+        "请阅读以上上下文，并只回复“测试完成”。")
+    raw_decode = DECODE.build_prompt_by_chars(
+        "FastLLM decode benchmark context block. ", args.decode_prefill_length,
+        "请连续输出数字序列，不要解释。")
+
+    def render(content):
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=False)
+
+    prompts = {"prefill": render(raw_prefill), "decode": render(raw_decode)}
+    prompts["prefill_path"] = str(result_dir / "shared-prefill-prompt.txt")
+    prompts["decode_path"] = str(result_dir / "shared-decode-prompt.txt")
+    Path(prompts["prefill_path"]).write_text(prompts["prefill"], encoding="utf-8")
+    Path(prompts["decode_path"]).write_text(prompts["decode"], encoding="utf-8")
+    metadata = {
+        "tokenizer": tokenizer.__class__.__name__,
+        "prefill_chars": len(prompts["prefill"]),
+        "decode_chars": len(prompts["decode"]),
+        "prefill_tokens_by_tokenizer": len(tokenizer.encode(
+            prompts["prefill"], add_special_tokens=False)),
+        "decode_tokens_by_tokenizer": len(tokenizer.encode(
+            prompts["decode"], add_special_tokens=False)),
+    }
+    (result_dir / "shared-prompt-metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Shared prompt metadata: " + json.dumps(metadata, ensure_ascii=False), flush=True)
+    return prompts
+
+
 def run_logged(command, log_path, env=None):
     print(f"SUBPROCESS COMMAND: {shlex.join(command)}", flush=True)
     with log_path.open("w", encoding="utf-8") as log:
@@ -113,7 +150,7 @@ def stop_process(process):
             process.wait(timeout=10)
 
 
-def run_fastllm(args, result_dir):
+def run_fastllm(args, result_dir, prompts):
     env = os.environ.copy()
     env.pop("FASTLLM_CUDA_NVFP4_TRACE", None)
     env["FASTLLM_CUDA_NVFP4_W4A4"] = "1"
@@ -125,6 +162,7 @@ def run_fastllm(args, result_dir):
               "--device", args.flm_device, "--moe_device", args.flm_device]
     prefill_command = [
         args.fastllm_python, "test/benchmark/prefill.py", *common,
+        "--prompt-file", prompts["prefill_path"], "--completion-api",
         "--prompt-repeat", str(args.prefill_repeat),
         "--max-tokens", str(args.prefill_max_tokens),
         "--result-json", str(prefill_json),
@@ -136,6 +174,7 @@ def run_fastllm(args, result_dir):
         decode_command = [
             args.fastllm_python, "test/benchmark/decode.py", *common,
             "--batch-size", str(batch), "--max_batch", str(batch),
+            "--prompt-file", prompts["decode_path"], "--completion-api",
             "--prefill-length", str(args.decode_prefill_length),
             "--max-tokens", str(args.decode_max_tokens),
             "--result-json", str(decode_json),
@@ -147,7 +186,7 @@ def run_fastllm(args, result_dir):
     return read_json(prefill_json), decode_results
 
 
-def run_vllm(args, result_dir):
+def run_vllm(args, result_dir, prompts):
     base_url = f"http://127.0.0.1:{args.port}"
     served_name = "nvfp4-performance"
     batches = decode_batch_cases(args)
@@ -180,34 +219,31 @@ def run_vllm(args, result_dir):
         stderr=subprocess.STDOUT, text=True)
     try:
         wait_server(base_url, process, args.startup_timeout, server_log)
-        warmup = PREFILL.warmup(base_url, served_name, "no-key", 3600, 8)
+        warmup = PREFILL.warmup(
+            base_url, served_name, "no-key", 3600, 8,
+            prompt_text=prompts["decode"], completion_api=True)
         print("vLLM warmup: " + json.dumps(warmup, ensure_ascii=False), flush=True)
 
-        prefill_prompt = PREFILL.build_long_context(
-            "FastLLM prefill benchmark context block. ", args.prefill_repeat,
-            "请阅读以上上下文，并只回复“测试完成”。")
         prefill = PREFILL.run_chat_completion(
-            base_url, served_name, "no-key", prefill_prompt,
-            args.prefill_max_tokens, 3600)
+            base_url, served_name, "no-key", prompts["prefill"],
+            args.prefill_max_tokens, 3600, completion_api=True)
         prefill.update({
             "case_name": "single", "backend": "vllm", "model_path": args.model,
-            "prompt_repeat": args.prefill_repeat, "prompt_chars": len(prefill_prompt),
+            "prompt_repeat": args.prefill_repeat,
+            "prompt_chars": len(prompts["prefill"]),
             "max_tokens": args.prefill_max_tokens,
         })
 
-        decode_prompt = DECODE.build_prompt_by_chars(
-            "FastLLM decode benchmark context block. ", args.decode_prefill_length,
-            "请连续输出数字序列，不要解释。")
         decode_results = []
         for batch in batches:
             decode = DECODE.run_decode_batch(
-                base_url, served_name, "no-key", decode_prompt,
-                args.decode_max_tokens, 3600, batch, 0)
+                base_url, served_name, "no-key", prompts["decode"],
+                args.decode_max_tokens, 3600, batch, 0, completion_api=True)
             decode.update({
                 "case_name": f"batch-{batch}", "backend": "vllm",
                 "model_path": args.model,
                 "prefill_length_chars": args.decode_prefill_length,
-                "prompt_chars": len(decode_prompt), "batch_size": batch,
+                "prompt_chars": len(prompts["decode"]), "batch_size": batch,
                 "server_max_batch": max(batches),
                 "max_tokens": args.decode_max_tokens,
             })
@@ -228,6 +264,27 @@ def run_vllm(args, result_dir):
 
 def ratio(numerator, denominator):
     return numerator / denominator if denominator else 0.0
+
+
+def validate_prompt_tokens(ft_prefill, ft_decode, vllm_prefill, vllm_decode):
+    """两个后端必须报告完全相同的prompt token数，否则拒绝生成性能结论。"""
+    if ft_prefill["prompt_tokens"] != vllm_prefill["prompt_tokens"]:
+        raise RuntimeError(
+            "Prefill prompt token不一致: "
+            f"FastLLM={ft_prefill['prompt_tokens']}, "
+            f"vLLM={vllm_prefill['prompt_tokens']}")
+    ft_by_batch = {item["batch_size"]: item for item in ft_decode}
+    vllm_by_batch = {item["batch_size"]: item for item in vllm_decode}
+    if set(ft_by_batch) != set(vllm_by_batch):
+        raise RuntimeError("FastLLM与vLLM的decode batch集合不一致")
+    for batch in sorted(ft_by_batch):
+        ft_tokens = ft_by_batch[batch]["total_prompt_tokens"]
+        vllm_tokens = vllm_by_batch[batch]["total_prompt_tokens"]
+        if ft_tokens != vllm_tokens:
+            raise RuntimeError(
+                f"Decode batch={batch} prompt token不一致: "
+                f"FastLLM={ft_tokens}, vLLM={vllm_tokens}")
+    print("Prompt token check: PASS", flush=True)
 
 
 def args_value(items, key):
@@ -335,8 +392,10 @@ def main():
     args = parse_args()
     result_dir = Path(args.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
-    ft_prefill, ft_decode = run_fastllm(args, result_dir)
-    vllm_prefill, vllm_decode = run_vllm(args, result_dir)
+    prompts = render_shared_prompts(args, result_dir)
+    ft_prefill, ft_decode = run_fastllm(args, result_dir, prompts)
+    vllm_prefill, vllm_decode = run_vllm(args, result_dir, prompts)
+    validate_prompt_tokens(ft_prefill, ft_decode, vllm_prefill, vllm_decode)
     make_report(result_dir, ft_prefill, ft_decode, vllm_prefill, vllm_decode)
 
 
