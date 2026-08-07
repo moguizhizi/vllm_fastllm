@@ -133,17 +133,6 @@ def build_parser():
         default="",
         help="将结构化性能结果写入JSON文件",
     )
-    parser.add_argument(
-        "--prompt-file",
-        type=str,
-        default="",
-        help="直接读取已经渲染完成的prompt；设置后不再按参数构造prompt",
-    )
-    parser.add_argument(
-        "--completion-api",
-        action="store_true",
-        help="使用/v1/completions发送已渲染prompt，避免服务端再次套用chat template",
-    )
     return parser
 
 
@@ -219,9 +208,8 @@ def build_long_context_by_chars(prompt_unit, target_chars, question):
     return "".join(parts)[:target_chars]
 
 
-def run_chat_completion(base_url, model_name, api_key, prompt_text, max_tokens,
-                        request_timeout, completion_api=False):
-    url = f"{base_url}/v1/completions" if completion_api else f"{base_url}/v1/chat/completions"
+def run_chat_completion(base_url, model_name, api_key, prompt_text, max_tokens, request_timeout):
+    url = f"{base_url}/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -231,11 +219,10 @@ def run_chat_completion(base_url, model_name, api_key, prompt_text, max_tokens,
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": True,
+        "messages": [
+            {"role": "user", "content": prompt_text},
+        ],
     }
-    if completion_api:
-        payload["prompt"] = prompt_text
-    else:
-        payload["messages"] = [{"role": "user", "content": prompt_text}]
 
     start_time = time.perf_counter()
     response = requests.post(
@@ -264,7 +251,7 @@ def run_chat_completion(base_url, model_name, api_key, prompt_text, max_tokens,
         if choices:
             choice = choices[0]
             delta = choice.get("delta", {})
-            content = choice.get("text") if completion_api else delta.get("content")
+            content = delta.get("content")
             if content:
                 if first_token_time is None:
                     first_token_time = time.perf_counter()
@@ -301,9 +288,8 @@ def run_chat_completion(base_url, model_name, api_key, prompt_text, max_tokens,
     }
 
 
-def warmup(base_url, model_name, api_key, request_timeout, max_tokens,
-           prompt_text=None, completion_api=False):
-    prompt_text = prompt_text or "这是一次预热请求，请只回复“ok”。"
+def warmup(base_url, model_name, api_key, request_timeout, max_tokens):
+    prompt_text = "这是一次预热请求，请只回复“ok”。"
     return run_chat_completion(
         base_url=base_url,
         model_name=model_name,
@@ -311,7 +297,6 @@ def warmup(base_url, model_name, api_key, request_timeout, max_tokens,
         prompt_text=prompt_text,
         max_tokens=max_tokens,
         request_timeout=request_timeout,
-        completion_api=completion_api,
     )
 
 
@@ -367,9 +352,6 @@ def resolve_case_args(base_args, defaults, case_config, case_index):
 
 
 def build_prompt_from_args(args):
-    prompt_file = getattr(args, "prompt_file", "")
-    if prompt_file:
-        return Path(prompt_file).read_text(encoding="utf-8")
     prefill_length = getattr(args, "prefill_length", None)
     if prefill_length is not None:
         return build_long_context_by_chars(args.prompt_unit, int(prefill_length), args.question)
@@ -400,7 +382,6 @@ def run_single_benchmark(args):
         else:
             print(f"prompt_repeat: {args.prompt_repeat}")
         print(f"prompt_chars: {len(long_prompt)}")
-        print(f"request_api: {'completions' if args.completion_api else 'chat/completions'}")
         print(f"max_tokens: {args.max_tokens}")
         print("=" * 60)
 
@@ -415,8 +396,6 @@ def run_single_benchmark(args):
                 api_key=args.api_key,
                 request_timeout=args.request_timeout,
                 max_tokens=args.warmup_max_tokens,
-                prompt_text=long_prompt if args.completion_api else None,
-                completion_api=args.completion_api,
             )
             print(
                 "warmup: "
@@ -432,7 +411,6 @@ def run_single_benchmark(args):
             prompt_text=long_prompt,
             max_tokens=args.max_tokens,
             request_timeout=args.request_timeout,
-            completion_api=args.completion_api,
         )
         result.update(
             {
