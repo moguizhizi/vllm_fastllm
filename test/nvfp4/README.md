@@ -53,7 +53,9 @@ GPU0移动到GPU1时先销毁GPU0 cache，再从host源直接上传到GPU1并立
 作为融合量化的对照；激活量化覆盖真实K=4096/7168/14336。SM100和SM120的
 grouped MoE覆盖M=2/64/224、topk=1/8、experts=40/64。
 
-`ops-performance` 的dense W4A4覆盖M=1/16/64/128/256/512/1024；grouped MoE
+`ops-performance` 的dense W4A4覆盖M=1/16/64/127/128/129/255/256/257/512/1024，
+精确验证激活scale的128行边界和SM120的M=256 tile分派边界；另测FP16输出及
+Qwen3-8B的4096x6144、4096x24576、12288x4096真实Linear形状。grouped MoE
 使用同一组M/topk/experts矩阵。测试开启strict检查：CUTLASS失败时直接报错，
 不允许legacy fallback伪装成CUTLASS成绩。执行结束后自动生成
 `ops-performance.md`和`ops-performance.csv`，表格包含参数、延迟、带宽和算力。
@@ -118,7 +120,9 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
 ```
 
 整体模型 prefill/decode 会分时运行FastLLM和vLLM，避免同时加载两份模型。
-两边使用相同prompt、batch、最大生成长度和贪心采样，结果写入
+两边使用相同prompt、最大生成长度和贪心采样；Decode默认覆盖
+batch=1/2/4/8/16/32。vLLM关闭prefix caching，避免连续case复用相同prompt
+导致后续batch的TTFT和吞吐虚高。结果写入
 `model-performance-results/model-performance-compare.{md,csv,json}`。表格包含实际
 输入/输出token数、TTFT、Prefill吞吐、Decode batch吞吐、端到端吞吐和FT/vLLM比值：
 
@@ -153,7 +157,12 @@ ops-performance.md
 ops-performance.csv
 model_performance_compare.log
 model-performance-results/fastllm-prefill.log
-model-performance-results/fastllm-decode.log
+model-performance-results/fastllm-decode-b1.log
+model-performance-results/fastllm-decode-b2.log
+model-performance-results/fastllm-decode-b4.log
+model-performance-results/fastllm-decode-b8.log
+model-performance-results/fastllm-decode-b16.log
+model-performance-results/fastllm-decode-b32.log
 model-performance-results/vllm-server.log
 model-performance-results/model-performance-compare.md
 model-performance-results/model-performance-compare.csv

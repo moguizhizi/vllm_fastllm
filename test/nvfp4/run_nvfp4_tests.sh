@@ -86,6 +86,30 @@ run_ops_functional() {
             --param bias=1 --param input_type=bf16 \
             --param check_warmup_fallback=1 \
             --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        run_logged op_dense_w4a4_aligned_fp16 env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            FASTLLM_CUDA_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=128 --param in=1024 --param out=1024 \
+            --param bias=0 --param input_type=fp16 \
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        run_logged op_dense_w4a4_padding_n_only env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            FASTLLM_CUDA_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=128 --param in=1024 --param out=1000 \
+            --param bias=0 --param input_type=bf16 \
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
+        run_logged op_dense_w4a4_padding_k_only env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            FASTLLM_CUDA_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=128 --param in=1008 --param out=1024 \
+            --param bias=0 --param input_type=bf16 \
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         if [[ $(nvidia-smi -L 2>/dev/null | wc -l) -ge 2 ]]; then
             run_logged op_dense_w4a4_device_move env \
                 FASTLLM_CUDA_NVFP4_TRACE=1 \
@@ -145,7 +169,8 @@ run_ops_functional() {
 run_ops_performance() {
     if [[ "${gpu_profile}" == sm100 || "${gpu_profile}" == sm120 ]]; then
         local dense_m quant_k moe_m moe_topk moe_experts
-        for dense_m in 1 16 64 128 256 512 1024; do
+        # 覆盖激活scale的128行边界，以及SM120在M=256处的tile分派边界。
+        for dense_m in 1 16 64 127 128 129 255 256 257 512 1024; do
             run_logged "op_dense_w4a4_perf_m${dense_m}" env \
                 FASTLLM_CUDA_NVFP4_W4A4=1 \
                 FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
@@ -153,6 +178,25 @@ run_ops_performance() {
                 --param batch="${dense_m}" --param in=4096 --param out=4096 \
                 --param bias=0 --param input_type=bf16 --param check_release=1 \
                 --param performance_only=1 \
+                --warmup 5 --iters 20 --atol 0.20 --rtol 0.20
+        done
+        run_logged op_dense_w4a4_perf_fp16_m128 env \
+            FASTLLM_CUDA_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=128 --param in=4096 --param out=4096 \
+            --param bias=0 --param input_type=fp16 --param performance_only=1 \
+            --warmup 5 --iters 20 --atol 0.20 --rtol 0.20
+        local dense_shape
+        for dense_shape in 4096:6144 4096:24576 12288:4096; do
+            local dense_k=${dense_shape%%:*}
+            local dense_n=${dense_shape#*:}
+            run_logged "op_dense_w4a4_perf_m128_k${dense_k}_n${dense_n}" env \
+                FASTLLM_CUDA_NVFP4_W4A4=1 \
+                FASTLLM_CUDA_NVFP4_W4A4_STRICT=1 \
+                "${optest}" --op linear_nvfp4 --device cuda:0 \
+                --param batch=128 --param in="${dense_k}" --param out="${dense_n}" \
+                --param bias=0 --param input_type=bf16 --param performance_only=1 \
                 --warmup 5 --iters 20 --atol 0.20 --rtol 0.20
         done
         for quant_k in 4096 7168 14336; do
@@ -218,7 +262,7 @@ run_model() {
         --model "${model_path}" \
         --result-dir "${log_dir}/model-performance-results" \
         --prefill-repeat 256 --prefill-max-tokens 16 \
-        --decode-batch-size 32 --decode-prefill-length 512 \
+        --decode-batch-sizes 1,2,4,8,16,32 --decode-prefill-length 512 \
         --decode-max-tokens 64
 }
 

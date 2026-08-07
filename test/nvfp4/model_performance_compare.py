@@ -43,6 +43,9 @@ def parse_args():
     parser.add_argument("--prefill-repeat", type=int, default=256)
     parser.add_argument("--prefill-max-tokens", type=int, default=16)
     parser.add_argument("--decode-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--decode-batch-sizes", default="",
+        help="逗号分隔的decode batch矩阵；为空时使用--decode-batch-size")
     parser.add_argument("--decode-prefill-length", type=int, default=512)
     parser.add_argument("--decode-max-tokens", type=int, default=64)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -50,6 +53,15 @@ def parse_args():
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--startup-timeout", type=int, default=1200)
     return parser.parse_args()
+
+
+def decode_batch_cases(args):
+    values = ([args.decode_batch_size] if not args.decode_batch_sizes else
+              [int(value.strip()) for value in args.decode_batch_sizes.split(",")
+               if value.strip()])
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("decode batch必须是正整数")
+    return list(dict.fromkeys(values))
 
 
 def run_logged(command, log_path, env=None):
@@ -109,7 +121,6 @@ def run_fastllm(args, result_dir):
     env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
     env["FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT"] = "1"
     prefill_json = result_dir / "fastllm-prefill.json"
-    decode_json = result_dir / "fastllm-decode.json"
     common = [args.model, "--dtype", args.flm_dtype, "--atype", args.flm_atype,
               "--device", args.flm_device, "--moe_device", args.flm_device]
     prefill_command = [
@@ -118,31 +129,38 @@ def run_fastllm(args, result_dir):
         "--max-tokens", str(args.prefill_max_tokens),
         "--result-json", str(prefill_json),
     ]
-    decode_command = [
-        args.fastllm_python, "test/benchmark/decode.py", *common,
-        "--batch-size", str(args.decode_batch_size),
-        "--max_batch", str(args.decode_batch_size),
-        "--prefill-length", str(args.decode_prefill_length),
-        "--max-tokens", str(args.decode_max_tokens),
-        "--result-json", str(decode_json),
-    ]
     run_logged(prefill_command, result_dir / "fastllm-prefill.log", env)
-    run_logged(decode_command, result_dir / "fastllm-decode.log", env)
-    return read_json(prefill_json), read_json(decode_json)
+    decode_results = []
+    for batch in decode_batch_cases(args):
+        decode_json = result_dir / f"fastllm-decode-b{batch}.json"
+        decode_command = [
+            args.fastllm_python, "test/benchmark/decode.py", *common,
+            "--batch-size", str(batch), "--max_batch", str(batch),
+            "--prefill-length", str(args.decode_prefill_length),
+            "--max-tokens", str(args.decode_max_tokens),
+            "--result-json", str(decode_json),
+        ]
+        run_logged(decode_command, result_dir / f"fastllm-decode-b{batch}.log", env)
+        decode_results.append(read_json(decode_json))
+    (result_dir / "fastllm-decode.json").write_text(
+        json.dumps(decode_results, ensure_ascii=False, indent=2), encoding="utf-8")
+    return read_json(prefill_json), decode_results
 
 
 def run_vllm(args, result_dir):
     base_url = f"http://127.0.0.1:{args.port}"
     served_name = "nvfp4-performance"
+    batches = decode_batch_cases(args)
     command = [
         args.vllm_python, "-m", "vllm.entrypoints.openai.api_server",
         "--model", args.model, "--served-model-name", served_name,
         "--host", "127.0.0.1", "--port", str(args.port),
         "--dtype", "auto", "--max-model-len", str(args.max_model_len),
-        "--max-num-seqs", str(args.decode_batch_size),
+        "--max-num-seqs", str(max(batches)),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--trust-remote-code", "--enforce-eager",
         "--linear-backend", "cutlass",
+        "--no-enable-prefix-caching",
         "--enable-force-include-usage",
     ]
     env = os.environ.copy()
@@ -180,23 +198,29 @@ def run_vllm(args, result_dir):
         decode_prompt = DECODE.build_prompt_by_chars(
             "FastLLM decode benchmark context block. ", args.decode_prefill_length,
             "请连续输出数字序列，不要解释。")
-        decode = DECODE.run_decode_batch(
-            base_url, served_name, "no-key", decode_prompt,
-            args.decode_max_tokens, 3600, args.decode_batch_size, 0)
-        decode.update({
-            "case_name": "single", "backend": "vllm", "model_path": args.model,
-            "prefill_length_chars": args.decode_prefill_length,
-            "prompt_chars": len(decode_prompt), "batch_size": args.decode_batch_size,
-            "server_max_batch": args.decode_batch_size,
-            "max_tokens": args.decode_max_tokens,
-        })
+        decode_results = []
+        for batch in batches:
+            decode = DECODE.run_decode_batch(
+                base_url, served_name, "no-key", decode_prompt,
+                args.decode_max_tokens, 3600, batch, 0)
+            decode.update({
+                "case_name": f"batch-{batch}", "backend": "vllm",
+                "model_path": args.model,
+                "prefill_length_chars": args.decode_prefill_length,
+                "prompt_chars": len(decode_prompt), "batch_size": batch,
+                "server_max_batch": max(batches),
+                "max_tokens": args.decode_max_tokens,
+            })
+            decode_results.append(decode)
+            (result_dir / f"vllm-decode-b{batch}.json").write_text(
+                json.dumps(decode, ensure_ascii=False, indent=2), encoding="utf-8")
         (result_dir / "vllm-prefill.json").write_text(
             json.dumps(prefill, ensure_ascii=False, indent=2), encoding="utf-8")
         (result_dir / "vllm-decode.json").write_text(
-            json.dumps(decode, ensure_ascii=False, indent=2), encoding="utf-8")
+            json.dumps(decode_results, ensure_ascii=False, indent=2), encoding="utf-8")
         print("vLLM prefill result: " + json.dumps(prefill, ensure_ascii=False), flush=True)
-        print("vLLM decode result: " + json.dumps(decode, ensure_ascii=False), flush=True)
-        return prefill, decode
+        print("vLLM decode results: " + json.dumps(decode_results, ensure_ascii=False), flush=True)
+        return prefill, decode_results
     finally:
         stop_process(process)
         log_handle.close()
@@ -206,21 +230,27 @@ def ratio(numerator, denominator):
     return numerator / denominator if denominator else 0.0
 
 
+def args_value(items, key):
+    return items[0].get(key, "-") if items else "-"
+
+
 def make_report(result_dir, ft_prefill, ft_decode, vllm_prefill, vllm_decode):
     prefill_rows = [
         ("FastLLM", ft_prefill), ("vLLM", vllm_prefill),
     ]
-    decode_rows = [
-        ("FastLLM", ft_decode), ("vLLM", vllm_decode),
-    ]
+    decode_rows = [("FastLLM", item) for item in ft_decode]
+    decode_rows.extend(("vLLM", item) for item in vllm_decode)
+    ft_decode_by_batch = {item["batch_size"]: item for item in ft_decode}
+    vllm_decode_by_batch = {item["batch_size"]: item for item in vllm_decode}
     lines = [
         "# NVFP4整体性能对比", "",
         "## 测试参数", "",
         "| 场景 | Prompt参数 | Batch | 最大生成tokens |",
         "| --- | ---: | ---: | ---: |",
         f"| Prefill | repeat={ft_prefill.get('prompt_repeat', '-')} | 1 | {ft_prefill['max_tokens']} |",
-        f"| Decode | chars={ft_decode.get('prefill_length_chars', '-')} | "
-        f"{ft_decode['batch_size']} | {ft_decode['max_tokens']} |",
+        f"| Decode | chars={args_value(ft_decode, 'prefill_length_chars')} | "
+        f"{','.join(str(item['batch_size']) for item in ft_decode)} | "
+        f"{args_value(ft_decode, 'max_tokens')} |",
         "",
         "## Prefill", "",
         "| 后端 | Prompt tokens | Output tokens | TTFT(ms) | Prefill(tok/s) | Decode(tok/s) | Total(s) |",
@@ -244,14 +274,21 @@ def make_report(result_dir, ft_prefill, ft_decode, vllm_prefill, vllm_decode):
             f"{item['batch_wall_time']:.6f} |")
     lines.extend([
         "", "## FastLLM / vLLM", "",
-        "| 指标 | 比值 |",
-        "| --- | ---: |",
-        f"| Prefill吞吐 | {ratio(ft_prefill['prefill_speed'], vllm_prefill['prefill_speed']):.4f}x |",
-        f"| Decode batch吞吐 | {ratio(ft_decode['batch_decode_speed'], vllm_decode['batch_decode_speed']):.4f}x |",
-        f"| Decode E2E吞吐 | {ratio(ft_decode['end_to_end_speed'], vllm_decode['end_to_end_speed']):.4f}x |",
-        f"| TTFT速度（vLLM TTFT / FastLLM TTFT） | {ratio(vllm_prefill['ttft'], ft_prefill['ttft']):.4f}x |",
-        "",
+        "| 指标 | Batch | 比值 |",
+        "| --- | ---: | ---: |",
+        f"| Prefill吞吐 | 1 | {ratio(ft_prefill['prefill_speed'], vllm_prefill['prefill_speed']):.4f}x |",
+        f"| TTFT速度（vLLM TTFT / FastLLM TTFT） | 1 | {ratio(vllm_prefill['ttft'], ft_prefill['ttft']):.4f}x |",
     ])
+    for batch in sorted(set(ft_decode_by_batch) & set(vllm_decode_by_batch)):
+        ft_item = ft_decode_by_batch[batch]
+        vllm_item = vllm_decode_by_batch[batch]
+        lines.append(
+            f"| Decode batch吞吐 | {batch} | "
+            f"{ratio(ft_item['batch_decode_speed'], vllm_item['batch_decode_speed']):.4f}x |")
+        lines.append(
+            f"| Decode E2E吞吐 | {batch} | "
+            f"{ratio(ft_item['end_to_end_speed'], vllm_item['end_to_end_speed']):.4f}x |")
+    lines.append("")
     report = "\n".join(lines)
     (result_dir / "model-performance-compare.md").write_text(report, encoding="utf-8")
     rows = []
