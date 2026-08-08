@@ -74,7 +74,7 @@ FastllmNvfp4QuantKernel(
 
 template <typename T>
 __global__ void __launch_bounds__(512, FASTLLM_NVFP4_BLOCKS_PER_SM)
-FastllmSiluMulNvfp4QuantKernel(
+FastllmSiluMulNvfp4QuantOptimizedKernel(
         const T *__restrict__ input, uint8_t *__restrict__ output,
         uint8_t *__restrict__ outputScales, int rows, int hidden,
         int paddedHidden, int kTiles, float globalScale) {
@@ -84,6 +84,37 @@ FastllmSiluMulNvfp4QuantKernel(
     // scale缓冲区仍按128行分块分配，但融合量化只处理真实输入行。
     // CUTLASS GEMM的逻辑M就是rows，不会读取M维补齐区域。
     for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+        fastllm_nvfp4::PackedVec<T> gate, up;
+        const int element = pack * fastllm_nvfp4::kElementsPerThread;
+        const bool valid = row < rows && element < hidden;
+        const T *rowInput = valid ? input + (size_t)row * hidden * 2 : input;
+        fastllm_nvfp4::LoadOrZero(gate, rowInput + element, valid);
+        fastllm_nvfp4::LoadOrZero(up, rowInput + hidden + element, valid);
+        auto activated = fastllm_nvfp4::SiluMul(gate, up);
+        uint8_t *scale = fastllm_nvfp4::QuantScaleAddress(
+            row, pack, kTiles, outputScales);
+        const auto packed = fastllm_nvfp4::Quantize(activated, globalScale, scale);
+        if (row < rows) {
+            fastllm_nvfp4::StoreFp4(
+                output + (size_t)row * (paddedHidden / 2) + element / 2, packed);
+        }
+    }
+}
+
+/**
+ * 调度优化前的融合kernel，仅供算子横向性能对比。
+ *
+ * 该版本固定最多256线程，并把M补齐到128后执行；生产路径不调用它。
+ */
+template <typename T>
+__global__ void FastllmSiluMulNvfp4QuantBaselineKernel(
+        const T *__restrict__ input, uint8_t *__restrict__ output,
+        uint8_t *__restrict__ outputScales, int rows, int hidden,
+        int paddedHidden, int roundedRows, int kTiles, float globalScale) {
+    const int pack = blockIdx.y * blockDim.x + threadIdx.x;
+    const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
+    if (pack >= packs) return;
+    for (int row = blockIdx.x; row < roundedRows; row += gridDim.x) {
         fastllm_nvfp4::PackedVec<T> gate, up;
         const int element = pack * fastllm_nvfp4::kElementsPerThread;
         const bool valid = row < rows && element < hidden;
@@ -173,9 +204,10 @@ static bool LaunchQuant(const void *input, uint8_t *output, uint8_t *scales,
 }
 
 template <typename T>
-static bool LaunchSiluMulQuant(const void *input, uint8_t *output, uint8_t *scales,
-                               int rows, int hidden, int paddedHidden, float globalScale,
-                               cudaStream_t stream) {
+static bool LaunchSiluMulQuantOptimized(
+        const void *input, uint8_t *output, uint8_t *scales,
+        int rows, int hidden, int paddedHidden, float globalScale,
+        cudaStream_t stream) {
     const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
     const int realPacks = std::max(1, hidden / fastllm_nvfp4::kElementsPerThread);
     const int threads = std::min(512, realPacks);
@@ -186,9 +218,27 @@ static bool LaunchSiluMulQuant(const void *input, uint8_t *output, uint8_t *scal
         std::max(1, Nvfp4MultiprocessorCount() * Nvfp4BlocksPerSm(threads) / gridY));
     dim3 block(threads);
     dim3 grid(gridX, gridY);
-    FastllmSiluMulNvfp4QuantKernel<T><<<grid, block, 0, stream>>>(
+    FastllmSiluMulNvfp4QuantOptimizedKernel<T><<<grid, block, 0, stream>>>(
         static_cast<const T *>(input), output, scales, rows, hidden,
         paddedHidden, kTiles, globalScale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+/** 启动优化前的固定256线程、M补齐128版本，仅用于benchmark。 */
+template <typename T>
+static bool LaunchSiluMulQuantBaseline(
+        const void *input, uint8_t *output, uint8_t *scales,
+        int rows, int hidden, int paddedHidden, float globalScale,
+        cudaStream_t stream) {
+    const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
+    const int threads = std::min(256, packs);
+    const int roundedRows = (rows + 127) / 128 * 128;
+    const int kTiles = (paddedHidden + 63) / 64;
+    dim3 block(threads);
+    dim3 grid(std::min(roundedRows, 128), (packs + threads - 1) / threads);
+    FastllmSiluMulNvfp4QuantBaselineKernel<T><<<grid, block, 0, stream>>>(
+        static_cast<const T *>(input), output, scales, rows, hidden,
+        paddedHidden, roundedRows, kTiles, globalScale);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -244,6 +294,42 @@ bool FastllmCudaSiluMulNvfp4Quantize(
 }
 
 /**
+ * 显式选择SwiGLU+NVFP4融合量化版本，仅供算子正确性和性能横向比较。
+ * 正式推理继续调用FastllmCudaSiluMulNvfp4Quantize并固定使用Optimized。
+ */
+bool FastllmCudaSiluMulNvfp4QuantizeVersion(
+        const void *input, fastllm::DataType inputType,
+        uint8_t *output, uint8_t *outputScales,
+        int rows, int hidden, float globalScale,
+        FastllmCudaNvfp4SiluMulVersion version, void *streamPtr) {
+    if (!FastllmNvfp4RuntimeSupported() || input == nullptr || output == nullptr ||
+        outputScales == nullptr || rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
+        !std::isfinite(globalScale) || globalScale <= 0.0f) {
+        return false;
+    }
+    cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
+    if (inputType == fastllm::DataType::FLOAT16) {
+        return version == FastllmCudaNvfp4SiluMulVersion::Baseline
+            ? LaunchSiluMulQuantBaseline<half>(
+                  input, output, outputScales, rows, hidden, hidden,
+                  globalScale, stream)
+            : LaunchSiluMulQuantOptimized<half>(
+                  input, output, outputScales, rows, hidden, hidden,
+                  globalScale, stream);
+    }
+    if (inputType == fastllm::DataType::BFLOAT16) {
+        return version == FastllmCudaNvfp4SiluMulVersion::Baseline
+            ? LaunchSiluMulQuantBaseline<__nv_bfloat16>(
+                  input, output, outputScales, rows, hidden, hidden,
+                  globalScale, stream)
+            : LaunchSiluMulQuantOptimized<__nv_bfloat16>(
+                  input, output, outputScales, rows, hidden, hidden,
+                  globalScale, stream);
+    }
+    return false;
+}
+
+/**
  * 融合执行SwiGLU并把结果动态量化为CUTLASS使用的NVFP4激活布局。
  *
  * 输入的每一行按[gate(hidden), up(hidden)]连续存放。kernel先计算
@@ -279,12 +365,14 @@ bool FastllmCudaSiluMulNvfp4QuantizePadded(
     }
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
     if (inputType == fastllm::DataType::FLOAT16) {
-        return LaunchSiluMulQuant<half>(input, output, outputScales, rows, hidden,
-                                        paddedHidden, globalScale, stream);
+        return LaunchSiluMulQuantOptimized<half>(
+            input, output, outputScales, rows, hidden,
+            paddedHidden, globalScale, stream);
     }
     if (inputType == fastllm::DataType::BFLOAT16) {
-        return LaunchSiluMulQuant<__nv_bfloat16>(input, output, outputScales, rows, hidden,
-                                                 paddedHidden, globalScale, stream);
+        return LaunchSiluMulQuantOptimized<__nv_bfloat16>(
+            input, output, outputScales, rows, hidden,
+            paddedHidden, globalScale, stream);
     }
     return false;
 }

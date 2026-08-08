@@ -575,6 +575,15 @@ bool FastllmCudaNvfp4QuantizeActivationPadded(
     uint8_t *output, uint8_t *outputScales,
     int rows, int columns, int paddedColumns,
     float globalScale, void *streamPtr = nullptr);
+enum class FastllmCudaNvfp4SiluMulVersion {
+    Baseline,
+    Optimized,
+};
+bool FastllmCudaSiluMulNvfp4QuantizeVersion(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int hidden, float globalScale,
+    FastllmCudaNvfp4SiluMulVersion version, void *streamPtr = nullptr);
 bool FastllmCudaSiluMulNvfp4Quantize(
     const void *input, fastllm::DataType inputType,
     uint8_t *output, uint8_t *outputScales,

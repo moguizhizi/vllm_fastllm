@@ -1934,6 +1934,8 @@ namespace {
     struct Nvfp4SwiGLUQuantState {
         int rows = 0, hidden = 0;
         fastllm::DataType inputType = fastllm::DataType::FLOAT16;
+        FastllmCudaNvfp4SiluMulVersion implementation =
+            FastllmCudaNvfp4SiluMulVersion::Optimized;
         fastllm::Data input;
         uint8_t *packed = nullptr;
         uint8_t *scales = nullptr;
@@ -1944,6 +1946,15 @@ namespace {
             hidden = params.GetInt("hidden");
             inputType = params.GetString("input_type") == "bf16"
                 ? fastllm::DataType::BFLOAT16 : fastllm::DataType::FLOAT16;
+            const std::string implementationName = params.GetString("implementation");
+            if (implementationName == "baseline") {
+                implementation = FastllmCudaNvfp4SiluMulVersion::Baseline;
+            } else if (implementationName == "optimized") {
+                implementation = FastllmCudaNvfp4SiluMulVersion::Optimized;
+            } else {
+                throw std::runtime_error(
+                    "nvfp4_swiglu_quant implementation must be baseline or optimized");
+            }
             if (rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
                 (params.GetString("input_type") != "fp16" &&
                  params.GetString("input_type") != "bf16")) {
@@ -1968,9 +1979,9 @@ namespace {
         }
 
         void Run() {
-            if (!FastllmCudaSiluMulNvfp4Quantize(
+            if (!FastllmCudaSiluMulNvfp4QuantizeVersion(
                     input.cudaData, inputType, packed, scales,
-                    rows, hidden, 1.0f, nullptr)) {
+                    rows, hidden, 1.0f, implementation, nullptr)) {
                 throw std::runtime_error("NVFP4 fused SwiGLU quant launch failed");
             }
         }
@@ -2048,6 +2059,8 @@ namespace {
                 params.Add("rows", "32", "flattened token rows");
                 params.Add("hidden", "1024", "post-SwiGLU width, multiple of 32");
                 params.Add("input_type", "fp16", "fp16 or bf16");
+                params.Add("implementation", "optimized",
+                           "baseline or optimized fused CUDA kernel");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
