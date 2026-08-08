@@ -51,6 +51,21 @@ def load_config(path):
     for metric in config["metrics"]:
         if metric.get("goal", "min") not in ("min", "max"):
             raise ValueError(f"metric goal只能是min或max: {metric['name']}")
+    selection = config.get("selection")
+    if selection:
+        candidates = selection.get("candidates", [])
+        reference = selection.get("reference")
+        metric = selection.get("metric")
+        if len(candidates) < 2 or len(candidates) != len(set(candidates)):
+            raise ValueError("selection.candidates至少需要两个不重复的候选版本")
+        if any(name not in names for name in candidates):
+            raise ValueError("selection.candidates包含不存在的implementation")
+        if config["baseline"] not in candidates:
+            raise ValueError("baseline必须属于selection.candidates")
+        if reference not in names or reference in candidates:
+            raise ValueError("selection.reference必须存在且不能属于candidates")
+        if metric not in metric_names:
+            raise ValueError("selection.metric必须是已定义的metric")
     return config
 
 
@@ -64,7 +79,8 @@ def format_value(value, context):
 
 
 def merge_context(config, case, config_path, output_prefix):
-    context = {}
+    # 允许命令直接引用已导出的环境变量，例如{NVFP4_VLLM_PYTHON}。
+    context = dict(os.environ)
     context.update(config.get("variables", {}))
     context.update(case.get("variables", {}))
     context.update(case.get("dimensions", {}))
@@ -197,6 +213,7 @@ def run_benchmarks(config, config_path, output_prefix, args):
     method = args.aggregate or config.get("aggregate", "median")
     if repeat <= 0:
         raise ValueError("repeat必须大于0")
+    keep_going = args.keep_going or bool(config.get("keep_going", False))
     log_dir = output_prefix.parent / f"{output_prefix.name}-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -207,6 +224,7 @@ def run_benchmarks(config, config_path, output_prefix, args):
             "dimensions": case.get("dimensions", {}),
             "implementations": {},
         }
+        execution = {}
         for implementation in implementations:
             name = implementation["name"]
             command = resolve_command(config, case, implementation, context)
@@ -215,32 +233,58 @@ def run_benchmarks(config, config_path, output_prefix, args):
             timeout = case.get("timeout", implementation.get(
                 "timeout", config.get("timeout", None)))
             print(f"[{case['name']}][{name}] {shlex.join(command)}", flush=True)
-            if args.dry_run:
-                case_result["implementations"][name] = {
-                    "status": "dry-run", "command": command, "metrics": {}}
-                continue
-            samples = {metric["name"]: [] for metric in config["metrics"]}
-            status, error = "ok", ""
+            execution[name] = {
+                "implementation": implementation,
+                "command": command,
+                "cwd": cwd,
+                "env": env_overrides,
+                "timeout": timeout,
+                "status": "dry-run" if args.dry_run else "pending",
+                "error": "",
+                "samples": {metric["name"]: [] for metric in config["metrics"]},
+            }
+        if not args.dry_run:
+            # 每轮旋转实现顺序，避免总是先跑baseline造成温度、频率和缓存偏差。
             for index in range(repeat):
-                log_path = log_dir / (
-                    f"{slug(case['name'])}__{slug(name)}__run-{index + 1}.log")
-                returncode, output = run_one(
-                    command, cwd, env_overrides, timeout, log_path)
-                if returncode != 0:
-                    status, error = "failed", f"退出码{returncode}，日志：{log_path}"
-                    break
-                try:
-                    for metric in config["metrics"]:
-                        value = parse_metric(output, metric, implementation)
-                        if value is not None:
-                            samples[metric["name"]].append(value)
-                except ValueError as exception:
-                    status, error = "failed", f"{exception}，日志：{log_path}"
-                    break
+                shift = index % len(implementations)
+                round_order = implementations[shift:] + implementations[:shift]
+                for implementation in round_order:
+                    name = implementation["name"]
+                    state = execution[name]
+                    if state["status"] == "failed":
+                        continue
+                    log_path = log_dir / (
+                        f"{slug(case['name'])}__{slug(name)}__run-{index + 1}.log")
+                    returncode, output = run_one(
+                        state["command"], state["cwd"], state["env"],
+                        state["timeout"], log_path)
+                    if returncode != 0:
+                        state["status"] = "failed"
+                        state["error"] = f"退出码{returncode}，日志：{log_path}"
+                        if not keep_going:
+                            raise RuntimeError(
+                                f"{case['name']}/{name}: {state['error']}")
+                        continue
+                    try:
+                        for metric in config["metrics"]:
+                            value = parse_metric(output, metric, implementation)
+                            if value is not None:
+                                state["samples"][metric["name"]].append(value)
+                    except ValueError as exception:
+                        state["status"] = "failed"
+                        state["error"] = f"{exception}，日志：{log_path}"
+                        if not keep_going:
+                            raise RuntimeError(
+                                f"{case['name']}/{name}: {state['error']}")
+        for implementation in implementations:
+            name = implementation["name"]
+            state = execution[name]
             metrics = {}
-            if status == "ok":
+            if state["status"] == "pending":
+                state["status"] = "ok"
+            if state["status"] == "ok":
                 for metric in config["metrics"]:
-                    values = samples[metric["name"]]
+                    values = state["samples"][metric["name"]]
                     if values:
                         metrics[metric["name"]] = {
                             "value": aggregate(values, method),
@@ -250,20 +294,24 @@ def run_benchmarks(config, config_path, output_prefix, args):
                             "stdev": statistics.pstdev(values) if len(values) > 1 else 0.0,
                         }
             case_result["implementations"][name] = {
-                "status": status,
-                "error": error,
-                "command": command,
+                "status": state["status"],
+                "error": state["error"],
+                "command": state["command"],
                 "metrics": metrics,
             }
-            if status != "ok" and not args.keep_going:
-                raise RuntimeError(f"{case['name']}/{name}: {error}")
         results.append(case_result)
     return results, implementations, repeat, method
 
 
 def comparison_rows(config, results, implementations):
     baseline = config["baseline"]
-    candidates = [item["name"] for item in implementations if item["name"] != baseline]
+    selected_names = {item["name"] for item in implementations}
+    if config.get("selection"):
+        candidates = [name for name in config["selection"]["candidates"]
+                      if name != baseline and name in selected_names]
+    else:
+        candidates = [item["name"] for item in implementations
+                      if item["name"] != baseline]
     rows = []
     for result in results:
         base_result = result["implementations"].get(baseline, {})
@@ -275,18 +323,8 @@ def comparison_rows(config, results, implementations):
                 candidate_metric = candidate_result.get("metrics", {}).get(name)
                 baseline_value = base_metric["value"] if base_metric else None
                 candidate_value = candidate_metric["value"] if candidate_metric else None
-                speedup = None
-                improvement = None
-                if baseline_value is not None and candidate_value is not None:
-                    if metric.get("goal", "min") == "min" and candidate_value != 0:
-                        speedup = baseline_value / candidate_value
-                        if baseline_value != 0:
-                            improvement = ((baseline_value - candidate_value) /
-                                           baseline_value * 100.0)
-                    elif metric.get("goal", "min") == "max" and baseline_value != 0:
-                        speedup = candidate_value / baseline_value
-                        improvement = ((candidate_value - baseline_value) /
-                                       baseline_value * 100.0)
+                speedup, improvement = relative_performance(
+                    metric.get("goal", "min"), baseline_value, candidate_value)
                 rows.append({
                     "case": result["case"],
                     **result["dimensions"],
@@ -300,6 +338,74 @@ def comparison_rows(config, results, implementations):
                     "speedup": speedup,
                     "improvement_pct": improvement,
                 })
+    return rows
+
+
+def relative_performance(goal, baseline_value, candidate_value):
+    """返回candidate相对baseline的加速比和方向归一化优化率。"""
+    if baseline_value is None or candidate_value is None:
+        return None, None
+    if goal == "min":
+        speedup = baseline_value / candidate_value if candidate_value != 0 else None
+        improvement = ((baseline_value - candidate_value) / baseline_value * 100.0
+                       if baseline_value != 0 else None)
+    else:
+        speedup = candidate_value / baseline_value if baseline_value != 0 else None
+        improvement = ((candidate_value - baseline_value) / baseline_value * 100.0
+                       if baseline_value != 0 else None)
+    return speedup, improvement
+
+
+def selection_rows(config, results, implementations):
+    """逐case选择最快候选版本，再与唯一固定reference比较。"""
+    selection = config.get("selection")
+    if not selection:
+        return []
+    available = {item["name"] for item in implementations}
+    candidates = [name for name in selection["candidates"] if name in available]
+    reference = selection["reference"] if selection["reference"] in available else None
+    metric_name = selection["metric"]
+    metric = next(item for item in config["metrics"] if item["name"] == metric_name)
+    goal = metric.get("goal", "min")
+    rows = []
+    for result in results:
+        values = {}
+        rejected = {}
+        for candidate in candidates:
+            item = result["implementations"].get(candidate, {})
+            measured = item.get("metrics", {}).get(metric_name)
+            if item.get("status") == "ok" and measured is not None:
+                values[candidate] = measured["value"]
+            else:
+                rejected[candidate] = item.get("error") or item.get("status", "not-run")
+        winner = None
+        if values:
+            chooser = min if goal == "min" else max
+            winner = chooser(values, key=values.get)
+        reference_value = None
+        if reference is not None:
+            reference_result = result["implementations"].get(reference, {})
+            measured = reference_result.get("metrics", {}).get(metric_name)
+            if reference_result.get("status") == "ok" and measured is not None:
+                reference_value = measured["value"]
+        winner_value = values.get(winner) if winner else None
+        speedup, improvement = relative_performance(
+            goal, reference_value, winner_value)
+        rows.append({
+            "case": result["case"],
+            **result["dimensions"],
+            "metric": metric_name,
+            "unit": metric.get("unit", ""),
+            "goal": goal,
+            "candidate_values": values,
+            "rejected_candidates": rejected,
+            "selected": winner,
+            "selected_value": winner_value,
+            "reference": reference,
+            "reference_value": reference_value,
+            "selected_speedup_vs_reference": speedup,
+            "selected_improvement_pct_vs_reference": improvement,
+        })
     return rows
 
 
@@ -324,12 +430,12 @@ def md_escape(value):
     return display(value).replace("|", "\\|").replace("\n", " ")
 
 
-def make_markdown(config, comparisons, dimensions, repeat, method):
+def make_markdown(config, comparisons, selections, dimensions, repeat, method):
     lines = [
         f"# {config['name']}", "",
         f"> baseline：`{config['baseline']}`；外层重复：{repeat}；聚合：{method}。"
         "Speedup大于1表示candidate更快。", "",
-        "## 汇总", "",
+        "## 候选版本横向汇总", "",
         "| candidate | metric | 有效case | 胜/平/负 | 几何平均speedup | 平均优化率 |",
         "| --- | --- | ---: | ---: | ---: | ---: |",
     ]
@@ -347,7 +453,7 @@ def make_markdown(config, comparisons, dimensions, repeat, method):
         lines.append(
             f"| {md_escape(candidate)} | {md_escape(metric)} | {len(rows)} | "
             f"{wins}/{ties}/{losses} | {geomean:.4f}x | {improvement:+.2f}% |")
-    lines.extend(["", "## 各维度明细", ""])
+    lines.extend(["", "## 候选版本各维度明细", ""])
     columns = ["case", *dimensions, "baseline", "candidate", "metric", "unit",
                "baseline_value", "candidate_value", "speedup", "improvement_pct"]
     lines.append("| " + " | ".join(columns) + " |")
@@ -361,6 +467,35 @@ def make_markdown(config, comparisons, dimensions, repeat, method):
             if row["improvement_pct"] is not None else "-")
         lines.append("| " + " | ".join(
             md_escape(rendered.get(column, "-")) for column in columns) + " |")
+    if selections:
+        lines.extend([
+            "", "## 选优结果与固定参考实现", "",
+            "> 每个case只在candidates中选优；reference不参与选优。", "",
+        ])
+        selection_columns = [
+            "case", *dimensions, "metric", "candidate_values", "selected",
+            "rejected_candidates", "selected_value", "reference", "reference_value",
+            "selected_speedup_vs_reference",
+            "selected_improvement_pct_vs_reference",
+        ]
+        lines.append("| " + " | ".join(selection_columns) + " |")
+        lines.append("| " + " | ".join("---" for _ in selection_columns) + " |")
+        for row in selections:
+            rendered = dict(row)
+            rendered["candidate_values"] = ", ".join(
+                f"{name}={display(value)}"
+                for name, value in row["candidate_values"].items()) or "-"
+            rendered["rejected_candidates"] = ", ".join(
+                row["rejected_candidates"]) or "-"
+            rendered["selected_speedup_vs_reference"] = (
+                f"{row['selected_speedup_vs_reference']:.4f}x"
+                if row["selected_speedup_vs_reference"] is not None else "-")
+            rendered["selected_improvement_pct_vs_reference"] = (
+                f"{row['selected_improvement_pct_vs_reference']:+.2f}%"
+                if row["selected_improvement_pct_vs_reference"] is not None else "-")
+            lines.append("| " + " | ".join(
+                md_escape(rendered.get(column, "-"))
+                for column in selection_columns) + " |")
     lines.append("")
     return "\n".join(lines)
 
@@ -370,9 +505,11 @@ def write_reports(config, config_path, output_prefix, results, implementations,
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     dimensions = all_dimensions(config)
     comparisons = comparison_rows(config, results, implementations)
+    selections = selection_rows(config, results, implementations)
     json_path = Path(str(output_prefix) + ".json")
     results_csv = output_prefix.with_name(output_prefix.name + "-results.csv")
     comparison_csv = output_prefix.with_name(output_prefix.name + "-comparison.csv")
+    selection_csv = output_prefix.with_name(output_prefix.name + "-selection.csv")
     md_path = Path(str(output_prefix) + ".md")
 
     payload = {
@@ -384,6 +521,7 @@ def write_reports(config, config_path, output_prefix, results, implementations,
         "aggregate": method,
         "results": results,
         "comparisons": comparisons,
+        "selections": selections,
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -416,12 +554,33 @@ def write_reports(config, config_path, output_prefix, results, implementations,
         writer.writeheader()
         writer.writerows(comparisons)
 
-    markdown = make_markdown(config, comparisons, dimensions, repeat, method)
+    if selections:
+        selection_columns = [
+            "case", *dimensions, "metric", "unit", "goal", "candidate_values",
+            "rejected_candidates", "selected", "selected_value", "reference", "reference_value",
+            "selected_speedup_vs_reference",
+            "selected_improvement_pct_vs_reference",
+        ]
+        with selection_csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=selection_columns)
+            writer.writeheader()
+            for row in selections:
+                output = dict(row)
+                output["candidate_values"] = json.dumps(
+                    row["candidate_values"], ensure_ascii=False, sort_keys=True)
+                output["rejected_candidates"] = json.dumps(
+                    row["rejected_candidates"], ensure_ascii=False, sort_keys=True)
+                writer.writerow(output)
+
+    markdown = make_markdown(
+        config, comparisons, selections, dimensions, repeat, method)
     md_path.write_text(markdown, encoding="utf-8")
     print(markdown)
     print(f"JSON: {json_path}")
     print(f"CSV明细: {results_csv}")
     print(f"CSV对比: {comparison_csv}")
+    if selections:
+        print(f"CSV选优: {selection_csv}")
     print(f"Markdown: {md_path}")
 
 

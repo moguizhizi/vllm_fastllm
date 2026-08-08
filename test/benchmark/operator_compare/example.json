@@ -1,8 +1,14 @@
 {
   "name": "算子优化前后示例",
   "baseline": "before",
+  "selection": {
+    "candidates": ["before", "after"],
+    "reference": "reference",
+    "metric": "latency_ms"
+  },
   "repeat": 3,
   "aggregate": "median",
+  "keep_going": true,
   "timeout": 60,
   "metrics": [
     {
@@ -34,6 +40,14 @@
         "-lc",
         "echo latency_ms={after_latency}; echo throughput={after_throughput}"
       ]
+    },
+    {
+      "name": "reference",
+      "command": [
+        "bash",
+        "-lc",
+        "echo latency_ms={reference_latency}; echo throughput={reference_throughput}"
+      ]
     }
   ],
   "cases": [
@@ -50,7 +64,9 @@
         "before_latency": 0.02,
         "after_latency": 0.01,
         "before_throughput": 100,
-        "after_throughput": 200
+        "after_throughput": 200,
+        "reference_latency": 0.012,
+        "reference_throughput": 180
       }
     },
     {
@@ -66,7 +82,9 @@
         "before_latency": 0.08,
         "after_latency": 0.06,
         "before_throughput": 400,
-        "after_throughput": 533.33
+        "after_throughput": 533.33,
+        "reference_latency": 0.055,
+        "reference_throughput": 550
       }
     }
   ]

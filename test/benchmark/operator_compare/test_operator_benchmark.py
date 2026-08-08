@@ -35,9 +35,16 @@ class OperatorBenchmarkTest(unittest.TestCase):
             self.assertAlmostEqual(latency["improvement_pct"], 50.0)
             self.assertAlmostEqual(throughput["speedup"], 2.0)
             self.assertAlmostEqual(throughput["improvement_pct"], 100.0)
+            selected = next(row for row in payload["selections"]
+                            if row["case"] == "demo_m1")
+            self.assertEqual(selected["selected"], "after")
+            self.assertEqual(selected["reference"], "reference")
+            self.assertAlmostEqual(
+                selected["selected_speedup_vs_reference"], 1.2)
             self.assertTrue(Path(str(prefix) + ".md").is_file())
             self.assertTrue(prefix.with_name("report-results.csv").is_file())
             self.assertTrue(prefix.with_name("report-comparison.csv").is_file())
+            self.assertTrue(prefix.with_name("report-selection.csv").is_file())
 
     def test_metric_implementation_override(self):
         metric = {
@@ -47,6 +54,32 @@ class OperatorBenchmarkTest(unittest.TestCase):
         }
         implementation = {"name": "vllm"}
         self.assertEqual(MODULE.parse_metric("vllm=1.25", metric, implementation), 1.25)
+
+    def test_selection_rejects_failed_candidate(self):
+        config = {
+            "baseline": "v1",
+            "selection": {
+                "candidates": ["v1", "v2"],
+                "reference": "reference",
+                "metric": "latency_ms",
+            },
+            "metrics": [{"name": "latency_ms", "unit": "ms", "goal": "min"}],
+        }
+        implementations = [{"name": "v1"}, {"name": "v2"}, {"name": "reference"}]
+        results = [{
+            "case": "m1",
+            "dimensions": {"M": 1},
+            "implementations": {
+                "v1": {"status": "ok", "metrics": {"latency_ms": {"value": 2.0}}},
+                "v2": {"status": "failed", "error": "accuracy failed", "metrics": {}},
+                "reference": {
+                    "status": "ok", "metrics": {"latency_ms": {"value": 1.5}}},
+            },
+        }]
+        selected = MODULE.selection_rows(config, results, implementations)[0]
+        self.assertEqual(selected["selected"], "v1")
+        self.assertIn("v2", selected["rejected_candidates"])
+        self.assertAlmostEqual(selected["selected_speedup_vs_reference"], 0.75)
 
 
 if __name__ == "__main__":
