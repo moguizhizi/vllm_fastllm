@@ -28,6 +28,7 @@ python3 test/benchmark/operator_compare/operator_benchmark.py \
 /tmp/operator-report.json
 /tmp/operator-report-results.csv
 /tmp/operator-report-comparison.csv
+/tmp/operator-report-selection.csv
 /tmp/operator-report-logs/*.log
 ```
 
@@ -81,15 +82,18 @@ python3 test/benchmark/operator_compare/operator_benchmark.py \
 | `metrics` | 从输出提取的指标，可配置单位、优化方向和正则 |
 | `implementations` | 被测实现，可指向不同程序、Python环境或Git版本产物 |
 | `cases` | 测试矩阵；`dimensions`会原样进入CSV和Markdown |
+| `selection` | 可选；定义参与选优的候选版本、固定参考实现和选优指标 |
+| `keep_going` | 某个版本正确性或运行失败后继续；选优配置建议设为`true` |
 
 ### 模板变量
 
 命令、工作目录和环境变量支持`{name}`模板。可用变量来自：
 
-1. 顶层`variables`。
-2. 当前case的`variables`。
-3. 当前case的`dimensions`。
-4. 内置的`{case}`、`{config_dir}`、`{repo}`和`{output_prefix}`。
+1. 当前进程已经导出的环境变量。
+2. 顶层`variables`。
+3. 当前case的`variables`。
+4. 当前case的`dimensions`。
+5. 内置的`{case}`、`{config_dir}`、`{repo}`和`{output_prefix}`。
 
 后面的值覆盖前面的同名值。`command`必须写成JSON数组，每一项对应一个命令行
 参数；框架默认不经过shell，避免空格和引号产生歧义。确实需要管道时显式使用：
@@ -150,81 +154,90 @@ goal=max：speedup = candidate / baseline
 
 注意：框架不会自动换算单位。不同实现必须输出相同单位，或由被测命令先完成换算。
 
-## 算子修改前后对比
+## 同一二进制内比较多个算子版本
 
-先分别保存两版构建产物，然后在同一配置中定义两个实现：
+推荐把多个kernel版本同时编入测试程序，通过参数选择函数。生产入口仍固定调用正式
+版本，baseline只供测试。这样只编译一次：
 
 ```json
 "implementations": [
   {
-    "name": "before",
+    "name": "ft_v1",
     "command": [
-      "/opt/fastllm-before/optest", "--op", "linear_nvfp4",
+      "{repo}/optest", "--op", "nvfp4_swiglu_quant",
       "--device", "cuda:0",
-      "--param", "batch={M}", "--param", "in={K}", "--param", "out={N}",
-      "--warmup", "20", "--iters", "200"
+      "--param", "implementation=baseline",
+      "--param", "rows={rows}", "--param", "hidden={hidden}",
+      "--warmup", "100", "--iters", "2000"
     ]
   },
   {
-    "name": "after",
+    "name": "ft_v2",
     "command": [
-      "{repo}/optest", "--op", "linear_nvfp4",
+      "{repo}/optest", "--op", "nvfp4_swiglu_quant",
       "--device", "cuda:0",
-      "--param", "batch={M}", "--param", "in={K}", "--param", "out={N}",
-      "--warmup", "20", "--iters", "200"
+      "--param", "implementation=optimized",
+      "--param", "rows={rows}", "--param", "hidden={hidden}",
+      "--warmup", "100", "--iters", "2000"
     ]
   }
 ]
 ```
 
-case只保存变化的维度：
+将来增加`ft_v3`时，只需增加第三个函数入口和implementation。case只保存变化的维度：
 
 ```json
 "cases": [
-  {"name": "m1", "dimensions": {"M": 1, "N": 4096, "K": 4096, "dtype": "bf16"}},
-  {"name": "m128", "dimensions": {"M": 128, "N": 4096, "K": 4096, "dtype": "bf16"}},
-  {"name": "m256", "dimensions": {"M": 256, "N": 4096, "K": 4096, "dtype": "bf16"}}
+  {"name": "r1_k4096", "dimensions": {"rows": 1, "hidden": 4096}},
+  {"name": "r32_k4096", "dimensions": {"rows": 32, "hidden": 4096}},
+  {"name": "r128_k4096", "dimensions": {"rows": 128, "hidden": 4096}}
 ]
 ```
 
-不要在同一目录反复覆盖`optest`。给不同版本保留不同的绝对路径，才能确保比较的
-确实是两份代码。
+每条`optest`命令先做正确性检查，再进入性能循环。命令失败的版本不会进入选优。
 
-## FastLLM与vLLM对比
+## FastLLM多版本选优后对比固定vLLM
 
-同一套框架只需把实现名称和命令换成FastLLM、vLLM：
+`selection.candidates`只放FastLLM版本；vLLM只作为`reference`，不参与选优：
 
 ```json
 {
-  "baseline": "vLLM",
+  "baseline": "ft_v1",
+  "selection": {
+    "candidates": ["ft_v1", "ft_v2", "ft_v3"],
+    "reference": "vllm",
+    "metric": "latency_ms"
+  },
+  "keep_going": true,
   "implementations": [
     {
-      "name": "vLLM",
-      "command": [
-        "/opt/vllm/bin/python", "/opt/bench/vllm_linear.py",
-        "--m", "{M}", "--n", "{N}", "--k", "{K}", "--dtype", "{dtype}"
-      ],
-      "metric_patterns": {
-        "latency_ms": "vllm_latency_ms=(?P<value>[0-9.eE+-]+)"
-      }
+      "name": "ft_v1",
+      "command": ["{repo}/optest", "--param", "implementation=v1"]
     },
     {
-      "name": "FastLLM",
-      "command": [
-        "{repo}/optest", "--op", "linear_nvfp4", "--device", "cuda:0",
-        "--param", "batch={M}", "--param", "in={K}", "--param", "out={N}",
-        "--param", "input_type={dtype}", "--warmup", "20", "--iters", "200"
-      ],
-      "metric_patterns": {
-        "latency_ms": "latency: avg_ms=(?P<value>[0-9.eE+-]+)"
-      }
+      "name": "ft_v2",
+      "command": ["{repo}/optest", "--param", "implementation=v2"]
+    },
+    {
+      "name": "ft_v3",
+      "command": ["{repo}/optest", "--param", "implementation=v3"]
+    },
+    {
+      "name": "vllm",
+      "command": ["{NVFP4_VLLM_PYTHON}", "/opt/bench/vllm_op.py"]
     }
   ]
 }
 ```
 
-这里`baseline=vLLM`，所以报告中的candidate为FastLLM，speedup含义是FastLLM相对
-vLLM的加速比。框架不要求两个实现在同一个Python环境中。
+每个case先按`selection.metric`从成功的FastLLM candidates中选出最快版本，再计算：
+
+```text
+selected_speedup_vs_reference = vLLM延迟 / FastLLM最优版本延迟
+```
+
+`operator-report-selection.csv`和Markdown最后一节记录所有候选值、被淘汰版本、
+最终版本以及它相对固定vLLM的性能。框架不要求FastLLM与vLLM在同一Python环境。
 
 ## case级覆盖
 
@@ -285,11 +298,47 @@ python3 -m unittest discover \
   -s test/benchmark/operator_compare -p 'test_*.py'
 ```
 
+## 仓库内SwiGLU+NVFP4实例
+
+`test/nvfp4/swiglu_versions_compare.json`已经配置：
+
+```text
+ft_baseline：优化前固定256线程、M补齐128版本
+ft_optimized：当前按GPU占用率调度、只处理真实M版本
+vllm：固定参考实现，不参与选优
+```
+
+执行：
+
+```bash
+export NVFP4_VLLM_PYTHON=/path/to/python-with-vllm
+export REPORT_DIR="$PWD/test/nvfp4/logs/swiglu-versions-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$REPORT_DIR"
+
+python3 test/benchmark/operator_compare/operator_benchmark.py \
+  --config test/nvfp4/swiglu_versions_compare.json \
+  --output-prefix "$REPORT_DIR/swiglu-versions-compare" \
+  2>&1 | tee "$REPORT_DIR/suite-output.log"
+```
+
+也可以直接使用NVFP4测试入口：
+
+```bash
+NVFP4_VLLM_PYTHON=/path/to/python-with-vllm \
+NVFP4_LOG_DIR="$PWD/test/nvfp4/logs/swiglu-versions-$(date -u +%Y%m%dT%H%M%SZ)" \
+  test/nvfp4/run_nvfp4_tests.sh swiglu-versions
+```
+
+配置覆盖rows=1/16/32/64/128及hidden=4096/7168/14336。每个FastLLM版本先由
+`optest`与“普通SwiGLU+独立量化”做正确性比较；失败版本被标记为rejected。成功
+版本按`latency_ms`选优，最后只将胜出版本与vLLM比较。
+
 ## 测试原则
 
-- 两个实现必须使用相同输入shape、dtype、warmup、iters和同步边界。
+- 所有候选版本与参考实现必须使用相同输入shape、dtype、warmup、iters和同步边界。
 - CUDA算子计时前后都应同步GPU；不要把异步kernel启动时间当成执行时间。
-- 修改前后对比必须保留两份独立构建产物。
+- 同一二进制比较多个版本时，每个implementation必须明确调用不同函数。
+- 外层重复会轮转实现执行顺序，降低GPU温度、频率和缓存对固定先后顺序的偏差。
 - 框架层`repeat`用于观察进程级波动；算子内部仍应执行足够多的warmup和iters。
 - 性能测试不要开启会插入同步或打印大量日志的trace开关。
 - 对比GPU算子时固定GPU、功耗模式和系统负载，并记录驱动、CUDA和代码commit。

@@ -76,6 +76,33 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
 输出文件为`operator-performance-compare.{md,csv,json}`；vLLM子进程命令和输出
 保存在`operator-performance-compare-vllm.log`。
 
+SwiGLU+NVFP4还提供同一二进制的多版本选优测试。`baseline`保留优化前固定256线程、
+M补齐128的kernel；`optimized`使用当前按GPU占用率设置grid且只处理真实M的kernel。
+两者都先执行功能检查，再按rows=1/16/32/64/128和
+hidden=4096/7168/14336逐case选出FastLLM最优版本；vLLM只作为固定reference：
+
+```bash
+export NVFP4_VLLM_PYTHON=/path/to/python-with-vllm
+export REPORT_DIR="$PWD/test/nvfp4/logs/swiglu-versions-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$REPORT_DIR"
+
+python3 test/benchmark/operator_compare/operator_benchmark.py \
+  --config test/nvfp4/swiglu_versions_compare.json \
+  --output-prefix "$REPORT_DIR/swiglu-versions-compare" \
+  2>&1 | tee "$REPORT_DIR/suite-output.log"
+```
+
+简化入口：
+
+```bash
+NVFP4_VLLM_PYTHON=/path/to/python-with-vllm \
+NVFP4_LOG_DIR="$PWD/test/nvfp4/logs/swiglu-versions-$(date -u +%Y%m%dT%H%M%SZ)" \
+  test/nvfp4/run_nvfp4_tests.sh swiglu-versions
+```
+
+结果包含`swiglu-versions-compare.{md,json}`、原始结果CSV、候选版本横向CSV、
+最终选优及vLLM对比CSV和每次执行的完整日志。
+
 ## 模型和显卡
 
 - dense W4A4 首选：`nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4`；B200/B300（SM100）或 RTX PRO 6000 Blackwell（SM120，96GB）。
