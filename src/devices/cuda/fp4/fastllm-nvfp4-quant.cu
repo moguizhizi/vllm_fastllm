@@ -72,6 +72,26 @@ FastllmNvfp4QuantKernel(
     }
 }
 
+/**
+ * 融合执行SwiGLU并将结果动态量化为CUTLASS使用的NVFP4激活。
+ *
+ * 每个线程处理一组连续hidden元素：分别读取gate和up，计算
+ * SiLU(gate) * up，再使用globalScale生成E2M1打包值和对应的E4M3
+ * 局部scale。kernel只遍历真实rows；paddedHidden仅决定输出行跨度和
+ * scale布局，越过真实hidden的列写入零值，以满足后续CUTLASS GEMM布局。
+ *
+ * @tparam T          输入元素类型，仅支持half或__nv_bfloat16。
+ * @param input       输入激活，逻辑形状为[rows, 2 * hidden]；每行前半部分
+ *                    为gate，后半部分为up。
+ * @param output      NVFP4 E2M1打包输出，逻辑形状为[rows, paddedHidden]，
+ *                    每两个FP4元素占一个字节。
+ * @param outputScales E4M3局部scale输出，使用CUTLASS要求的swizzle布局。
+ * @param rows        真实激活行数，通常为token数。
+ * @param hidden      SwiGLU输出宽度，即每行gate或up的元素数。
+ * @param paddedHidden 对齐后的输出宽度；不得小于hidden。
+ * @param kTiles      paddedHidden对应的64元素tile数量，用于计算scale地址。
+ * @param globalScale FP32全局scale；与局部scale共同还原量化值。
+ */
 template <typename T>
 __global__ void __launch_bounds__(512, FASTLLM_NVFP4_BLOCKS_PER_SM)
 FastllmSiluMulNvfp4QuantOptimizedKernel(
