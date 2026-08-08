@@ -14,8 +14,41 @@
 
 namespace {
 
+// 与vLLM量化kernel一致：block最多使用512线程，并通过launch bounds限制
+// 单block寄存器占用。SM101/110/120/121每个SM最多1536线程，
+// SM100/103按2048线程计算；每个SM最多请求4个block。
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ == 1010 || __CUDA_ARCH__ == 1100 || \
+     __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+#define FASTLLM_NVFP4_MAX_THREADS_PER_SM 1536
+#else
+#define FASTLLM_NVFP4_MAX_THREADS_PER_SM 2048
+#endif
+#define FASTLLM_NVFP4_BLOCKS_PER_SM \
+    (((FASTLLM_NVFP4_MAX_THREADS_PER_SM / 512) < 4) \
+         ? (FASTLLM_NVFP4_MAX_THREADS_PER_SM / 512) : 4)
+
+static int Nvfp4BlocksPerSm(int blockThreads) {
+    int device = 0;
+    int maxThreadsPerSm = FASTLLM_NVFP4_MAX_THREADS_PER_SM;
+    if (cudaGetDevice(&device) == cudaSuccess) {
+        cudaDeviceGetAttribute(&maxThreadsPerSm,
+                               cudaDevAttrMaxThreadsPerMultiProcessor, device);
+    }
+    return std::min(4, std::max(1, maxThreadsPerSm / std::max(1, blockThreads)));
+}
+
+static int Nvfp4MultiprocessorCount() {
+    int device = 0, count = 1;
+    if (cudaGetDevice(&device) == cudaSuccess) {
+        cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device);
+    }
+    return std::max(1, count);
+}
+
 template <typename T>
-__global__ void FastllmNvfp4QuantKernel(
+__global__ void __launch_bounds__(512, FASTLLM_NVFP4_BLOCKS_PER_SM)
+FastllmNvfp4QuantKernel(
         const T *__restrict__ input, uint8_t *__restrict__ output,
         uint8_t *__restrict__ outputScales, int rows, int columns,
         int paddedColumns,
@@ -40,15 +73,17 @@ __global__ void FastllmNvfp4QuantKernel(
 }
 
 template <typename T>
-__global__ void FastllmSiluMulNvfp4QuantKernel(
+__global__ void __launch_bounds__(512, FASTLLM_NVFP4_BLOCKS_PER_SM)
+FastllmSiluMulNvfp4QuantKernel(
         const T *__restrict__ input, uint8_t *__restrict__ output,
         uint8_t *__restrict__ outputScales, int rows, int hidden,
-        int paddedHidden,
-        int roundedRows, int kTiles, float globalScale) {
+        int paddedHidden, int kTiles, float globalScale) {
     const int pack = blockIdx.y * blockDim.x + threadIdx.x;
     const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
     if (pack >= packs) return;
-    for (int row = blockIdx.x; row < roundedRows; row += gridDim.x) {
+    // scale缓冲区仍按128行分块分配，但融合量化只处理真实输入行。
+    // CUTLASS GEMM的逻辑M就是rows，不会读取M维补齐区域。
+    for (int row = blockIdx.x; row < rows; row += gridDim.x) {
         fastllm_nvfp4::PackedVec<T> gate, up;
         const int element = pack * fastllm_nvfp4::kElementsPerThread;
         const bool valid = row < rows && element < hidden;
@@ -121,11 +156,16 @@ static bool LaunchQuant(const void *input, uint8_t *output, uint8_t *scales,
                         int rows, int columns, int paddedColumns, float globalScale,
                         cudaStream_t stream) {
     const int packs = paddedColumns / fastllm_nvfp4::kElementsPerThread;
-    const int threads = std::min(256, packs);
+    const int realPacks = std::max(1, columns / fastllm_nvfp4::kElementsPerThread);
+    const int threads = std::min(512, realPacks);
     const int roundedRows = (rows + 127) / 128 * 128;
     const int kTiles = (paddedColumns + 63) / 64;
+    const int gridY = (packs + threads - 1) / threads;
+    const int gridX = std::min(
+        roundedRows,
+        std::max(1, Nvfp4MultiprocessorCount() * Nvfp4BlocksPerSm(threads) / gridY));
     dim3 block(threads);
-    dim3 grid(std::min(roundedRows, 128), (packs + threads - 1) / threads);
+    dim3 grid(gridX, gridY);
     FastllmNvfp4QuantKernel<T><<<grid, block, 0, stream>>>(
         static_cast<const T *>(input), output, scales, rows, columns,
         paddedColumns, roundedRows, kTiles, globalScale);
@@ -137,16 +177,23 @@ static bool LaunchSiluMulQuant(const void *input, uint8_t *output, uint8_t *scal
                                int rows, int hidden, int paddedHidden, float globalScale,
                                cudaStream_t stream) {
     const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
-    const int threads = std::min(256, packs);
-    const int roundedRows = (rows + 127) / 128 * 128;
+    const int realPacks = std::max(1, hidden / fastllm_nvfp4::kElementsPerThread);
+    const int threads = std::min(512, realPacks);
     const int kTiles = (paddedHidden + 63) / 64;
+    const int gridY = (packs + threads - 1) / threads;
+    const int gridX = std::min(
+        rows,
+        std::max(1, Nvfp4MultiprocessorCount() * Nvfp4BlocksPerSm(threads) / gridY));
     dim3 block(threads);
-    dim3 grid(std::min(roundedRows, 128), (packs + threads - 1) / threads);
+    dim3 grid(gridX, gridY);
     FastllmSiluMulNvfp4QuantKernel<T><<<grid, block, 0, stream>>>(
         static_cast<const T *>(input), output, scales, rows, hidden,
-        paddedHidden, roundedRows, kTiles, globalScale);
+        paddedHidden, kTiles, globalScale);
     return cudaGetLastError() == cudaSuccess;
 }
+
+#undef FASTLLM_NVFP4_BLOCKS_PER_SM
+#undef FASTLLM_NVFP4_MAX_THREADS_PER_SM
 
 } // namespace
 
