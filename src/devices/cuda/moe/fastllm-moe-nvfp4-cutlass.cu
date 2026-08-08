@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -48,17 +49,65 @@ __global__ void ReduceRoutes(const T *parts, const int *routePositions,
     else output[index] = __float2bfloat16_rn(value);
 }
 
-struct QuantBuffer {
-    uint8_t *values = nullptr;
-    uint8_t *scales = nullptr;
+/**
+ * Grouped NVFP4 MoE在一张GPU、一个调用线程上的持久临时缓冲区。
+ *
+ * 路由表、gather结果以及两层激活量化结果均按需扩容并跨调用复用，避免
+ * 每个token步、每个活跃expert重复cudaMalloc/cudaFree。scratch使用
+ * thread_local隔离CPU调用线程；同一线程再按GPU编号隔离，和
+ * cudaStreamPerThread的生命周期保持一致。
+ */
+struct MoeScratch {
+    int *routeRows = nullptr;
+    int *routePositions = nullptr;
+    float *routeScales = nullptr;
+    uint8_t *gathered = nullptr;
+    uint8_t *gateValues = nullptr;
+    uint8_t *gateScales = nullptr;
+    uint8_t *downValues = nullptr;
+    uint8_t *downScales = nullptr;
+    size_t routeRowsCapacity = 0;
+    size_t routePositionsCapacity = 0;
+    size_t routeScalesCapacity = 0;
+    size_t gatheredCapacity = 0;
+    size_t gateValueCapacity = 0;
+    size_t gateScaleCapacity = 0;
+    size_t downValueCapacity = 0;
+    size_t downScaleCapacity = 0;
 };
 
-static void ReleaseBuffers(std::vector<QuantBuffer> &buffers) {
-    for (auto &buffer : buffers) {
-        FastllmCudaFree(buffer.values);
-        FastllmCudaFree(buffer.scales);
+static thread_local std::map<int, MoeScratch> moeScratch;
+
+template <typename T>
+static bool EnsureScratchBuffer(T *&buffer, size_t &capacity, size_t bytes) {
+    if (buffer != nullptr && capacity >= bytes) return true;
+    T *replacement = static_cast<T *>(FastllmCudaMalloc(bytes));
+    if (replacement == nullptr) return false;
+    if (buffer != nullptr) FastllmCudaFree(buffer);
+    buffer = replacement;
+    capacity = bytes;
+    return true;
+}
+
+/** 获取并扩容当前GPU/线程的MoE scratch；正式计算阶段不再释放。 */
+static MoeScratch *GetMoeScratch(size_t routeCount, size_t gatheredBytes,
+                                 size_t gateValueBytes, size_t gateScaleBytes,
+                                 size_t downValueBytes, size_t downScaleBytes) {
+    const int device = FastllmCudaGetDevice();
+    MoeScratch &scratch = moeScratch[device];
+    const size_t routeBytes = routeCount * sizeof(int);
+    if (!EnsureScratchBuffer(scratch.routeRows, scratch.routeRowsCapacity, routeBytes) ||
+        !EnsureScratchBuffer(scratch.routePositions, scratch.routePositionsCapacity, routeBytes) ||
+        !EnsureScratchBuffer(scratch.routeScales, scratch.routeScalesCapacity,
+                             routeCount * sizeof(float)) ||
+        !EnsureScratchBuffer(scratch.gathered, scratch.gatheredCapacity, gatheredBytes) ||
+        !EnsureScratchBuffer(scratch.gateValues, scratch.gateValueCapacity, gateValueBytes) ||
+        !EnsureScratchBuffer(scratch.gateScales, scratch.gateScaleCapacity, gateScaleBytes) ||
+        !EnsureScratchBuffer(scratch.downValues, scratch.downValueCapacity, downValueBytes) ||
+        !EnsureScratchBuffer(scratch.downScales, scratch.downScaleCapacity, downScaleBytes)) {
+        return nullptr;
     }
-    buffers.clear();
+    return &scratch;
 }
 
 static int MinBatch() {
@@ -125,21 +174,33 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     output.UpdateUnitSize();
     output.Resize(input.dims);
     output.Allocate(false);
-    fastllm::Data gathered;
-    gathered.dataDevice = fastllm::DataDevice::CUDA;
-    gathered.dataDeviceIds = input.dataDeviceIds;
-    gathered.dataType = dtype;
-    gathered.UpdateUnitSize();
-    gathered.Resize({totalTasks, hidden});
-    gathered.Allocate(false);
 
-    int *cudaRouteRows = static_cast<int *>(FastllmCudaMalloc(sizeof(int) * (size_t)totalTasks));
-    int *cudaRoutePositions = static_cast<int *>(FastllmCudaMalloc(sizeof(int) * (size_t)totalTasks));
-    float *cudaRouteScales = static_cast<float *>(FastllmCudaMalloc(sizeof(float) * (size_t)totalTasks));
-    if (!cudaRouteRows || !cudaRoutePositions || !cudaRouteScales) {
-        FastllmCudaFree(cudaRouteRows); FastllmCudaFree(cudaRoutePositions);
-        FastllmCudaFree(cudaRouteScales); return false;
+    // 每个expert的scale布局都会把自身M补齐到128，因此不能只按totalTasks
+    // 计算一块scale大小；先计算各expert在持久scale缓冲区中的独立偏移。
+    std::vector<int> activeExperts;
+    std::vector<size_t> gateScaleOffsets, downScaleOffsets;
+    activeExperts.reserve(experts);
+    gateScaleOffsets.reserve(experts);
+    downScaleOffsets.reserve(experts);
+    size_t gateScaleBytes = 0, downScaleBytes = 0;
+    for (int e = 0; e < experts; ++e) if (expertCounts[e] > 0) {
+        activeExperts.push_back(e);
+        gateScaleOffsets.push_back(gateScaleBytes);
+        downScaleOffsets.push_back(downScaleBytes);
+        gateScaleBytes += FastllmCudaNvfp4SwizzledScaleBytes(expertCounts[e], hidden);
+        downScaleBytes += FastllmCudaNvfp4SwizzledScaleBytes(expertCounts[e], inter);
     }
+    if (activeExperts.empty()) return false;
+
+    MoeScratch *scratch = GetMoeScratch(
+        totalTasks, (size_t)totalTasks * hidden * sizeof(T),
+        (size_t)totalTasks * hidden / 2, gateScaleBytes,
+        (size_t)totalTasks * inter / 2, downScaleBytes);
+    if (scratch == nullptr) return false;
+
+    int *cudaRouteRows = scratch->routeRows;
+    int *cudaRoutePositions = scratch->routePositions;
+    float *cudaRouteScales = scratch->routeScales;
     cudaStream_t stream = cudaStreamPerThread;
     bool ok = cudaMemcpyAsync(cudaRouteRows, routeRows, sizeof(int) * (size_t)totalTasks,
                               cudaMemcpyHostToDevice, stream) == cudaSuccess &&
@@ -151,36 +212,36 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     if (ok && cudaInput) {
         size_t elements = (size_t)totalTasks * hidden;
         GatherRows<<<(elements + 255) / 256, 256, 0, stream>>>(
-            cudaInput, cudaRouteRows, static_cast<T *>(gathered.cudaData), totalTasks, hidden);
+            cudaInput, cudaRouteRows, reinterpret_cast<T *>(scratch->gathered),
+            totalTasks, hidden);
         ok = cudaGetLastError() == cudaSuccess;
     } else ok = false;
 
-    std::vector<QuantBuffer> gateBuffers, downBuffers;
     std::vector<const uint8_t *> a, b, scaleA, scaleB;
     std::vector<const float *> alpha;
     std::vector<void *> d;
     std::vector<int> rows;
-    std::vector<int> activeExperts;
-    for (int e = 0; ok && e < experts; ++e) if (expertCounts[e] > 0) {
+    a.reserve(activeExperts.size()); b.reserve(activeExperts.size());
+    scaleA.reserve(activeExperts.size()); scaleB.reserve(activeExperts.size());
+    alpha.reserve(activeExperts.size()); d.reserve(activeExperts.size());
+    rows.reserve(activeExperts.size());
+    for (size_t i = 0; ok && i < activeExperts.size(); ++i) {
+        const int e = activeExperts[i];
         int count = expertCounts[e], start = expertStarts[e];
-        QuantBuffer quant;
-        quant.values = static_cast<uint8_t *>(FastllmCudaMalloc((size_t)count * hidden / 2));
-        quant.scales = static_cast<uint8_t *>(FastllmCudaMalloc(
-            FastllmCudaNvfp4SwizzledScaleBytes(count, hidden)));
+        uint8_t *quantValues = scratch->gateValues + (size_t)start * hidden / 2;
+        uint8_t *quantScales = scratch->gateScales + gateScaleOffsets[i];
         const uint8_t *weight = nullptr, *weightScales = nullptr;
         const float *weightAlpha = nullptr;
         fastllm::Data &gate = *weights[(e + 1) * 2];
-        ok = quant.values && quant.scales &&
-             FastllmCudaNvfp4QuantizeActivation(
-                 static_cast<T *>(gathered.cudaData) + (size_t)start * hidden,
-                 dtype, quant.values, quant.scales, count, hidden, 1.0f, (void *)stream) &&
+        ok = FastllmCudaNvfp4QuantizeActivation(
+                 reinterpret_cast<T *>(scratch->gathered) + (size_t)start * hidden,
+                 dtype, quantValues, quantScales, count, hidden, 1.0f, (void *)stream) &&
              FastllmCudaPrepareNvfp4W4A4Weight(
                  gate, hidden, inter * 2, &weight, &weightScales, &weightAlpha);
-        gateBuffers.push_back(quant);
         if (ok) {
-            activeExperts.push_back(e); rows.push_back(count);
-            a.push_back(quant.values); b.push_back(weight);
-            scaleA.push_back(quant.scales); scaleB.push_back(weightScales);
+            rows.push_back(count);
+            a.push_back(quantValues); b.push_back(weight);
+            scaleA.push_back(quantScales); scaleB.push_back(weightScales);
             alpha.push_back(weightAlpha);
             d.push_back(static_cast<T *>(w1.cudaData) + (size_t)start * inter * 2);
         }
@@ -198,23 +259,19 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     a.clear(); b.clear(); scaleA.clear(); scaleB.clear(); alpha.clear(); d.clear(); rows.clear();
     for (size_t i = 0; ok && i < activeExperts.size(); ++i) {
         int e = activeExperts[i], count = expertCounts[e], start = expertStarts[e];
-        QuantBuffer quant;
-        quant.values = static_cast<uint8_t *>(FastllmCudaMalloc((size_t)count * inter / 2));
-        quant.scales = static_cast<uint8_t *>(FastllmCudaMalloc(
-            FastllmCudaNvfp4SwizzledScaleBytes(count, inter)));
+        uint8_t *quantValues = scratch->downValues + (size_t)start * inter / 2;
+        uint8_t *quantScales = scratch->downScales + downScaleOffsets[i];
         const uint8_t *weight = nullptr, *weightScales = nullptr;
         const float *weightAlpha = nullptr;
         fastllm::Data &down = *weights[(e + 1) * 2 + 1];
-        ok = quant.values && quant.scales &&
-             FastllmCudaSiluMulNvfp4Quantize(
+        ok = FastllmCudaSiluMulNvfp4Quantize(
                  static_cast<T *>(w1.cudaData) + (size_t)start * inter * 2,
-                 dtype, quant.values, quant.scales, count, inter, 1.0f, (void *)stream) &&
+                 dtype, quantValues, quantScales, count, inter, 1.0f, (void *)stream) &&
              FastllmCudaPrepareNvfp4W4A4Weight(
                  down, inter, hidden, &weight, &weightScales, &weightAlpha);
-        downBuffers.push_back(quant);
         if (ok) {
-            rows.push_back(count); a.push_back(quant.values); b.push_back(weight);
-            scaleA.push_back(quant.scales); scaleB.push_back(weightScales);
+            rows.push_back(count); a.push_back(quantValues); b.push_back(weight);
+            scaleA.push_back(quantScales); scaleB.push_back(weightScales);
             alpha.push_back(weightAlpha);
             d.push_back(static_cast<T *>(w2.cudaData) + (size_t)start * hidden);
         }
@@ -236,10 +293,6 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         ok = cudaGetLastError() == cudaSuccess;
     }
 
-    ReleaseBuffers(gateBuffers);
-    ReleaseBuffers(downBuffers);
-    FastllmCudaFree(cudaRouteRows); FastllmCudaFree(cudaRoutePositions);
-    FastllmCudaFree(cudaRouteScales);
     if (cudaInput) FastllmCudaFinishInput(input, cudaInput);
     return ok;
 }

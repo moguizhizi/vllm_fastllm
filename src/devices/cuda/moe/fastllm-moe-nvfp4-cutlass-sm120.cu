@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <map>
 #include <vector>
 
 // NVCC 12.8会为__global__模板生成host stub。这里必须使用具名namespace，
@@ -85,9 +86,38 @@ __global__ void SetupMetadataSm120(int32_t *shapes, StrideA *strideA,
         cute::make_shape(rows[group], n, k, 1));
 }
 
+/** SM120 grouped GEMM复用的device metadata和CUTLASS workspace。 */
+struct GroupedScratchSm120 {
+    uint8_t *metadata = nullptr;
+    void *workspace = nullptr;
+    size_t metadataCapacity = 0;
+    size_t workspaceCapacity = 0;
+};
+
+static thread_local std::map<int, GroupedScratchSm120> groupedScratchSm120;
+
 template <typename T>
-T *AllocArray(size_t count) {
-    return static_cast<T *>(FastllmCudaMalloc(sizeof(T) * count));
+static bool EnsureBufferSm120(T *&buffer, size_t &capacity, size_t bytes) {
+    if (bytes == 0 || (buffer != nullptr && capacity >= bytes)) return true;
+    T *replacement = static_cast<T *>(FastllmCudaMalloc(bytes));
+    if (replacement == nullptr) return false;
+    if (buffer != nullptr) FastllmCudaFree(buffer);
+    buffer = replacement;
+    capacity = bytes;
+    return true;
+}
+
+static size_t AlignMetadataSm120(size_t offset, size_t alignment) {
+    return (offset + alignment - 1) / alignment * alignment;
+}
+
+/** 获取当前GPU/线程的持久metadata；thread_local防止per-thread stream互相覆盖。 */
+static GroupedScratchSm120 *GetGroupedScratchSm120(size_t metadataBytes) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
+    GroupedScratchSm120 &scratch = groupedScratchSm120[device];
+    return EnsureBufferSm120(
+        scratch.metadata, scratch.metadataCapacity, metadataBytes) ? &scratch : nullptr;
 }
 
 bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
@@ -107,19 +137,46 @@ bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
     using LayoutSFB = Kernel::CollectiveMainloop::InternalLayoutSFB;
     using ScaleConfig = Kernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
-    auto a = AllocArray<const Config::ElementType *>(groups);
-    auto b = AllocArray<const Config::ElementType *>(groups);
-    auto sa = AllocArray<const Config::ElementSFType *>(groups);
-    auto sb = AllocArray<const Config::ElementSFType *>(groups);
-    auto alpha = AllocArray<const float *>(groups);
-    auto d = AllocArray<Config::ElementD *>(groups);
-    auto rows = AllocArray<int>(groups);
-    auto shapes = AllocArray<int32_t>((size_t)groups * 3);
-    auto strideA = AllocArray<StrideA>(groups);
-    auto strideB = AllocArray<StrideB>(groups);
-    auto strideD = AllocArray<StrideD>(groups);
-    auto layoutA = AllocArray<LayoutSFA>(groups);
-    auto layoutB = AllocArray<LayoutSFB>(groups);
+    // 所有device metadata放入一块持久buffer，只在容量增长时重新分配。
+    size_t metadataBytes = 0;
+#define RESERVE_META_SM120(type, count) \
+    do { metadataBytes = AlignMetadataSm120(metadataBytes, alignof(type)); \
+         metadataBytes += sizeof(type) * (size_t)(count); } while (0)
+    RESERVE_META_SM120(const Config::ElementType *, groups); // A
+    RESERVE_META_SM120(const Config::ElementType *, groups); // B
+    RESERVE_META_SM120(const Config::ElementSFType *, groups); // scale A
+    RESERVE_META_SM120(const Config::ElementSFType *, groups); // scale B
+    RESERVE_META_SM120(const float *, groups); // alpha
+    RESERVE_META_SM120(Config::ElementD *, groups); // D
+    RESERVE_META_SM120(int, groups); // rows
+    RESERVE_META_SM120(int32_t, (size_t)groups * 3); // shapes
+    RESERVE_META_SM120(StrideA, groups);
+    RESERVE_META_SM120(StrideB, groups);
+    RESERVE_META_SM120(StrideD, groups);
+    RESERVE_META_SM120(LayoutSFA, groups);
+    RESERVE_META_SM120(LayoutSFB, groups);
+#undef RESERVE_META_SM120
+    GroupedScratchSm120 *scratch = GetGroupedScratchSm120(metadataBytes);
+    if (scratch == nullptr) return false;
+    size_t metadataOffset = 0;
+#define TAKE_META_SM120(name, type, count) \
+    metadataOffset = AlignMetadataSm120(metadataOffset, alignof(type)); \
+    auto name = reinterpret_cast<type *>(scratch->metadata + metadataOffset); \
+    metadataOffset += sizeof(type) * (size_t)(count)
+    TAKE_META_SM120(a, const Config::ElementType *, groups);
+    TAKE_META_SM120(b, const Config::ElementType *, groups);
+    TAKE_META_SM120(sa, const Config::ElementSFType *, groups);
+    TAKE_META_SM120(sb, const Config::ElementSFType *, groups);
+    TAKE_META_SM120(alpha, const float *, groups);
+    TAKE_META_SM120(d, Config::ElementD *, groups);
+    TAKE_META_SM120(rows, int, groups);
+    TAKE_META_SM120(shapes, int32_t, (size_t)groups * 3);
+    TAKE_META_SM120(strideA, StrideA, groups);
+    TAKE_META_SM120(strideB, StrideB, groups);
+    TAKE_META_SM120(strideD, StrideD, groups);
+    TAKE_META_SM120(layoutA, LayoutSFA, groups);
+    TAKE_META_SM120(layoutB, LayoutSFB, groups);
+#undef TAKE_META_SM120
     std::vector<const Config::ElementType *> castA(groups), castB(groups);
     std::vector<const Config::ElementSFType *> castSA(groups), castSB(groups);
     std::vector<Config::ElementD *> castD(groups);
@@ -130,8 +187,7 @@ bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
         castSB[i] = reinterpret_cast<const Config::ElementSFType *>(hostScaleB[i]);
         castD[i] = static_cast<Config::ElementD *>(hostD[i]);
     }
-    bool ok = a && b && sa && sb && alpha && d && rows && shapes &&
-              strideA && strideB && strideD && layoutA && layoutB;
+    bool ok = true;
 #define COPY_META(dst, src, bytes) \
     do { if (ok) ok = cudaMemcpyAsync((dst), (src), (bytes), cudaMemcpyHostToDevice, stream) == cudaSuccess; } while (0)
     COPY_META(a, castA.data(), sizeof(void *) * groups);
@@ -150,7 +206,6 @@ bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
         ok = cudaGetLastError() == cudaSuccess;
     }
 
-    void *workspace = nullptr;
     if (ok) {
         typename Kernel::MainloopArguments mainloop{
             a, strideA, b, strideB, sa, layoutA, sb, layoutB};
@@ -172,18 +227,13 @@ bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
             mainloop, epilogue, hw, scheduler};
         Gemm gemm;
         size_t workspaceBytes = Gemm::get_workspace_size(args);
-        workspace = workspaceBytes ? FastllmCudaMalloc(workspaceBytes) : nullptr;
-        ok = (workspaceBytes == 0 || workspace != nullptr) &&
+        ok = EnsureBufferSm120(
+                 scratch->workspace, scratch->workspaceCapacity, workspaceBytes) &&
              gemm.can_implement(args) == cutlass::Status::kSuccess &&
-             gemm.initialize(args, workspace, stream) == cutlass::Status::kSuccess &&
-             gemm.run(args, workspace, stream) == cutlass::Status::kSuccess &&
+             gemm.initialize(args, scratch->workspace, stream) == cutlass::Status::kSuccess &&
+             gemm.run(args, scratch->workspace, stream) == cutlass::Status::kSuccess &&
              cudaGetLastError() == cudaSuccess;
     }
-    FastllmCudaFree(workspace);
-    FastllmCudaFree(a); FastllmCudaFree(b); FastllmCudaFree(sa); FastllmCudaFree(sb);
-    FastllmCudaFree(alpha); FastllmCudaFree(d); FastllmCudaFree(rows);
-    FastllmCudaFree(shapes); FastllmCudaFree(strideA); FastllmCudaFree(strideB);
-    FastllmCudaFree(strideD); FastllmCudaFree(layoutA); FastllmCudaFree(layoutB);
     return ok;
 }
 } // namespace fastllm_nvfp4_moe_sm120
