@@ -280,6 +280,15 @@ run_model() {
         --decode-max-tokens 64
 }
 
+run_swiglu_versions() {
+    local vllm_python=${NVFP4_VLLM_PYTHON:-python3}
+    run_logged swiglu_versions_compare env \
+        NVFP4_VLLM_PYTHON="${vllm_python}" \
+        python3 test/benchmark/operator_compare/operator_benchmark.py \
+        --config test/nvfp4/swiglu_versions_compare.json \
+        --output-prefix "${log_dir}/swiglu-versions-compare"
+}
+
 resolve_gpu_profile
 
 case "${suite}" in
@@ -290,8 +299,9 @@ case "${suite}" in
     ops) run_ops ;;
     forward) run_forward ;;
     model-performance|model) run_model ;;
+    swiglu-versions|swiglu-compare) run_swiglu_versions ;;
     all) run_build; run_ops_functional; run_ops_compare; run_forward; run_model ;;
-    *) echo "usage: $0 {build|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}; NVFP4_GPU_PROFILE=auto|sm100|sm120|preblackwell" >&2; exit 2 ;;
+    *) echo "usage: $0 {build|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|swiglu-versions|all}; NVFP4_GPU_PROFILE=auto|sm100|sm120|preblackwell" >&2; exit 2 ;;
 esac
 
 printf 'Logs: %s\n' "${log_dir}"
