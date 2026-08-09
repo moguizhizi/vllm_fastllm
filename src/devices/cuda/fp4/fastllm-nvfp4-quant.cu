@@ -46,6 +46,61 @@ static int Nvfp4MultiprocessorCount() {
     return std::max(1, count);
 }
 
+/**
+ * 保存SwiGLU+NVFP4第三版热路径所需的单GPU启动属性。
+ *
+ * 属性由当前CPU线程首次访问某块GPU时从CUDA Runtime读取。后续调用直接
+ * 复用缓存，避免为每次融合量化重复查询计算能力、SM数量和每SM线程上限。
+ * 缓存只影响host侧启动参数，不保存张量或CUDA显存。
+ */
+struct Nvfp4CachedLaunchProperties {
+    int device = -1;
+    int arch = 0;
+    int multiprocessorCount = 1;
+    int maxThreadsPerSm = FASTLLM_NVFP4_MAX_THREADS_PER_SM;
+};
+
+/**
+ * 取得当前GPU的SwiGLU+NVFP4启动属性，并在CPU线程内缓存查询结果。
+ *
+ * 同一推理线程通常固定使用一块GPU，因此命中缓存后只需确认当前device，
+ * 不再重复执行cudaDeviceGetAttribute。线程切换GPU时重新读取属性，避免把
+ * 一块GPU的grid配置错误用于另一块GPU；CUDA查询失败时不更新缓存。
+ *
+ * @param properties 返回当前GPU编号、计算能力、SM数量和每SM线程上限。
+ * @return 属性读取成功且GPU计算能力位于SM100至SM129时返回true；否则
+ *         返回false，调用方不得启动NVFP4融合kernel。
+ */
+static bool GetCachedNvfp4LaunchProperties(
+        Nvfp4CachedLaunchProperties &properties) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+
+    static thread_local Nvfp4CachedLaunchProperties cached;
+    if (cached.device != device) {
+        // GPU发生变化时一次性读取所有启动属性；只有全部成功才发布缓存。
+        int major = 0, minor = 0, multiprocessorCount = 1;
+        int maxThreadsPerSm = FASTLLM_NVFP4_MAX_THREADS_PER_SM;
+        if (cudaDeviceGetAttribute(
+                &major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(
+                &minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(
+                &multiprocessorCount, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(
+                &maxThreadsPerSm,
+                cudaDevAttrMaxThreadsPerMultiProcessor, device) != cudaSuccess) {
+            return false;
+        }
+        cached.device = device;
+        cached.arch = major * 10 + minor;
+        cached.multiprocessorCount = std::max(1, multiprocessorCount);
+        cached.maxThreadsPerSm = std::max(1, maxThreadsPerSm);
+    }
+    properties = cached;
+    return properties.arch >= 100 && properties.arch < 130;
+}
+
 template <typename T>
 __global__ void __launch_bounds__(512, FASTLLM_NVFP4_BLOCKS_PER_SM)
 FastllmNvfp4QuantKernel(
@@ -244,6 +299,59 @@ static bool LaunchSiluMulQuantOptimized(
     return cudaGetLastError() == cudaSuccess;
 }
 
+/**
+ * 使用缓存的GPU属性启动第三版SwiGLU+NVFP4融合量化。
+ *
+ * device kernel与Optimized版本相同，差异只在host热路径：SM数量和线程上限
+ * 由调用方缓存后传入，避免每次启动重复查询CUDA设备属性；每个CPU线程在
+ * 某块GPU上的首次启动检查一次同步launch错误，后续异步错误由调用方在
+ * 结果依赖或显式同步边界取得。该函数不分配显存，也不执行流同步。
+ *
+ * @tparam T           输入元素类型，仅支持half或__nv_bfloat16。
+ * @param input        输入激活，逻辑形状为[rows, 2 * hidden]。
+ * @param output       打包E2M1输出，容量至少为rows * paddedHidden / 2字节。
+ * @param scales       CUTLASS swizzle布局的E4M3局部scale输出。
+ * @param rows         真实激活行数，通常为token数。
+ * @param hidden       SwiGLU输出宽度。
+ * @param paddedHidden 对齐后的输出宽度，不得小于hidden。
+ * @param globalScale  激活动态量化使用的正数FP32全局scale。
+ * @param properties   当前GPU已缓存的启动属性。
+ * @param stream       异步启动kernel所使用的CUDA流。
+ * @return 启动参数有效且首次launch检查成功时返回true；后续异步错误由
+ *         调用方通过CUDA同步接口取得。
+ */
+template <typename T>
+static bool LaunchSiluMulQuantCached(
+        const void *input, uint8_t *output, uint8_t *scales,
+        int rows, int hidden, int paddedHidden, float globalScale,
+        const Nvfp4CachedLaunchProperties &properties,
+        cudaStream_t stream) {
+    const int packs = paddedHidden / fastllm_nvfp4::kElementsPerThread;
+    const int realPacks = std::max(1, hidden / fastllm_nvfp4::kElementsPerThread);
+    const int threads = std::min(512, realPacks);
+    const int kTiles = (paddedHidden + 63) / 64;
+    const int gridY = (packs + threads - 1) / threads;
+    const int blocksPerSm = std::min(
+        4, std::max(1, properties.maxThreadsPerSm / std::max(1, threads)));
+    const int gridX = std::min(
+        rows,
+        std::max(1, properties.multiprocessorCount * blocksPerSm / gridY));
+    dim3 block(threads);
+    dim3 grid(gridX, gridY);
+    FastllmSiluMulNvfp4QuantOptimizedKernel<T><<<grid, block, 0, stream>>>(
+        static_cast<const T *>(input), output, scales, rows, hidden,
+        paddedHidden, kTiles, globalScale);
+
+    // 首次在该GPU启动时检查配置错误；benchmark warmup完成后不再让
+    // cudaGetLastError进入每次迭代的host计时路径。
+    static thread_local int validatedDevice = -1;
+    if (validatedDevice != properties.device) {
+        if (cudaGetLastError() != cudaSuccess) return false;
+        validatedDevice = properties.device;
+    }
+    return true;
+}
+
 /** 启动优化前的固定256线程、M补齐128版本，仅用于benchmark。 */
 template <typename T>
 static bool LaunchSiluMulQuantBaseline(
@@ -314,20 +422,57 @@ bool FastllmCudaSiluMulNvfp4Quantize(
 }
 
 /**
- * 显式选择SwiGLU+NVFP4融合量化版本，仅供算子正确性和性能横向比较。
- * 正式推理继续调用FastllmCudaSiluMulNvfp4Quantize并固定使用Optimized。
+ * 显式选择一个SwiGLU+NVFP4融合量化版本并异步启动计算。
+ *
+ * 本接口只用于同一二进制内的算子正确性和性能横向比较，不改变正式推理
+ * 使用的版本。Baseline保留旧启动策略，Optimized只处理真实M并按GPU占用
+ * 率设置grid，Cached在Optimized基础上缓存GPU启动属性并移除稳定热路径的
+ * 重复launch检查。三个版本生成相同的E2M1数据和E4M3 swizzle scale布局。
+ *
+ * 输入和输出的数学语义为：output = NVFP4Quantize(SiLU(gate) * up)，其中
+ * input逻辑形状为[rows, 2 * hidden]，output逻辑形状为[rows, hidden]。
+ * kernel异步错误由测试框架在结果拷贝或显式同步时取得。
+ *
+ * @param input       FP16或BF16输入，逻辑形状为[rows, 2 * hidden]。
+ * @param inputType   输入类型，仅支持FLOAT16和BFLOAT16。
+ * @param output      打包E2M1输出，每两个FP4元素占一个字节。
+ * @param outputScales CUTLASS swizzle布局的E4M3局部scale输出。
+ * @param rows        输入行数，通常为本次参与计算的token数。
+ * @param hidden      SwiGLU输出宽度，必须是32的倍数。
+ * @param globalScale 激活动态量化使用的正数FP32全局scale。
+ * @param version     待测试的Baseline、Optimized或Cached版本。
+ * @param streamPtr   CUDA流指针；为空时使用默认流。
+ * @return 参数、GPU能力和对应版本的kernel启动成功时返回true；否则返回
+ *         false，异步执行错误需由调用方同步后取得。
  */
 bool FastllmCudaSiluMulNvfp4QuantizeVersion(
         const void *input, fastllm::DataType inputType,
         uint8_t *output, uint8_t *outputScales,
         int rows, int hidden, float globalScale,
         FastllmCudaNvfp4SiluMulVersion version, void *streamPtr) {
-    if (!FastllmNvfp4RuntimeSupported() || input == nullptr || output == nullptr ||
-        outputScales == nullptr || rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
+    if (input == nullptr || output == nullptr || outputScales == nullptr ||
+        rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
         !std::isfinite(globalScale) || globalScale <= 0.0f) {
         return false;
     }
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
+    if (version == FastllmCudaNvfp4SiluMulVersion::Cached) {
+        Nvfp4CachedLaunchProperties properties;
+        if (!GetCachedNvfp4LaunchProperties(properties)) return false;
+        if (inputType == fastllm::DataType::FLOAT16) {
+            return LaunchSiluMulQuantCached<half>(
+                input, output, outputScales, rows, hidden, hidden,
+                globalScale, properties, stream);
+        }
+        if (inputType == fastllm::DataType::BFLOAT16) {
+            return LaunchSiluMulQuantCached<__nv_bfloat16>(
+                input, output, outputScales, rows, hidden, hidden,
+                globalScale, properties, stream);
+        }
+        return false;
+    }
+    // 保留旧版本原有的逐次能力检查，使多版本benchmark只比较指定改动。
+    if (!FastllmNvfp4RuntimeSupported()) return false;
     if (inputType == fastllm::DataType::FLOAT16) {
         return version == FastllmCudaNvfp4SiluMulVersion::Baseline
             ? LaunchSiluMulQuantBaseline<half>(

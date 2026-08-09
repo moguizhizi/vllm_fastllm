@@ -578,6 +578,7 @@ bool FastllmCudaNvfp4QuantizeActivationPadded(
 enum class FastllmCudaNvfp4SiluMulVersion {
     Baseline,
     Optimized,
+    Cached,
 };
 bool FastllmCudaSiluMulNvfp4QuantizeVersion(
     const void *input, fastllm::DataType inputType,
