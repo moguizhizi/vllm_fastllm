@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""使用同一组token ID分时测试FastLLM和vLLM整体性能。"""
+"""通过相同HTTP接口和Token ID对比FastLLM与vLLM整体模型性能。"""
 
 import argparse
 import csv
-import ctypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
@@ -18,13 +17,16 @@ import requests
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
+MODES = ("eager", "best")
+SCENARIOS = ("cold", "cache_hit")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="NVFP4 vLLM/FastLLM严格整体性能对比")
     parser.add_argument("--model", required=True)
     parser.add_argument("--result-dir", required=True)
-    parser.add_argument("--vllm-python", default=os.environ.get("NVFP4_VLLM_PYTHON", sys.executable))
+    parser.add_argument("--vllm-python", default=os.environ.get(
+        "NVFP4_VLLM_PYTHON", sys.executable))
     parser.add_argument("--fastllm-python", default=sys.executable)
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
@@ -38,15 +40,12 @@ def parse_args():
         help="逗号分隔的decode batch矩阵；为空时使用--decode-batch-size")
     parser.add_argument("--decode-max-tokens", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--startup-timeout", type=int, default=1200)
     parser.add_argument("--request-timeout", type=int, default=3600)
-    parser.add_argument("--stage", choices=("orchestrate", "fastllm"),
-                        default="orchestrate", help=argparse.SUPPRESS)
-    parser.add_argument("--prompt-token-file", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--output", default="", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -73,27 +72,11 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def run_logged(command, log_path, env=None):
-    print(f"SUBPROCESS COMMAND: {shlex.join(command)}", flush=True)
-    with Path(log_path).open("w", encoding="utf-8") as log:
-        log.write(f"COMMAND: {shlex.join(command)}\n\n")
-        process = subprocess.Popen(
-            command, cwd=REPO_DIR, env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1)
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log.write(line)
-        status = process.wait()
-    if status != 0:
-        raise subprocess.CalledProcessError(status, command)
-
-
 def render_prompt_tokens(tokenizer, target_tokens, label):
-    """生成完整Chat Prompt，并用有效上下文token补到指定长度。"""
+    """生成指定长度Prompt；label位于开头，确保Cold用例不能命中同一前缀页。"""
     messages = [{
         "role": "user",
-        "content": f"这是{label}性能测试。请基于前面的上下文继续回答。",
+        "content": f"{label}。请基于后续上下文继续回答。",
     }]
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     try:
@@ -103,8 +86,7 @@ def render_prompt_tokens(tokenizer, target_tokens, label):
         prompt = tokenizer.apply_chat_template(messages, **kwargs)
     base_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if len(base_ids) > target_tokens:
-        raise ValueError(
-            f"{label}目标长度{target_tokens}小于基础Chat Prompt长度{len(base_ids)}")
+        raise ValueError(f"目标长度{target_tokens}小于基础Prompt长度{len(base_ids)}")
     filler = tokenizer.encode(
         " FastLLM vLLM shared benchmark context block.",
         add_special_tokens=False)
@@ -112,32 +94,65 @@ def render_prompt_tokens(tokenizer, target_tokens, label):
         raise RuntimeError("上下文填充文本未产生token")
     missing = target_tokens - len(base_ids)
     fill_ids = (filler * ((missing + len(filler) - 1) // len(filler)))[:missing]
-    # 保留Chat Template的结尾，在assistant生成前缀之前插入上下文token。
     token_ids = base_ids[:-1] + fill_ids + base_ids[-1:] if base_ids else fill_ids
     if len(token_ids) != target_tokens:
-        raise AssertionError("固定Prompt token长度构造失败")
-    return token_ids, prompt
+        raise AssertionError("固定Prompt Token长度构造失败")
+    return token_ids
+
+
+def case_specs(args):
+    return [
+        ("prefill", 1, args.prefill_input_tokens, args.prefill_max_tokens),
+        *[("decode", batch, args.decode_input_tokens, args.decode_max_tokens)
+          for batch in decode_batch_cases(args)],
+    ]
 
 
 def build_shared_prompts(args, result_dir):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    prefill_ids, prefill_prompt = render_prompt_tokens(
-        tokenizer, args.prefill_input_tokens, "Prefill")
-    decode_ids, decode_prompt = render_prompt_tokens(
-        tokenizer, args.decode_input_tokens, "Decode")
+    cases = {}
+    for workload, batch, input_length, output_length in case_specs(args):
+        case_id = f"{workload}_b{batch}"
+        cold_warmup = render_prompt_tokens(
+            tokenizer, input_length, f"{case_id} cold warmup")
+        cold_trials = [
+            render_prompt_tokens(
+                tokenizer, input_length, f"{case_id} cold measured trial {index}")
+            for index in range(args.repeats)
+        ]
+        cache_tokens = render_prompt_tokens(
+            tokenizer, input_length, f"{case_id} cache hit")
+        first_differences = []
+        for trial in cold_trials:
+            difference = next(
+                (index for index, pair in enumerate(zip(cold_warmup, trial))
+                 if pair[0] != pair[1]), input_length)
+            first_differences.append(difference)
+        # 差异必须落在Prompt开头，不能让Cold用例复用完整的Paged KV页。
+        if any(index >= 128 for index in first_differences):
+            raise RuntimeError(f"{case_id}的Cold Prompt公共前缀过长")
+        cases[case_id] = {
+            "workload": workload,
+            "batch": batch,
+            "input_length": input_length,
+            "output_length": output_length,
+            "cold": {
+                "warmup_token_ids": cold_warmup,
+                "trial_token_ids": cold_trials,
+                "first_difference_from_warmup": first_differences,
+            },
+            "cache_hit": {
+                "warmup_token_ids": cache_tokens,
+                "trial_token_ids": [cache_tokens for _ in range(args.repeats)],
+            },
+        }
     payload = {
         "model": args.model,
         "tokenizer": type(tokenizer).__name__,
-        "prefill": {
-            "token_ids": prefill_ids,
-            "prompt_preview": prefill_prompt[:200],
-        },
-        "decode": {
-            "token_ids": decode_ids,
-            "prompt_preview": decode_prompt[:200],
-        },
+        "repeats": args.repeats,
+        "cases": cases,
     }
     path = result_dir / "shared-prompt-token-ids.json"
     write_json(path, payload)
@@ -148,8 +163,8 @@ def mean_or_none(values):
     return statistics.mean(values) if values else None
 
 
-def summarize_requests(backend, workload, batch, input_tokens, target_output_tokens,
-                       requests_data, batch_start, batch_end):
+def summarize_requests(backend, mode, scenario, workload, batch, input_tokens,
+                       target_output_tokens, requests_data, batch_start, batch_end):
     ttfts = []
     tpots = []
     itls = []
@@ -160,19 +175,30 @@ def summarize_requests(backend, workload, batch, input_tokens, target_output_tok
         if token_times:
             ttfts.append(token_times[0] - item["start_time"])
         if len(token_times) > 1:
-            tpots.append((item["end_time"] - token_times[0]) / (len(token_times) - 1))
+            tpots.append(
+                (item["end_time"] - token_times[0]) / (len(token_times) - 1))
             itls.extend(
                 token_times[index] - token_times[index - 1]
                 for index in range(1, len(token_times)))
     total_output_tokens = sum(item["output_tokens"] for item in requests_data)
+    cached_values = [item["cached_input_tokens"] for item in requests_data
+                     if item["cached_input_tokens"] is not None]
+    total_cached_tokens = sum(cached_values) if cached_values else None
+    total_prompt_tokens = len(input_tokens) * batch
     wall = batch_end - batch_start
     ttft_avg = mean_or_none(ttfts)
     return {
+        "mode": mode,
+        "scenario": scenario,
         "workload": workload,
         "backend": backend,
         "batch": batch,
         "prompt_tokens_per_request": len(input_tokens),
-        "total_prompt_tokens": len(input_tokens) * batch,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_cached_prompt_tokens": total_cached_tokens,
+        "cache_hit_ratio": (
+            total_cached_tokens / total_prompt_tokens
+            if total_cached_tokens is not None and total_prompt_tokens else None),
         "target_output_tokens_per_request": target_output_tokens,
         "total_output_tokens": total_output_tokens,
         "ttft_s": ttft_avg,
@@ -188,124 +214,7 @@ def summarize_requests(backend, workload, batch, input_tokens, target_output_tok
     }
 
 
-def launch_fastllm_request(model, input_tokens, output_tokens):
-    from ftllm import llm
-
-    token_buffer = (ctypes.c_int * len(input_tokens))(*input_tokens)
-    empty_stops = (ctypes.c_int * 0)()
-    return llm.fastllm_lib.launch_response_llm_model(
-        model.model, len(input_tokens), token_buffer,
-        ctypes.c_int(output_tokens), ctypes.c_int(0), ctypes.c_bool(False),
-        ctypes.c_float(1.0), ctypes.c_int(1), ctypes.c_float(1.0),
-        ctypes.c_float(1.0), ctypes.c_bool(False), ctypes.c_int(0), empty_stops)
-
-
-def run_fastllm_batch(model, workload, input_tokens, output_tokens, batch):
-    from ftllm import llm
-
-    requests_data = []
-    batch_start = time.perf_counter()
-    for request_id in range(batch):
-        start_time = time.perf_counter()
-        handle = launch_fastllm_request(model, input_tokens, output_tokens)
-        requests_data.append({
-            "request_id": request_id,
-            "handle": handle,
-            "start_time": start_time,
-            "end_time": None,
-            "token_times": [],
-            "output_tokens": 0,
-            "finish_code": None,
-        })
-    pending = set(range(batch))
-    while pending:
-        progressed = False
-        for index in list(pending):
-            item = requests_data[index]
-            if not llm.fastllm_lib.can_fetch_response_llm_model(model.model, item["handle"]):
-                continue
-            token = llm.fastllm_lib.fetch_response_llm_model(model.model, item["handle"])
-            now = time.perf_counter()
-            progressed = True
-            if token <= -1:
-                item["end_time"] = now
-                item["finish_code"] = token
-                pending.remove(index)
-            else:
-                item["token_times"].append(now)
-                item["output_tokens"] += 1
-        if not progressed:
-            time.sleep(0.0005)
-    batch_end = max(item["end_time"] for item in requests_data)
-    for item in requests_data:
-        item.pop("handle")
-    return summarize_requests(
-        "FastLLM", workload, batch, input_tokens, output_tokens,
-        requests_data, batch_start, batch_end)
-
-
-def run_fastllm_stage(args):
-    from ftllm import llm
-
-    prompts = read_json(args.prompt_token_file)
-    batches = decode_batch_cases(args)
-    llm.set_device_map(args.flm_device)
-    llm.set_device_map(args.flm_device, True)
-    model = llm.model(args.model, dtype=args.flm_dtype)
-    try:
-        model.set_atype(args.flm_atype)
-        model.set_max_batch(max(batches))
-        model.warmup()
-        cases = [
-            ("prefill", prompts["prefill"]["token_ids"], args.prefill_max_tokens, 1),
-            *[("decode", prompts["decode"]["token_ids"],
-               args.decode_max_tokens, batch) for batch in batches],
-        ]
-        results = []
-        for workload, token_ids, output_tokens, batch in cases:
-            for _ in range(args.warmup):
-                run_fastllm_batch(
-                    model, "warmup", token_ids, min(output_tokens, 8), batch)
-            result = run_fastllm_batch(
-                model, workload, token_ids, output_tokens, batch)
-            print(json.dumps(result, ensure_ascii=False), flush=True)
-            results.append(result)
-        write_json(args.output, results)
-    finally:
-        model.release_memory()
-
-
-def wait_server(base_url, process, timeout, server_log):
-    deadline = time.time() + timeout
-    last_error = ""
-    while time.time() < deadline:
-        if process.poll() is not None:
-            tail = Path(server_log).read_text(
-                encoding="utf-8", errors="replace")[-8000:]
-            raise RuntimeError(
-                f"vLLM服务提前退出，code={process.returncode}\n{tail}")
-        try:
-            response = requests.get(f"{base_url}/v1/models", timeout=2)
-            if response.status_code == 200:
-                return
-            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-        except requests.RequestException as error:
-            last_error = str(error)
-        time.sleep(1)
-    raise TimeoutError(f"等待vLLM启动超时: {last_error}")
-
-
-def stop_process(process):
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
-
-
-def run_vllm_request(base_url, model_name, input_tokens, output_tokens,
+def run_http_request(base_url, model_name, input_tokens, output_tokens,
                      request_timeout, request_id):
     payload = {
         "model": model_name,
@@ -328,7 +237,9 @@ def run_vllm_request(base_url, model_name, input_tokens, output_tokens,
     token_times = []
     returned_prompt_ids = None
     usage = {}
-    for raw_line in response.iter_lines(decode_unicode=True):
+    # 使用最小流式读取粒度，避免FastLLM/vLLM的SSE chunk大小不同导致客户端
+    # 把多个Token攒到一起后再记录时间。
+    for raw_line in response.iter_lines(chunk_size=1, decode_unicode=True):
         if not raw_line or not raw_line.startswith("data:"):
             continue
         data = raw_line[5:].strip()
@@ -347,31 +258,34 @@ def run_vllm_request(base_url, model_name, input_tokens, output_tokens,
         token_times.extend([now] * len(delta_ids))
     end_time = time.perf_counter()
     if returned_prompt_ids != input_tokens:
-        raise RuntimeError(
-            f"vLLM请求{request_id}的prompt token IDs与共享输入不一致")
+        raise RuntimeError(f"请求{request_id}返回的Prompt Token ID不一致")
     output_count = int(usage.get("completion_tokens") or len(token_times))
-    if output_count != len(token_times):
+    if output_count != len(token_times) or output_count != output_tokens:
         raise RuntimeError(
-            f"vLLM请求{request_id}流式token数{len(token_times)}与usage中的"
-            f"{output_count}不一致")
+            f"请求{request_id}应输出{output_tokens}个Token，流式收到"
+            f"{len(token_times)}个，usage报告{output_count}个")
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    cached_input_tokens = prompt_details.get("cached_tokens")
+    if cached_input_tokens is not None:
+        cached_input_tokens = int(cached_input_tokens)
     return {
         "request_id": request_id,
         "start_time": start_time,
         "end_time": end_time,
         "token_times": token_times,
         "output_tokens": output_count,
-        "finish_code": -1,
+        "cached_input_tokens": cached_input_tokens,
     }
 
 
-def run_vllm_batch(base_url, model_name, workload, input_tokens, output_tokens,
-                   batch, request_timeout):
+def run_http_batch(base_url, model_name, backend, mode, scenario, workload,
+                   input_tokens, output_tokens, batch, request_timeout):
     batch_start = time.perf_counter()
     requests_data = []
     with ThreadPoolExecutor(max_workers=batch) as executor:
         futures = [
             executor.submit(
-                run_vllm_request, base_url, model_name, input_tokens,
+                run_http_request, base_url, model_name, input_tokens,
                 output_tokens, request_timeout, request_id)
             for request_id in range(batch)
         ]
@@ -380,62 +294,149 @@ def run_vllm_batch(base_url, model_name, workload, input_tokens, output_tokens,
     requests_data.sort(key=lambda item: item["request_id"])
     batch_end = max(item["end_time"] for item in requests_data)
     return summarize_requests(
-        "vLLM", workload, batch, input_tokens, output_tokens,
+        backend, mode, scenario, workload, batch, input_tokens, output_tokens,
         requests_data, batch_start, batch_end)
 
 
-def run_vllm(args, prompt_path, result_dir):
-    prompts = read_json(prompt_path)
-    batches = decode_batch_cases(args)
+def median_or_none(values):
+    filtered = [value for value in values if value is not None]
+    return statistics.median(filtered) if filtered else None
+
+
+def aggregate_trials(trials):
+    result = {key: value for key, value in trials[0].items()
+              if key not in ("requests", "total_output_tokens")}
+    metric_keys = (
+        "ttft_s", "tpot_s", "itl_s", "e2el_s", "wall_s",
+        "prefill_tok_s", "output_tok_s", "cache_hit_ratio")
+    for key in metric_keys:
+        result[key] = median_or_none([trial[key] for trial in trials])
+    result["total_output_tokens"] = int(statistics.median(
+        trial["total_output_tokens"] for trial in trials))
+    result["total_cached_prompt_tokens"] = median_or_none(
+        [trial["total_cached_prompt_tokens"] for trial in trials])
+    result["repeat_count"] = len(trials)
+    result["aggregate"] = "median"
+    result["trials"] = trials
+    return result
+
+
+def run_backend_cases(base_url, model_name, backend, mode, prompts, args):
+    results = []
+    for scenario in SCENARIOS:
+        for case in prompts["cases"].values():
+            scenario_data = case[scenario]
+            for _ in range(args.warmup):
+                run_http_batch(
+                    base_url, model_name, backend, mode, scenario, "warmup",
+                    scenario_data["warmup_token_ids"],
+                    min(case["output_length"], 8), case["batch"],
+                    args.request_timeout)
+            trials = []
+            for input_tokens in scenario_data["trial_token_ids"]:
+                trials.append(run_http_batch(
+                    base_url, model_name, backend, mode, scenario,
+                    case["workload"], input_tokens, case["output_length"],
+                    case["batch"], args.request_timeout))
+            result = aggregate_trials(trials)
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+            results.append(result)
+    return results
+
+
+def wait_server(base_url, process, timeout, server_log, backend):
+    deadline = time.time() + timeout
+    last_error = ""
+    while time.time() < deadline:
+        if process.poll() is not None:
+            tail = Path(server_log).read_text(
+                encoding="utf-8", errors="replace")[-8000:]
+            raise RuntimeError(
+                f"{backend}服务提前退出，code={process.returncode}\n{tail}")
+        try:
+            response = requests.get(f"{base_url}/v1/models", timeout=2)
+            if response.status_code == 200:
+                return
+            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+        except requests.RequestException as error:
+            last_error = str(error)
+        time.sleep(1)
+    raise TimeoutError(f"等待{backend}启动超时: {last_error}")
+
+
+def stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+
+
+def run_server(command, env, server_log, backend, base_url, prompts, args, mode):
+    print(f"SUBPROCESS COMMAND: {shlex.join(command)}", flush=True)
+    with Path(server_log).open("w", encoding="utf-8") as log_handle:
+        log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
+        for name in sorted(name for name in env if name.startswith(
+                ("FASTLLM_CUDA_NVFP4", "FASTLLM_CUDA_GRAPH",
+                 "VLLM_USE_FLASHINFER"))):
+            log_handle.write(f"ENV: {name}={env[name]}\n")
+        log_handle.write("\n")
+        log_handle.flush()
+        process = subprocess.Popen(
+            command, cwd=REPO_DIR, env=env, stdout=log_handle,
+            stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_server(base_url, process, args.startup_timeout, server_log, backend)
+            return run_backend_cases(
+                base_url, "nvfp4-performance", backend, mode, prompts, args)
+        finally:
+            stop_process(process)
+
+
+def run_fastllm(args, prompts, result_dir, mode):
     base_url = f"http://127.0.0.1:{args.port}"
-    served_name = "nvfp4-performance"
+    command = [
+        args.fastllm_python,
+        str(REPO_DIR / "test/nvfp4/fastllm_http_benchmark_server.py"),
+        "--model", args.model, "--host", "127.0.0.1",
+        "--port", str(args.port), "--dtype", args.flm_dtype,
+        "--atype", args.flm_atype, "--device", args.flm_device,
+        "--max-batch", str(max(decode_batch_cases(args))),
+    ]
+    env = os.environ.copy()
+    env.pop("FASTLLM_CUDA_NVFP4_TRACE", None)
+    env["FASTLLM_CUDA_NVFP4_W4A4"] = "1"
+    env["FASTLLM_CUDA_NVFP4_W4A4_STRICT"] = "1"
+    env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
+    env["FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT"] = "1"
+    env["FASTLLM_CUDA_GRAPH"] = "0" if mode == "eager" else "1"
+    return run_server(
+        command, env, result_dir / f"fastllm-{mode}-server.log", "FastLLM",
+        base_url, prompts, args, mode)
+
+
+def run_vllm(args, prompts, result_dir, mode):
+    base_url = f"http://127.0.0.1:{args.port}"
     command = [
         args.vllm_python, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", args.model, "--served-model-name", served_name,
+        "--model", args.model, "--served-model-name", "nvfp4-performance",
         "--host", "127.0.0.1", "--port", str(args.port),
         "--dtype", "auto", "--max-model-len", str(args.max_model_len),
-        "--max-num-seqs", str(max(batches)),
+        "--max-num-seqs", str(max(decode_batch_cases(args))),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
-        "--trust-remote-code", "--enforce-eager",
-        "--linear-backend", "cutlass", "--no-enable-prefix-caching",
-        "--enable-force-include-usage",
+        "--trust-remote-code", "--linear-backend", "cutlass",
+        "--enable-prefix-caching", "--enable-force-include-usage",
     ]
+    if mode == "eager":
+        command.append("--enforce-eager")
     env = os.environ.copy()
     env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     env["VLLM_USE_FLASHINFER_MOE_FP4"] = "0"
-    server_log = result_dir / "vllm-server.log"
-    print(f"SUBPROCESS COMMAND: {shlex.join(command)}", flush=True)
-    log_handle = server_log.open("w", encoding="utf-8")
-    log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
-    log_handle.write("ENV: VLLM_USE_FLASHINFER_SAMPLER=0\n")
-    log_handle.write("ENV: VLLM_USE_FLASHINFER_MOE_FP4=0\n\n")
-    log_handle.flush()
-    process = subprocess.Popen(
-        command, cwd=REPO_DIR, env=env, stdout=log_handle,
-        stderr=subprocess.STDOUT, text=True)
-    try:
-        wait_server(base_url, process, args.startup_timeout, server_log)
-        cases = [
-            ("prefill", prompts["prefill"]["token_ids"], args.prefill_max_tokens, 1),
-            *[("decode", prompts["decode"]["token_ids"],
-               args.decode_max_tokens, batch) for batch in batches],
-        ]
-        results = []
-        for workload, token_ids, output_tokens, batch in cases:
-            for _ in range(args.warmup):
-                run_vllm_batch(
-                    base_url, served_name, "warmup", token_ids,
-                    min(output_tokens, 8), batch, args.request_timeout)
-            result = run_vllm_batch(
-                base_url, served_name, workload, token_ids,
-                output_tokens, batch, args.request_timeout)
-            print(json.dumps(result, ensure_ascii=False), flush=True)
-            results.append(result)
-        write_json(result_dir / "vllm-results.json", results)
-        return results
-    finally:
-        stop_process(process)
-        log_handle.close()
+    return run_server(
+        command, env, result_dir / f"vllm-{mode}-server.log", "vLLM",
+        base_url, prompts, args, mode)
 
 
 def fmt_ms(value):
@@ -446,75 +447,97 @@ def fmt_number(value):
     return "n/a" if value is None else f"{value:.2f}"
 
 
+def fmt_percent(value):
+    return "n/a" if value is None else f"{value * 100:.1f}%"
+
+
 def ratio(fastllm_value, vllm_value):
     if fastllm_value is None or vllm_value in (None, 0):
         return "n/a"
     return f"{fastllm_value / vllm_value:.4f}x"
 
 
-def ordered_results(fastllm_results, vllm_results):
-    fastllm_map = {
-        (item["workload"], item["batch"]): item for item in fastllm_results}
-    vllm_map = {(item["workload"], item["batch"]): item for item in vllm_results}
+def ordered_results(fastllm_results, vllm_results, mode, scenario):
+    def select(items):
+        return {(item["workload"], item["batch"]): item for item in items
+                if item["mode"] == mode and item["scenario"] == scenario}
+
+    fastllm_map = select(fastllm_results)
+    vllm_map = select(vllm_results)
     keys = [("prefill", 1)] + [
-        ("decode", item["batch"])
-        for item in fastllm_results if item["workload"] == "decode"]
+        ("decode", item["batch"]) for item in fastllm_map.values()
+        if item["workload"] == "decode"]
     rows = []
     for key in keys:
         if key not in fastllm_map or key not in vllm_map:
-            raise RuntimeError(f"FastLLM/vLLM缺少对应测试项: {key}")
+            raise RuntimeError(f"FastLLM/vLLM缺少对应测试项: {mode}/{scenario}/{key}")
         rows.extend((fastllm_map[key], vllm_map[key]))
     return rows
 
 
 def make_report(result_dir, fastllm_results, vllm_results):
-    rows = ordered_results(fastllm_results, vllm_results)
     lines = [
         "# NVFP4严格整体性能对比", "",
-        "> 两个后端直接接收同一组token ID；不经过各自Chat Template。", "",
-        "| Workload | 后端 | Batch | Prompt/请求 | Prompt总数 | Output总数 | "
-        "TTFT(ms) | TPOT(ms) | ITL(ms) | E2EL(ms) | Prefill(tok/s) | "
-        "Output(tok/s) | Wall(s) |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-        "---: | ---: | ---: | ---: |",
+        "> 两个后端通过HTTP `/v1/completions`接收同一组Token ID；忽略EOS；",
+        "> 每个Case测试5轮并取中位数。Cold与Cache Hit分别统计。", "",
     ]
     csv_rows = []
-    for item in rows:
-        lines.append(
-            f"| {item['workload']} | {item['backend']} | {item['batch']} | "
-            f"{item['prompt_tokens_per_request']} | {item['total_prompt_tokens']} | "
-            f"{item['total_output_tokens']} | {fmt_ms(item['ttft_s'])} | "
-            f"{fmt_ms(item['tpot_s'])} | {fmt_ms(item['itl_s'])} | "
-            f"{fmt_ms(item['e2el_s'])} | {fmt_number(item['prefill_tok_s'])} | "
-            f"{fmt_number(item['output_tok_s'])} | {item['wall_s']:.6f} |")
-        csv_rows.append({
-            "workload": item["workload"],
-            "backend": item["backend"],
-            "batch": item["batch"],
-            "prompt_tokens_per_request": item["prompt_tokens_per_request"],
-            "total_prompt_tokens": item["total_prompt_tokens"],
-            "output_tokens": item["total_output_tokens"],
-            "ttft_ms": None if item["ttft_s"] is None else item["ttft_s"] * 1000,
-            "tpot_ms": None if item["tpot_s"] is None else item["tpot_s"] * 1000,
-            "itl_ms": None if item["itl_s"] is None else item["itl_s"] * 1000,
-            "e2el_ms": None if item["e2el_s"] is None else item["e2el_s"] * 1000,
-            "prefill_tok_s": item["prefill_tok_s"],
-            "output_tok_s": item["output_tok_s"],
-            "wall_s": item["wall_s"],
-        })
-    lines.extend(["", "## FastLLM / vLLM", "",
-                  "| Workload | Batch | TTFT | TPOT | ITL | E2EL | Output吞吐 |",
-                  "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"])
-    for index in range(0, len(rows), 2):
-        fastllm_item, vllm_item = rows[index:index + 2]
-        lines.append(
-            f"| {fastllm_item['workload']} | {fastllm_item['batch']} | "
-            f"{ratio(fastllm_item['ttft_s'], vllm_item['ttft_s'])} | "
-            f"{ratio(fastllm_item['tpot_s'], vllm_item['tpot_s'])} | "
-            f"{ratio(fastllm_item['itl_s'], vllm_item['itl_s'])} | "
-            f"{ratio(fastllm_item['e2el_s'], vllm_item['e2el_s'])} | "
-            f"{ratio(fastllm_item['output_tok_s'], vllm_item['output_tok_s'])} |")
-    lines.append("")
+    for mode in MODES:
+        for scenario in SCENARIOS:
+            rows = ordered_results(
+                fastllm_results, vllm_results, mode, scenario)
+            lines.extend([
+                f"## {mode.upper()} / {scenario}", "",
+                "| Workload | 后端 | Batch | Prompt/请求 | Prompt总数 | "
+                "Output总数 | Cache命中 | TTFT(ms) | TPOT(ms) | ITL(ms) | E2EL(ms) | "
+                "Prefill(tok/s) | Output(tok/s) | Wall(s) |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+                "---: | ---: | ---: | ---: | ---: |",
+            ])
+            for item in rows:
+                lines.append(
+                    f"| {item['workload']} | {item['backend']} | {item['batch']} | "
+                    f"{item['prompt_tokens_per_request']} | "
+                    f"{item['total_prompt_tokens']} | {item['total_output_tokens']} | "
+                    f"{fmt_percent(item['cache_hit_ratio'])} | "
+                    f"{fmt_ms(item['ttft_s'])} | {fmt_ms(item['tpot_s'])} | "
+                    f"{fmt_ms(item['itl_s'])} | {fmt_ms(item['e2el_s'])} | "
+                    f"{fmt_number(item['prefill_tok_s'])} | "
+                    f"{fmt_number(item['output_tok_s'])} | {item['wall_s']:.6f} |")
+                csv_rows.append({
+                    "mode": mode,
+                    "scenario": scenario,
+                    "workload": item["workload"],
+                    "backend": item["backend"],
+                    "batch": item["batch"],
+                    "prompt_tokens_per_request": item["prompt_tokens_per_request"],
+                    "total_prompt_tokens": item["total_prompt_tokens"],
+                    "output_tokens": item["total_output_tokens"],
+                    "cache_hit_ratio": item["cache_hit_ratio"],
+                    "repeat_count": item["repeat_count"],
+                    "ttft_ms": None if item["ttft_s"] is None else item["ttft_s"] * 1000,
+                    "tpot_ms": None if item["tpot_s"] is None else item["tpot_s"] * 1000,
+                    "itl_ms": None if item["itl_s"] is None else item["itl_s"] * 1000,
+                    "e2el_ms": None if item["e2el_s"] is None else item["e2el_s"] * 1000,
+                    "prefill_tok_s": item["prefill_tok_s"],
+                    "output_tok_s": item["output_tok_s"],
+                    "wall_s": item["wall_s"],
+                })
+            lines.extend([
+                "", "### FastLLM / vLLM", "",
+                "| Workload | Batch | TTFT | TPOT | ITL | E2EL | Output吞吐 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ])
+            for index in range(0, len(rows), 2):
+                fastllm_item, vllm_item = rows[index:index + 2]
+                lines.append(
+                    f"| {fastllm_item['workload']} | {fastllm_item['batch']} | "
+                    f"{ratio(fastllm_item['ttft_s'], vllm_item['ttft_s'])} | "
+                    f"{ratio(fastllm_item['tpot_s'], vllm_item['tpot_s'])} | "
+                    f"{ratio(fastllm_item['itl_s'], vllm_item['itl_s'])} | "
+                    f"{ratio(fastllm_item['e2el_s'], vllm_item['e2el_s'])} | "
+                    f"{ratio(fastllm_item['output_tok_s'], vllm_item['output_tok_s'])} |")
+            lines.append("")
     report = "\n".join(lines)
     markdown_path = result_dir / "model-performance-compare.md"
     csv_path = result_dir / "model-performance-compare.csv"
@@ -536,32 +559,17 @@ def orchestrate(args):
     result_dir = Path(args.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = build_shared_prompts(args, result_dir)
-    fastllm_output = result_dir / "fastllm-results.json"
-    command = [
-        args.fastllm_python, str(Path(__file__).resolve()),
-        "--stage", "fastllm", "--model", args.model,
-        "--result-dir", str(result_dir),
-        "--prompt-token-file", str(prompt_path),
-        "--output", str(fastllm_output),
-        "--flm-dtype", args.flm_dtype, "--flm-atype", args.flm_atype,
-        "--flm-device", args.flm_device,
-        "--prefill-input-tokens", str(args.prefill_input_tokens),
-        "--prefill-max-tokens", str(args.prefill_max_tokens),
-        "--decode-input-tokens", str(args.decode_input_tokens),
-        "--decode-batch-sizes", ",".join(map(str, decode_batch_cases(args))),
-        "--decode-max-tokens", str(args.decode_max_tokens),
-        "--warmup", str(args.warmup),
-    ]
-    env = os.environ.copy()
-    env.pop("FASTLLM_CUDA_NVFP4_TRACE", None)
-    env["FASTLLM_CUDA_NVFP4_W4A4"] = "1"
-    env["FASTLLM_CUDA_NVFP4_W4A4_STRICT"] = "1"
-    env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
-    env["FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT"] = "1"
-    run_logged(command, result_dir / "fastllm.log", env)
-    fastllm_results = read_json(fastllm_output)
-    vllm_results = run_vllm(args, prompt_path, result_dir)
-    make_report(result_dir, fastllm_results, vllm_results)
+    prompts = read_json(prompt_path)
+    all_fastllm_results = []
+    all_vllm_results = []
+    for mode in MODES:
+        fastllm_results = run_fastllm(args, prompts, result_dir, mode)
+        write_json(result_dir / f"fastllm-{mode}-results.json", fastllm_results)
+        all_fastllm_results.extend(fastllm_results)
+        vllm_results = run_vllm(args, prompts, result_dir, mode)
+        write_json(result_dir / f"vllm-{mode}-results.json", vllm_results)
+        all_vllm_results.extend(vllm_results)
+    make_report(result_dir, all_fastllm_results, all_vllm_results)
 
 
 def main():
@@ -570,14 +578,10 @@ def main():
     require_positive("prefill-max-tokens", args.prefill_max_tokens)
     require_positive("decode-input-tokens", args.decode_input_tokens)
     require_positive("decode-max-tokens", args.decode_max_tokens)
+    require_positive("repeats", args.repeats)
     if args.warmup < 0:
         raise ValueError("warmup不能小于0")
-    if args.stage == "fastllm":
-        if not args.prompt_token_file or not args.output:
-            raise ValueError("FastLLM阶段缺少prompt-token-file或output")
-        run_fastllm_stage(args)
-    else:
-        orchestrate(args)
+    orchestrate(args)
 
 
 if __name__ == "__main__":
