@@ -502,8 +502,9 @@ bool FastllmCudaSiluMulNvfp4QuantizeVersion(
  * scale。FP4结果按两个元素一个字节写入output；group scale直接写成
  * CUTLASS要求的swizzle布局。hidden到paddedHidden之间的补齐区域写零。
  *
- * 本函数只负责参数检查、数据类型分派和异步kernel启动，不执行流同步；
- * 调用方需要在warmup或依赖结果的边界检查异步CUDA错误。
+ * 正式推理固定使用Cached第三版：当前CPU线程首次访问GPU时读取并缓存
+ * 启动属性，后续热调用复用缓存。本函数不执行流同步；调用方需要在
+ * warmup或依赖结果的边界检查异步CUDA错误。
  *
  * @param input        FP16或BF16输入，逻辑形状为[rows, 2 * hidden]。
  * @param inputType    输入类型，仅支持FLOAT16和BFLOAT16。
@@ -522,22 +523,24 @@ bool FastllmCudaSiluMulNvfp4QuantizePadded(
         uint8_t *output, uint8_t *outputScales,
         int rows, int hidden, int paddedHidden,
         float globalScale, void *streamPtr) {
-    if (!FastllmNvfp4RuntimeSupported() || input == nullptr || output == nullptr ||
-        outputScales == nullptr || rows <= 0 || hidden <= 0 || hidden % 16 != 0 ||
+    if (input == nullptr || output == nullptr || outputScales == nullptr ||
+        rows <= 0 || hidden <= 0 || hidden % 16 != 0 ||
         paddedHidden < hidden || paddedHidden % 32 != 0 ||
         !std::isfinite(globalScale) || globalScale <= 0.0f) {
         return false;
     }
+    Nvfp4CachedLaunchProperties properties;
+    if (!GetCachedNvfp4LaunchProperties(properties)) return false;
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
     if (inputType == fastllm::DataType::FLOAT16) {
-        return LaunchSiluMulQuantOptimized<half>(
+        return LaunchSiluMulQuantCached<half>(
             input, output, outputScales, rows, hidden,
-            paddedHidden, globalScale, stream);
+            paddedHidden, globalScale, properties, stream);
     }
     if (inputType == fastllm::DataType::BFLOAT16) {
-        return LaunchSiluMulQuantOptimized<__nv_bfloat16>(
+        return LaunchSiluMulQuantCached<__nv_bfloat16>(
             input, output, outputScales, rows, hidden,
-            paddedHidden, globalScale, stream);
+            paddedHidden, globalScale, properties, stream);
     }
     return false;
 }
