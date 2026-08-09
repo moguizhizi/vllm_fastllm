@@ -164,11 +164,17 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
 ```
 
 整体模型对比由独立的`model_performance_compare.py`执行，不修改FastLLM原有
-`test/benchmark/prefill.py`和`decode.py`。脚本只用AutoTokenizer构造一次固定
-token ID：Prefill默认4096个，Decode默认512个；FastLLM通过raw-token接口消费，
-vLLM通过`/v1/completions`消费，并校验vLLM返回的prompt token ID完全一致。
-因此两边不会再次套用不同的Chat Template。两个框架分时加载模型，Decode默认覆盖
-batch=1/2/4/8/16/32；vLLM关闭prefix caching。结果写入
+`test/benchmark/prefill.py`和`decode.py`。脚本只用AutoTokenizer构造共享Token
+ID：Prefill默认4096个，Decode默认512个；FastLLM和vLLM均通过HTTP
+`/v1/completions`直接消费Token ID并回传校验，不再次套用各自的Chat Template。
+两个框架分时加载模型，使用相同的多线程HTTP客户端、Greedy采样并忽略EOS，Decode
+默认覆盖batch=1/2/4/8/16/32。
+
+测试同时覆盖`eager/best`和`cold/cache_hit`四种组合。两个后端都启用Prefix
+Cache；Cold的warmup及5轮正式测试使用开头不同的Prompt，避免命中已有缓存，
+Cache Hit则重复使用相同Prompt。每个Case默认测5轮并逐项取中位数。vLLM的Eager
+模式增加`--enforce-eager`，Best模式使用其默认CUDA Graph策略；FastLLM的Eager
+模式设置`FASTLLM_CUDA_GRAPH=0`，Best模式设置`FASTLLM_CUDA_GRAPH=1`。结果写入
 `model-performance-results/model-performance-compare.{md,csv,json}`，包含TTFT、
 TPOT、ITL、E2EL、Prefill/Output吞吐和FastLLM/vLLM比值：
 
@@ -210,10 +216,14 @@ operator-performance-compare.csv
 operator-performance-compare.json
 model_performance_compare.log
 model-performance-results/shared-prompt-token-ids.json
-model-performance-results/fastllm.log
-model-performance-results/fastllm-results.json
-model-performance-results/vllm-server.log
-model-performance-results/vllm-results.json
+model-performance-results/fastllm-eager-server.log
+model-performance-results/fastllm-eager-results.json
+model-performance-results/vllm-eager-server.log
+model-performance-results/vllm-eager-results.json
+model-performance-results/fastllm-best-server.log
+model-performance-results/fastllm-best-results.json
+model-performance-results/vllm-best-server.log
+model-performance-results/vllm-best-results.json
 model-performance-results/model-performance-compare.md
 model-performance-results/model-performance-compare.csv
 model-performance-results/model-performance-compare.json
