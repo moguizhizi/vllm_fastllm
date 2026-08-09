@@ -126,13 +126,11 @@ run_ops_functional() {
             run_logged "op_swiglu_fp4_quant_bf16_k${quant_k}" "${optest}" \
                 --op nvfp4_swiglu_quant --device cuda:0 \
                 --param rows=32 --param hidden="${quant_k}" --param input_type=bf16 \
-                --param implementation=cached \
                 --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         done
         run_logged op_swiglu_fp4_quant_fp16 "${optest}" \
             --op nvfp4_swiglu_quant --device cuda:0 \
             --param rows=32 --param hidden=1024 --param input_type=fp16 \
-            --param implementation=cached \
             --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         local moe_m moe_topk moe_experts
         for moe_m in 2 64 224; do
@@ -205,7 +203,6 @@ run_ops_performance() {
             run_logged "op_swiglu_fp4_quant_perf_k${quant_k}" "${optest}" \
                 --op nvfp4_swiglu_quant --device cuda:0 \
                 --param rows=32 --param hidden="${quant_k}" --param input_type=bf16 \
-                --param implementation=cached \
                 --warmup 20 --iters 200 --atol 0.20 --rtol 0.20
         done
         for moe_m in 2 64 224; do

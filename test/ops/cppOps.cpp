@@ -1934,6 +1934,7 @@ namespace {
     struct Nvfp4SwiGLUQuantState {
         int rows = 0, hidden = 0;
         fastllm::DataType inputType = fastllm::DataType::FLOAT16;
+        bool useProduction = true;
         FastllmCudaNvfp4SiluMulVersion implementation =
             FastllmCudaNvfp4SiluMulVersion::Cached;
         fastllm::Data input;
@@ -1947,15 +1948,22 @@ namespace {
             inputType = params.GetString("input_type") == "bf16"
                 ? fastllm::DataType::BFLOAT16 : fastllm::DataType::FLOAT16;
             const std::string implementationName = params.GetString("implementation");
-            if (implementationName == "baseline") {
+            if (implementationName == "production") {
+                // 常规功能和性能测试必须经过正式推理入口，避免测试路径
+                // 与模型主流程选择不同的融合实现。
+                useProduction = true;
+            } else if (implementationName == "baseline") {
+                useProduction = false;
                 implementation = FastllmCudaNvfp4SiluMulVersion::Baseline;
             } else if (implementationName == "optimized") {
+                useProduction = false;
                 implementation = FastllmCudaNvfp4SiluMulVersion::Optimized;
             } else if (implementationName == "cached") {
+                useProduction = false;
                 implementation = FastllmCudaNvfp4SiluMulVersion::Cached;
             } else {
                 throw std::runtime_error(
-                    "nvfp4_swiglu_quant implementation must be baseline, optimized or cached");
+                    "nvfp4_swiglu_quant implementation must be production, baseline, optimized or cached");
             }
             if (rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
                 (params.GetString("input_type") != "fp16" &&
@@ -1981,9 +1989,14 @@ namespace {
         }
 
         void Run() {
-            if (!FastllmCudaSiluMulNvfp4QuantizeVersion(
-                    input.cudaData, inputType, packed, scales,
-                    rows, hidden, 1.0f, implementation, nullptr)) {
+            const bool launched = useProduction
+                ? FastllmCudaSiluMulNvfp4Quantize(
+                      input.cudaData, inputType, packed, scales,
+                      rows, hidden, 1.0f, nullptr)
+                : FastllmCudaSiluMulNvfp4QuantizeVersion(
+                      input.cudaData, inputType, packed, scales,
+                      rows, hidden, 1.0f, implementation, nullptr);
+            if (!launched) {
                 throw std::runtime_error("NVFP4 fused SwiGLU quant launch failed");
             }
         }
@@ -2061,8 +2074,8 @@ namespace {
                 params.Add("rows", "32", "flattened token rows");
                 params.Add("hidden", "1024", "post-SwiGLU width, multiple of 32");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("implementation", "cached",
-                           "baseline, optimized or cached fused CUDA kernel");
+                params.Add("implementation", "production",
+                           "production main path, baseline, optimized or cached CUDA kernel");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
