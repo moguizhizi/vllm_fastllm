@@ -128,6 +128,11 @@ run_ops_functional() {
                 --param rows=32 --param hidden="${quant_k}" --param input_type=bf16 \
                 --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         done
+        run_logged op_swiglu_fp4_quant_cached_bf16 "${optest}" \
+            --op nvfp4_swiglu_quant --device cuda:0 \
+            --param rows=32 --param hidden=4096 --param input_type=bf16 \
+            --param implementation=cached \
+            --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         run_logged op_swiglu_fp4_quant_fp16 "${optest}" \
             --op nvfp4_swiglu_quant --device cuda:0 \
             --param rows=32 --param hidden=1024 --param input_type=fp16 \

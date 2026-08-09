@@ -2,7 +2,7 @@
   "name": "SwiGLU+NVFP4 FastLLM多版本选优及vLLM对比",
   "baseline": "ft_baseline",
   "selection": {
-    "candidates": ["ft_baseline", "ft_optimized"],
+    "candidates": ["ft_baseline", "ft_optimized", "ft_cached"],
     "reference": "vllm",
     "metric": "latency_ms"
   },
@@ -34,6 +34,16 @@
       "command": [
         "{repo}/optest", "--op", "nvfp4_swiglu_quant", "--device", "cuda:0",
         "--param", "implementation=optimized",
+        "--param", "rows={rows}", "--param", "hidden={hidden}",
+        "--param", "input_type={dtype}",
+        "--warmup", "100", "--iters", "2000", "--atol", "0.20", "--rtol", "0.20"
+      ]
+    },
+    {
+      "name": "ft_cached",
+      "command": [
+        "{repo}/optest", "--op", "nvfp4_swiglu_quant", "--device", "cuda:0",
+        "--param", "implementation=cached",
         "--param", "rows={rows}", "--param", "hidden={hidden}",
         "--param", "input_type={dtype}",
         "--warmup", "100", "--iters", "2000", "--atol", "0.20", "--rtol", "0.20"

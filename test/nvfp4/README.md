@@ -77,8 +77,9 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
 保存在`operator-performance-compare-vllm.log`。
 
 SwiGLU+NVFP4还提供同一二进制的多版本选优测试。`baseline`保留优化前固定256线程、
-M补齐128的kernel；`optimized`使用当前按GPU占用率设置grid且只处理真实M的kernel。
-两者都先执行功能检查，再按rows=1/16/32/64/128和
+M补齐128的kernel；`optimized`使用当前按GPU占用率设置grid且只处理真实M的kernel；
+`cached`复用`optimized`的device kernel，并缓存每块GPU的SM启动属性，同时把launch
+错误检查移出稳定热路径。三个版本都先执行功能检查，再按rows=1/16/32/64/128和
 hidden=4096/7168/14336逐case选出FastLLM最优版本；vLLM只作为固定reference：
 
 ```bash

@@ -1951,9 +1951,11 @@ namespace {
                 implementation = FastllmCudaNvfp4SiluMulVersion::Baseline;
             } else if (implementationName == "optimized") {
                 implementation = FastllmCudaNvfp4SiluMulVersion::Optimized;
+            } else if (implementationName == "cached") {
+                implementation = FastllmCudaNvfp4SiluMulVersion::Cached;
             } else {
                 throw std::runtime_error(
-                    "nvfp4_swiglu_quant implementation must be baseline or optimized");
+                    "nvfp4_swiglu_quant implementation must be baseline, optimized or cached");
             }
             if (rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
                 (params.GetString("input_type") != "fp16" &&
@@ -2060,7 +2062,7 @@ namespace {
                 params.Add("hidden", "1024", "post-SwiGLU width, multiple of 32");
                 params.Add("input_type", "fp16", "fp16 or bf16");
                 params.Add("implementation", "optimized",
-                           "baseline or optimized fused CUDA kernel");
+                           "baseline, optimized or cached fused CUDA kernel");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
