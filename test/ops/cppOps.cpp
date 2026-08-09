@@ -1935,7 +1935,7 @@ namespace {
         int rows = 0, hidden = 0;
         fastllm::DataType inputType = fastllm::DataType::FLOAT16;
         FastllmCudaNvfp4SiluMulVersion implementation =
-            FastllmCudaNvfp4SiluMulVersion::Optimized;
+            FastllmCudaNvfp4SiluMulVersion::Cached;
         fastllm::Data input;
         uint8_t *packed = nullptr;
         uint8_t *scales = nullptr;
@@ -2061,7 +2061,7 @@ namespace {
                 params.Add("rows", "32", "flattened token rows");
                 params.Add("hidden", "1024", "post-SwiGLU width, multiple of 32");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("implementation", "optimized",
+                params.Add("implementation", "cached",
                            "baseline, optimized or cached fused CUDA kernel");
                 return params;
             },
