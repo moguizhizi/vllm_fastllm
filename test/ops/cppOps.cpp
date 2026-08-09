@@ -2065,6 +2065,60 @@ namespace {
     };
 #endif
 
+    /**
+     * 按正式主流程测量SwiGLU与NVFP4融合量化的平均延迟。
+     *
+     * 测试状态只初始化一次，循环内持续调用Nvfp4SwiGLUQuantState::Run；
+     * production配置会进一步进入FastllmCudaSiluMulNvfp4Quantize正式入口。
+     * warmup循环结束后同步一次，全部计时迭代结束后再同步一次，不在每次
+     * kernel启动后强制同步，从而与正式异步执行方式及vLLM基准保持一致。
+     * 显式选择baseline、optimized或cached时仍复用相同计时协议，仅用于
+     * 独立多版本微基准。
+     *
+     * @param params 算子参数，包含rows、hidden、input_type和implementation。
+     * @param device 目标CUDA设备，例如cuda:0。
+     * @param warmup 计时前连续执行的预热次数。
+     * @param iters  纳入计时的连续执行次数。
+     * @return 平均延迟、逻辑访存字节数和估算计算量；CUDA不可用时抛出异常。
+     */
+    static BenchmarkResult BenchmarkNvfp4SwiGLUQuantCuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<Nvfp4SwiGLUQuantState>(params);
+
+        // 预热与正式推理一样连续提交，边界同步确保计时区间不包含预热。
+        for (int i = 0; i < warmup; ++i) state->Run();
+        ForceDeviceSync();
+
+        const auto begin = Clock::now();
+        for (int i = 0; i < iters; ++i) state->Run();
+        ForceDeviceSync();
+        const auto end = Clock::now();
+
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        result.bytesMoved = (double)params.GetInt("rows") *
+                            params.GetInt("hidden") * 4.5;
+        result.flops = (double)params.GetInt("rows") *
+                       params.GetInt("hidden") * 5.0;
+        const double seconds = result.avgMs / 1000.0;
+        if (seconds > 0.0) {
+            result.bandwidthGBps = result.bytesMoved / seconds / 1e9;
+            result.computeTFlops = result.flops / seconds / 1e12;
+        }
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("NVFP4 SwiGLU benchmark requires CUDA SM100+ build");
+#endif
+    }
+
     static OpCase MakeNvfp4SwiGLUQuantCase() {
         OpCase result{
             "nvfp4_swiglu_quant",
@@ -2122,6 +2176,7 @@ namespace {
             return fastllm::Data();
 #endif
         };
+        result.benchmarkOverride = BenchmarkNvfp4SwiGLUQuantCuda;
         return result;
     }
 
