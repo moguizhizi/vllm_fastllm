@@ -1111,11 +1111,19 @@ extern "C" int FastllmCudaRuntimeArch() {
     if (cudaGetDevice(&device) != cudaSuccess) {
         return 0;
     }
+    // 计算能力是稳定设备属性；同一CPU线程固定使用当前GPU时直接复用。
+    static thread_local int cachedDevice = -1;
+    static thread_local int cachedArch = 0;
+    if (cachedDevice == device) {
+        return cachedArch;
+    }
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         return 0;
     }
-    return prop.major * 10 + prop.minor;
+    cachedDevice = device;
+    cachedArch = prop.major * 10 + prop.minor;
+    return cachedArch;
 }
 
 extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(

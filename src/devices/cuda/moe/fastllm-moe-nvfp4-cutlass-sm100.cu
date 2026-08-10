@@ -17,6 +17,34 @@
 namespace {
 using namespace cute;
 
+/**
+ * 取得当前GPU的CUTLASS硬件信息，并缓存稳定设备属性。
+ *
+ * grouped MoE每次前向会执行两次GEMM。该函数只在调用线程首次使用某块
+ * GPU时读取SM数量，避免每次GEMM重复调用cudaDeviceGetAttribute。
+ *
+ * @param hardwareInfo 返回当前GPU编号及SM数量。
+ * @return CUDA设备及属性查询成功时返回true，否则返回false。
+ */
+static bool GetCachedHardwareInfo(cutlass::KernelHardwareInfo &hardwareInfo) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local int cachedDevice = -1;
+    static thread_local int cachedSmCount = 0;
+    if (cachedDevice != device) {
+        int smCount = 0;
+        if (cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount,
+                                   device) != cudaSuccess) {
+            return false;
+        }
+        cachedDevice = device;
+        cachedSmCount = smCount;
+    }
+    hardwareInfo.device_id = cachedDevice;
+    hardwareInfo.sm_count = cachedSmCount;
+    return true;
+}
+
 template <typename Out>
 struct GroupedConfig {
     using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
@@ -144,26 +172,25 @@ bool RunGrouped(const uint8_t *const *hostA, const uint8_t *const *hostB,
         epilogue.thread.alpha_ptr_array = const_cast<float **>(alpha);
         epilogue.thread.dAlpha = {_0{}, _0{}, 1};
         cutlass::KernelHardwareInfo hw;
-        int device = 0;
-        cudaGetDevice(&device);
-        hw.device_id = device;
-        cudaDeviceGetAttribute(&hw.sm_count, cudaDevAttrMultiProcessorCount, device);
-        typename Kernel::TileSchedulerArguments scheduler;
-        using Raster = typename cutlass::gemm::kernel::detail::
-            PersistentTileSchedulerSm100GroupParams<ShapeType>::RasterOrderOptions;
-        scheduler.raster_order = Raster::AlongM;
-        typename Gemm::Arguments args{
-            cutlass::gemm::GemmUniversalMode::kGrouped,
-            {groups, reinterpret_cast<ShapeType *>(shapes), nullptr},
-            mainloop, epilogue, hw, scheduler};
-        Gemm gemm;
-        size_t workspaceBytes = Gemm::get_workspace_size(args);
-        workspace = workspaceBytes ? FastllmCudaMalloc(workspaceBytes) : nullptr;
-        ok = (workspaceBytes == 0 || workspace != nullptr) &&
-             gemm.can_implement(args) == cutlass::Status::kSuccess &&
-             gemm.initialize(args, workspace, stream) == cutlass::Status::kSuccess &&
-             gemm.run(args, workspace, stream) == cutlass::Status::kSuccess &&
-             cudaGetLastError() == cudaSuccess;
+        ok = GetCachedHardwareInfo(hw);
+        if (ok) {
+            typename Kernel::TileSchedulerArguments scheduler;
+            using Raster = typename cutlass::gemm::kernel::detail::
+                PersistentTileSchedulerSm100GroupParams<ShapeType>::RasterOrderOptions;
+            scheduler.raster_order = Raster::AlongM;
+            typename Gemm::Arguments args{
+                cutlass::gemm::GemmUniversalMode::kGrouped,
+                {groups, reinterpret_cast<ShapeType *>(shapes), nullptr},
+                mainloop, epilogue, hw, scheduler};
+            Gemm gemm;
+            size_t workspaceBytes = Gemm::get_workspace_size(args);
+            workspace = workspaceBytes ? FastllmCudaMalloc(workspaceBytes) : nullptr;
+            ok = (workspaceBytes == 0 || workspace != nullptr) &&
+                 gemm.can_implement(args) == cutlass::Status::kSuccess &&
+                 gemm.initialize(args, workspace, stream) == cutlass::Status::kSuccess &&
+                 gemm.run(args, workspace, stream) == cutlass::Status::kSuccess &&
+                 cudaGetLastError() == cudaSuccess;
+        }
     }
     FastllmCudaFree(workspace);
     FastllmCudaFree(a); FastllmCudaFree(b); FastllmCudaFree(sa); FastllmCudaFree(sb);

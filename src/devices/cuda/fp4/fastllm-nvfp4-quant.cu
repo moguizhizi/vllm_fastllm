@@ -278,6 +278,56 @@ static bool LaunchQuant(const void *input, uint8_t *output, uint8_t *scales,
     return cudaGetLastError() == cudaSuccess;
 }
 
+/**
+ * 使用缓存的GPU属性启动普通激活NVFP4动态量化。
+ *
+ * MoE会按活跃expert多次调用普通激活量化。该热路径直接复用当前GPU的
+ * SM数量、每SM线程上限和计算能力，避免每个expert重复查询CUDA设备属性。
+ * kernel保持异步执行；稳定热路径不插入设备或流同步。
+ *
+ * @tparam T             输入元素类型，仅支持half或__nv_bfloat16。
+ * @param input          输入激活，逻辑形状为[rows, columns]。
+ * @param output         打包E2M1输出，每两个FP4元素占一个字节。
+ * @param scales         CUTLASS swizzle布局的E4M3局部scale输出。
+ * @param rows           本次量化的真实行数。
+ * @param columns        输入的真实列数，必须是16的倍数。
+ * @param paddedColumns  输出补齐列数，必须是32的倍数且不小于columns。
+ * @param globalScale    激活动态量化使用的正数FP32全局scale。
+ * @param properties     当前GPU已缓存的启动属性。
+ * @param stream         异步启动kernel所使用的CUDA流。
+ * @return kernel启动参数有效时返回true；异步执行错误由后续同步边界取得。
+ */
+template <typename T>
+static bool LaunchQuantCached(
+        const void *input, uint8_t *output, uint8_t *scales,
+        int rows, int columns, int paddedColumns, float globalScale,
+        const Nvfp4CachedLaunchProperties &properties,
+        cudaStream_t stream) {
+    const int packs = paddedColumns / fastllm_nvfp4::kElementsPerThread;
+    const int realPacks = std::max(
+        1, columns / fastllm_nvfp4::kElementsPerThread);
+    const int threads = std::min(512, realPacks);
+    const int roundedRows = (rows + 127) / 128 * 128;
+    const int kTiles = (paddedColumns + 63) / 64;
+    const int gridY = (packs + threads - 1) / threads;
+    const int blocksPerSm = std::min(
+        4, std::max(1, properties.maxThreadsPerSm / std::max(1, threads)));
+    const int gridX = std::min(
+        roundedRows,
+        std::max(1, properties.multiprocessorCount * blocksPerSm / gridY));
+    FastllmNvfp4QuantKernel<T><<<dim3(gridX, gridY), dim3(threads), 0, stream>>>(
+        static_cast<const T *>(input), output, scales, rows, columns,
+        paddedColumns, roundedRows, kTiles, globalScale);
+
+    // 每块GPU只检查首次launch的即时配置错误；该检查不会同步GPU。
+    static thread_local int validatedDevice = -1;
+    if (validatedDevice != properties.device) {
+        if (cudaGetLastError() != cudaSuccess) return false;
+        validatedDevice = properties.device;
+    }
+    return true;
+}
+
 template <typename T>
 static bool LaunchSiluMulQuantOptimized(
         const void *input, uint8_t *output, uint8_t *scales,
@@ -394,7 +444,9 @@ bool FastllmCudaNvfp4QuantizeActivationPadded(
         uint8_t *output, uint8_t *outputScales,
         int rows, int columns, int paddedColumns,
         float globalScale, void *streamPtr) {
-    if (!FastllmNvfp4RuntimeSupported() || input == nullptr || output == nullptr ||
+    Nvfp4CachedLaunchProperties properties;
+    if (!GetCachedNvfp4LaunchProperties(properties) ||
+        input == nullptr || output == nullptr ||
         outputScales == nullptr || rows <= 0 || columns <= 0 || columns % 16 != 0 ||
         paddedColumns < columns || paddedColumns % 32 != 0 ||
         !std::isfinite(globalScale) || globalScale <= 0.0f) {
@@ -402,12 +454,14 @@ bool FastllmCudaNvfp4QuantizeActivationPadded(
     }
     cudaStream_t stream = streamPtr == nullptr ? 0 : static_cast<cudaStream_t>(streamPtr);
     if (inputType == fastllm::DataType::FLOAT16) {
-        return LaunchQuant<half>(input, output, outputScales, rows, columns,
-                                 paddedColumns, globalScale, stream);
+        return LaunchQuantCached<half>(
+            input, output, outputScales, rows, columns, paddedColumns,
+            globalScale, properties, stream);
     }
     if (inputType == fastllm::DataType::BFLOAT16) {
-        return LaunchQuant<__nv_bfloat16>(input, output, outputScales, rows, columns,
-                                          paddedColumns, globalScale, stream);
+        return LaunchQuantCached<__nv_bfloat16>(
+            input, output, outputScales, rows, columns, paddedColumns,
+            globalScale, properties, stream);
     }
     return false;
 }

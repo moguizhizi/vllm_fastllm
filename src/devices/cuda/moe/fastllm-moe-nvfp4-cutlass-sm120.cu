@@ -92,6 +92,8 @@ struct GroupedScratchSm120 {
     void *workspace = nullptr;
     size_t metadataCapacity = 0;
     size_t workspaceCapacity = 0;
+    int device = -1;
+    int smCount = 0;
 };
 
 static thread_local std::map<int, GroupedScratchSm120> groupedScratchSm120;
@@ -116,6 +118,15 @@ static GroupedScratchSm120 *GetGroupedScratchSm120(size_t metadataBytes) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
     GroupedScratchSm120 &scratch = groupedScratchSm120[device];
+    scratch.device = device;
+    // SM数量属于稳定设备属性，只在该线程首次使用当前GPU时读取一次。
+    if (scratch.smCount <= 0 &&
+        cudaDeviceGetAttribute(&scratch.smCount,
+                               cudaDevAttrMultiProcessorCount,
+                               device) != cudaSuccess) {
+        scratch.smCount = 0;
+        return nullptr;
+    }
     return EnsureBufferSm120(
         scratch.metadata, scratch.metadataCapacity, metadataBytes) ? &scratch : nullptr;
 }
@@ -214,10 +225,8 @@ bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
         epilogue.thread.dAlpha = {_0{}, _0{}, 1};
         epilogue.thread.beta = 0.0f;
         cutlass::KernelHardwareInfo hw;
-        int device = 0;
-        cudaGetDevice(&device);
-        hw.device_id = device;
-        cudaDeviceGetAttribute(&hw.sm_count, cudaDevAttrMultiProcessorCount, device);
+        hw.device_id = scratch->device;
+        hw.sm_count = scratch->smCount;
         typename Kernel::TileSchedulerArguments scheduler;
         using Raster = cutlass::gemm::kernel::detail::RasterOrderOptions;
         scheduler.raster_order = Raster::AlongM;
