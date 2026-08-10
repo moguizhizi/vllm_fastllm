@@ -8681,15 +8681,17 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             int n = index.dims[0];
             int topk = index.dims[1];
             
-            if (!preferNvfp4W4A4 && batch == 1) {
-                if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
-                    TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
-                    return;
-                }
-                if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
-                    TryCudaMergeMOEBatch1GGUF(input, output, indexData, (float*)score.cudaData, true, topk,
-                                              w1, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
+            if (!preferNvfp4W4A4) {
+                if (batch == 1) {
+                    if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
+                        TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
+                        return;
+                    }
+                    if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
+                        TryCudaMergeMOEBatch1GGUF(input, output, indexData, (float*)score.cudaData, true, topk,
+                                                  w1, weights, weightsBatch, sharedScale, gateType)) {
+                        return;
+                    }
                 }
             }
 
