@@ -8252,8 +8252,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
      *
      * 本函数只处理NVFP4_BLOCK_16权重：验证输入和权重布局，将
      * [batch, topk]路由表按expert重排，然后调用原生W4A4 grouped入口。
-     * 它不参与FP8后端选择；失败时返回false，由DoCudaMergeMOE继续走
-     * 原有Legacy流程。
+     * routed experts完成后，如存在shared expert，则通过正式Dense Linear
+     * 主流程单独计算其MLP，并按sharedScale累加到grouped输出。它不参与
+     * FP8后端选择；失败时返回false，由DoCudaMergeMOE继续走Legacy流程。
      *
      * @param input         FP16/BF16输入，逻辑形状为[batch, hidden]。
      * @param output        最终MoE输出。
@@ -8265,7 +8266,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
      * @param w2            down grouped GEMM临时张量。
      * @param weights       expert权重数组。
      * @param weightsBatch  weights数组中的指针数量。
-     * @param sharedScale   shared expert合并系数；本路径不支持shared expert。
+     * @param sharedScale   shared expert输出的合并系数；为0时跳过shared expert。
      * @param gateType      门控类型，支持SwiGLU和GeGLU。
      * @return true表示W4A4 grouped计算成功；false表示条件不满足或执行失败。
      */
@@ -8279,13 +8280,11 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             indexData == nullptr || scoreData == nullptr) {
             return false;
         }
-        if (weights[0] != nullptr && sharedScale != 0.0f) {
-            return false;
-        }
-
         const int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
+        const bool hasSharedExpert =
+            weights[0] != nullptr && weights[1] != nullptr && sharedScale != 0.0f;
         const int minGroupedBatch =
             CudaEnvInt("FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH", 1);
         if (gateup == nullptr || down == nullptr ||
@@ -8296,6 +8295,19 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
             return false;
+        }
+
+        // shared expert不属于top-k路由集合。先验证其独立MLP布局，避免
+        // routed grouped GEMM完成后才发现shared权重无效，导致无法安全回退。
+        if (hasSharedExpert) {
+            Data *sharedGateup = weights[0];
+            Data *sharedDown = weights[1];
+            if (sharedGateup->dims.size() != 2 || sharedDown->dims.size() != 2 ||
+                sharedGateup->dims[1] != hidden ||
+                sharedGateup->dims[0] != sharedDown->dims[1] * 2 ||
+                sharedDown->dims[0] != hidden) {
+                return false;
+            }
         }
 
         int inter = down->dims[1];
@@ -8338,11 +8350,28 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 routePositions[b * topk + j] = pos;
             }
         }
-        return FastllmCudaMergeMoeNvfp4W4A4Grouped(
+        bool ok = FastllmCudaMergeMoeNvfp4W4A4Grouped(
             input, w1, w2, output, weights, weightsBatch,
             routeRows.data(), routeScales.data(), routePositions.data(),
             expertStarts.data(), expertCounts.data(), batch, topk,
             totalTasks, hidden, inter, gateType);
+        if (!ok || !hasSharedExpert) {
+            return ok;
+        }
+
+        // 与vLLM的职责拆分一致：grouped CUTLASS只负责routed experts；
+        // shared expert作为普通MLP单独执行，再按sharedScale累加到路由输出。
+        // DoCudaLinear沿用正式Dense后端选择，因此NVFP4 shared权重会进入
+        // Dense W4A4 CUTLASS，而不是建立仅供MoE测试使用的特殊路径。
+        Data *sharedGateup = weights[0];
+        Data *sharedDown = weights[1];
+        DoCudaLinearReshape(input, *sharedGateup, w1);
+        DoCudaLinear(input, *sharedGateup, *GetEmptyData(), w1);
+        ApplyCudaMoeGate(w1, w2, gateType);
+        DoCudaLinearReshape(w2, *sharedDown, w1);
+        DoCudaLinear(w2, *sharedDown, *GetEmptyData(), w1);
+        FastllmCudaAddTo(output, w1, sharedScale);
+        return true;
     }
 
     static bool TryCudaMergeMOELargeBatchFp8Grouped(
@@ -8585,10 +8614,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             int batch = input.dims[0];
             Data *firstGate = weights != nullptr && weightsBatch >= 4
                 ? weights[2] : nullptr;
-            const bool hasSharedExpert =
-                weights != nullptr && weightsBatch >= 2 &&
-                weights[0] != nullptr && weights[1] != nullptr &&
-                sharedScale != 0.0f;
             const int runtimeArch = FastllmCudaRuntimeArch();
             // 原生NVFP4 grouped CUTLASS是正式W4A4后端。它不按batch/M过滤，
             // batch=1时也优先于旧W4A16 decode kernel，与vLLM后端选择一致。
@@ -8596,52 +8621,54 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 batch > 0 &&
                 (gateType == MoeGateSwiglu || gateType == MoeGateGeglu) &&
                 firstGate != nullptr &&
-                !hasSharedExpert &&
                 firstGate->dataType == DataType::NVFP4_BLOCK_16 &&
                 runtimeArch >= 100 && runtimeArch < 130 &&
                 (runtimeArch < 120 || input.dataType == DataType::BFLOAT16) &&
                 CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_MOE_NVFP4_W4A4", true);
 
-            int marlinTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
-            if (!preferNvfp4W4A4 && TryCudaMergeMOEInt4GroupMarlinIndexed(
-                    input, output, index, score, batch, marlinTopk, w1, w2,
-                    weights, weightsBatch, gateType)) {
-                return;
-            }
-            if (!preferNvfp4W4A4 && batch == 1 && index.dims.size() >= 2) {
-                int topk = index.dims[1];
-                if (TryCudaMergeMOEBatch1Int8Indexed(
-                        input, output, index, score, topk, w1,
+            // 只有未选择NVFP4 W4A4时才探测旧后端，避免small-batch INT4或
+            // large-batch Triton FP8在未来扩展格式后意外截获NVFP4请求。
+            if (!preferNvfp4W4A4) {
+                int legacyTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
+                if (TryCudaMergeMOEInt4GroupMarlinIndexed(
+                        input, output, index, score, batch, legacyTopk, w1, w2,
                         weights, weightsBatch, gateType)) {
                     return;
                 }
-                if (TryCudaMergeMOEBatch1Int4GroupIndexed(
-                        input, output, index, score, topk, w1,
-                        weights, weightsBatch, gateType)) {
-                    return;
-                }
-                if (TryCudaMergeMOEBatch1Fp8Indexed(input, output, index, score, topk,
-                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
-                }
-            } else if (batch > 1 && batch <= 64 && index.dims.size() >= 2) {
-                int topk = index.dims[1];
-                if (TryCudaMergeMOESmallBatchInt4GroupIndexed(
-                        input, output, index, score, batch, topk, w1,
-                        weights, weightsBatch, gateType)) {
-                    return;
-                }
-                if (!preferNvfp4W4A4 &&
-                    TryCudaMergeMOESmallBatchFp8Indexed(
-                        input, output, index, score, batch, topk, w1, weights,
-                        weightsBatch, sharedScale, gateType)) {
-                    return;
-                }
-            } else if (batch > 64 && index.dims.size() >= 2) {
-                int topk = index.dims[1];
-                if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, batch, topk,
-                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
+
+                if (batch == 1 && index.dims.size() >= 2) {
+                    if (TryCudaMergeMOEBatch1Int8Indexed(
+                            input, output, index, score, legacyTopk, w1,
+                            weights, weightsBatch, gateType)) {
+                        return;
+                    }
+                    if (TryCudaMergeMOEBatch1Int4GroupIndexed(
+                            input, output, index, score, legacyTopk, w1,
+                            weights, weightsBatch, gateType)) {
+                        return;
+                    }
+                    if (TryCudaMergeMOEBatch1Fp8Indexed(
+                            input, output, index, score, legacyTopk, w1, weights,
+                            weightsBatch, sharedScale, gateType)) {
+                        return;
+                    }
+                } else if (batch > 1 && batch <= 64 && index.dims.size() >= 2) {
+                    if (TryCudaMergeMOESmallBatchInt4GroupIndexed(
+                            input, output, index, score, batch, legacyTopk, w1,
+                            weights, weightsBatch, gateType)) {
+                        return;
+                    }
+                    if (TryCudaMergeMOESmallBatchFp8Indexed(
+                            input, output, index, score, batch, legacyTopk, w1,
+                            weights, weightsBatch, sharedScale, gateType)) {
+                        return;
+                    }
+                } else if (batch > 64 && index.dims.size() >= 2) {
+                    if (TryCudaTritonMergeMOEFp8Indexed(
+                            input, output, index, score, batch, legacyTopk, w1,
+                            weights, weightsBatch, sharedScale, gateType)) {
+                        return;
+                    }
                 }
             }
             cudaMergeMOEUsedGraphUnsafeFallback = true;
