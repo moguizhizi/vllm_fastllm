@@ -4020,8 +4020,9 @@ namespace {
 
         for (int i = 0; i < warmup; i++) {
             state->Run();
-            ForceDeviceSync();
         }
+        // 与正式异步主流程及vLLM基准一致：整段warmup结束后只同步一次。
+        ForceDeviceSync();
 
         auto begin = Clock::now();
         for (int i = 0; i < iters; i++) {

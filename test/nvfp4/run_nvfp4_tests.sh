@@ -140,7 +140,6 @@ run_ops_functional() {
                         FASTLLM_CUDA_NVFP4_TRACE=1 \
                         FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
                         FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT=1 \
-                        FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=1 \
                         "${optest}" --op mergemoe_fp8 --device cuda:0 \
                         --param weight_type=nvfp4 --param path=check_nvfp4 \
                         --param batch="${moe_m}" --param topk="${moe_topk}" \
@@ -211,7 +210,6 @@ run_ops_performance() {
                     run_logged "op_grouped_moe_w4a4_perf_m${moe_m}_k${moe_topk}_e${moe_experts}" env \
                         FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
                         FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT=1 \
-                        FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=1 \
                         "${optest}" --op mergemoe_fp8 --device cuda:0 \
                         --param weight_type=nvfp4 --param path=operator \
                         --param batch="${moe_m}" --param topk="${moe_topk}" \

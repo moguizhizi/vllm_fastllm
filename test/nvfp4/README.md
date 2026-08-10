@@ -11,7 +11,7 @@
 | dense CUTLASS W4A4 | CUDA 12.8+；CUDA 12.x 编译目标 `100a/120a/121a`，CUDA 13.x 为 `100f/120f/121f`；当前运行时 SM100-SM119 或 SM120-SM129；权重 `NVFP4_BLOCK_16`、blockM=16；输入/输出同为 FP16 或 BF16；支持空 bias 或 FP32 bias；原始 K 为 16 的倍数；K/N 不足 32 时内部补零并裁剪；M>=1 |
 | 动态激活 FP4 | SM100 或 SM120-SM129；FP16/BF16 输入；列数为 16 的倍数；dense 正式入口还受上述 K/N、M 条件约束 |
 | SwiGLU+FP4 融合 | SM100 或 SM120-SM129；FP16/BF16 gate/up；hidden 为 16 的倍数；已接入 Dense `SwigluLinearAdd` 和 grouped MoE |
-| grouped MoE W4A4 | CUDA 12.8+；当前仅 SM100；FP16/BF16；SwiGLU；仅 `NVFP4_BLOCK_16` experts；hidden/inter 为 32 的倍数；expert 数 1-256；batch 默认至少 16；无 shared expert/EP |
+| grouped MoE W4A4 | CUDA 12.8+；SM100-SM119支持FP16/BF16，SM120-SM129支持BF16；SwiGLU；仅 `NVFP4_BLOCK_16` experts；hidden/inter 为32的倍数；expert数1-256；batch>1默认优先使用grouped路径；无shared expert/EP |
 | dense Marlin W4A16 | SM75-SM99；FP16 输入/输出；权重 `NVFP4_BLOCK_16`、blockM=16；无 bias；M>=1；K/N 为 64 的倍数 |
 
 环境变量：
@@ -26,7 +26,8 @@
 - `FASTLLM_CUDA_NVFP4_TRACE=1`：在 log 中打印命中或回退原因；该模式会
   插入CUDA流同步，只用于功能诊断，不用于正式性能测试。
 - `FASTLLM_CUDA_MOE_NVFP4_W4A4=0`：关闭 grouped MoE W4A4。
-- `FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=N`：grouped MoE 门槛，默认 16。
+- `FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=N`：grouped MoE 门槛，默认 1；
+  decode的batch=1仍保留专用路径，batch>1默认优先使用原生grouped W4A4。
 
 ## 权重显存生命周期
 
