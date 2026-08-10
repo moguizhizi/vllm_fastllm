@@ -3735,6 +3735,7 @@ namespace {
         std::string path = "operator";
         std::string weightType = "fp8";
         std::string scaleLayout = "block128";
+        fastllm::MoeGateType gateType = fastllm::MoeGateSwiglu;
         fastllm::Data input, index, score, output;
         fastllm::Data w1, w2, w3, curInput, curOutput;
         fastllm::Data referenceW1, referenceOutput;
@@ -3824,6 +3825,14 @@ namespace {
             path = params.GetString("path");
             weightType = params.GetString("weight_type");
             scaleLayout = params.GetString("scale_layout");
+            const std::string gateTypeName = params.GetString("gate_type");
+            if (gateTypeName == "swiglu") {
+                gateType = fastllm::MoeGateSwiglu;
+            } else if (gateTypeName == "geglu") {
+                gateType = fastllm::MoeGateGeglu;
+            } else {
+                throw std::runtime_error("gate_type must be swiglu or geglu");
+            }
             FastllmCudaSetDevice(0);
 
             fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
@@ -3951,7 +3960,7 @@ namespace {
             if (path == "operator") {
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
-                                  0.0f, output, 0, fastllm::MoeGateSwiglu);
+                                  0.0f, output, 0, gateType);
             } else if (path == "check_nvfp4") {
                 if (weightType != "nvfp4") {
                     throw std::runtime_error("check_nvfp4 requires weight_type=nvfp4");
@@ -3959,12 +3968,12 @@ namespace {
                 setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   referenceW1, w2, w3, curInput, curOutput,
-                                  0.0f, referenceOutput, 0, fastllm::MoeGateSwiglu);
+                                  0.0f, referenceOutput, 0, gateType);
                 ForceDeviceSync();
                 setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
-                                  0.0f, output, 0, fastllm::MoeGateSwiglu);
+                                  0.0f, output, 0, gateType);
                 ForceDeviceSync();
                 ComparisonStats stats = CompareData(
                     ConvertToFloat32Data(referenceOutput),
@@ -4070,6 +4079,7 @@ namespace {
                 params.Add("path", "operator", "operator, check_fp8, check_nvfp4, legacy or warp");
                 params.Add("weight_type", "fp8", "fp8 or nvfp4");
                 params.Add("scale_layout", "block128", "FP8 scale layout: block128 or perchannel");
+                params.Add("gate_type", "swiglu", "swiglu or geglu");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {

@@ -133,7 +133,7 @@ run_ops_functional() {
             --param rows=32 --param hidden=1024 --param input_type=fp16 \
             --warmup 0 --iters 1 --atol 0.20 --rtol 0.20
         local moe_m moe_topk moe_experts
-        for moe_m in 2 64 224; do
+        for moe_m in 1 2 64 224; do
             for moe_topk in 1 8; do
                 for moe_experts in 40 64; do
                     run_logged "op_grouped_moe_w4a4_check_m${moe_m}_k${moe_topk}_e${moe_experts}" env \
@@ -149,6 +149,15 @@ run_ops_functional() {
                 done
             done
         done
+        run_logged "op_grouped_moe_w4a4_check_geglu_m1_k1_e40" env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT=1 \
+            "${optest}" --op mergemoe_fp8 --device cuda:0 \
+            --param weight_type=nvfp4 --param path=check_nvfp4 \
+            --param gate_type=geglu --param batch=1 --param topk=1 \
+            --param experts=40 --param hidden=256 --param inter=256 \
+            --param input_type=bf16 --warmup 0 --iters 1
     else
         run_logged op_dense_marlin_w4a16_check env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
@@ -204,7 +213,7 @@ run_ops_performance() {
                 --param rows=32 --param hidden="${quant_k}" --param input_type=bf16 \
                 --warmup 20 --iters 200 --atol 0.20 --rtol 0.20
         done
-        for moe_m in 2 64 224; do
+        for moe_m in 1 2 64 224; do
             for moe_topk in 1 8; do
                 for moe_experts in 40 64; do
                     run_logged "op_grouped_moe_w4a4_perf_m${moe_m}_k${moe_topk}_e${moe_experts}" env \
