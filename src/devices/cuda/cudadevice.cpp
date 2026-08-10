@@ -6350,6 +6350,37 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 #endif
     }
 
+    /**
+     * 在CUDA设备上执行带路由的MoE前向计算，并按输入条件选择正式后端。
+     *
+     * 输入语义为：每个token由index指定top-k个expert，score给出对应路由
+     * 权重；每个expert依次执行gate/up Linear、门控激活和down Linear，最后
+     * 按score归并到output。函数先清理位于其他GPU的临时张量，再依次尝试
+     * batch=1、小batch、原生NVFP4 grouped CUTLASS、W4A8 grouped等专用
+     * 路径；均不满足时使用通用逐expert路径。NVFP4且batch>1时优先选择
+     * W4A4 grouped CUTLASS，避免被旧W4A16小batch实现提前截获。
+     *
+     * 需要CPU整理路由或动态分配临时缓冲区的fallback会把本次CUDA Graph
+     * 标记为不安全。函数本身不建立跨调用的后端生命周期；权重重排、缓存和
+     * fallback恢复由各Linear或grouped后端负责。
+     *
+     * @param input         输入激活，位于CUDA，逻辑形状为[batch, hidden]。
+     * @param output        MoE输出，逻辑形状与input相同，由命中后端写入。
+     * @param index         expert索引，逻辑形状为[batch, topk]，元素为INT32。
+     * @param score         路由权重，逻辑形状为[batch, topk]，元素为FP32。
+     * @param w1            第一层Linear或grouped gate/up结果的复用临时张量。
+     * @param w2            down Linear结果的复用临时张量。
+     * @param w3            batch=1通用fallback使用的gate/up临时张量。
+     * @param weights       expert权重指针数组；每个expert占连续两个元素，分别
+     *                      为gate/up和down权重。第0对为可选shared expert，
+     *                      routed expert e位于第e+1对。
+     * @param biass         expert偏置指针数组；当前CUDA MergeMOE分支保留该接口，
+     *                      优化路径不消费偏置。
+     * @param sharedScale   shared expert输出的合并系数；没有shared expert时为0。
+     * @param gateType      expert中间激活类型，专用NVFP4路径要求SwiGLU。
+     * @param weightsBatch  weights数组中的Data指针数量，通常为
+     *                      2 * (expert数量 + 1)。
+     */
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
                         Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch) {
 // static std::map<std::string, float> mergeMoeTimeCnt;
