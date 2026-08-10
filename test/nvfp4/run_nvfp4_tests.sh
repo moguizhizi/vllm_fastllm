@@ -158,6 +158,15 @@ run_ops_functional() {
             --param gate_type=geglu --param batch=1 --param topk=1 \
             --param experts=40 --param hidden=256 --param inter=256 \
             --param input_type=bf16 --warmup 0 --iters 1
+        run_logged "op_grouped_moe_w4a4_check_shared_m2_k1_e40" env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            FASTLLM_CUDA_MOE_NVFP4_W4A4=1 \
+            FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT=1 \
+            "${optest}" --op mergemoe_fp8 --device cuda:0 \
+            --param weight_type=nvfp4 --param path=check_nvfp4 \
+            --param shared_expert=1 --param batch=2 --param topk=1 \
+            --param experts=40 --param hidden=256 --param inter=256 \
+            --param input_type=bf16 --warmup 0 --iters 1
     else
         run_logged op_dense_marlin_w4a16_check env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \

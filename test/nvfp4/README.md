@@ -11,7 +11,7 @@
 | dense CUTLASS W4A4 | CUDA 12.8+；CUDA 12.x 编译目标 `100a/120a/121a`，CUDA 13.x 为 `100f/120f/121f`；当前运行时 SM100-SM119 或 SM120-SM129；权重 `NVFP4_BLOCK_16`、blockM=16；输入/输出同为 FP16 或 BF16；支持空 bias 或 FP32 bias；原始 K 为 16 的倍数；K/N 不足 32 时内部补零并裁剪；M>=1 |
 | 动态激活 FP4 | SM100 或 SM120-SM129；FP16/BF16 输入；列数为 16 的倍数；dense 正式入口还受上述 K/N、M 条件约束 |
 | SwiGLU+FP4 融合 | SM100 或 SM120-SM129；FP16/BF16 gate/up；hidden 为 16 的倍数；已接入 Dense `SwigluLinearAdd` 和 grouped MoE |
-| grouped MoE W4A4 | CUDA 12.8+；SM100-SM119支持FP16/BF16，SM120-SM129支持BF16；SwiGLU；仅 `NVFP4_BLOCK_16` experts；hidden/inter 为32的倍数；expert数1-256；batch>1默认优先使用grouped路径；无shared expert/EP |
+| grouped MoE W4A4 | CUDA 12.8+；SM100-SM119支持FP16/BF16，SM120-SM129支持BF16；SwiGLU/GeGLU；仅 `NVFP4_BLOCK_16` routed experts；hidden/inter 为32的倍数；expert数1-256；batch>=1默认优先使用grouped路径；shared expert由正式Dense Linear路径单独计算后累加；不支持EP |
 | dense Marlin W4A16 | SM75-SM99；FP16 输入/输出；权重 `NVFP4_BLOCK_16`、blockM=16；无 bias；M>=1；K/N 为 64 的倍数 |
 
 环境变量：

@@ -4003,6 +4003,7 @@ namespace {
         std::string path = "operator";
         std::string weightType = "fp8";
         std::string scaleLayout = "block128";
+        float sharedScale = 0.0f;
         fastllm::MoeGateType gateType = fastllm::MoeGateSwiglu;
         fastllm::Data input, index, score, output;
         fastllm::Data w1, w2, w3, curInput, curOutput;
@@ -4093,6 +4094,7 @@ namespace {
             path = params.GetString("path");
             weightType = params.GetString("weight_type");
             scaleLayout = params.GetString("scale_layout");
+            sharedScale = params.GetInt("shared_expert") ? 0.5f : 0.0f;
             const std::string gateTypeName = params.GetString("gate_type");
             if (gateTypeName == "swiglu") {
                 gateType = fastllm::MoeGateSwiglu;
@@ -4137,6 +4139,19 @@ namespace {
             ownedWeights.resize((size_t)(experts + 1) * 2);
             weights.assign((size_t)(experts + 1) * 2, nullptr);
             biass.assign((size_t)(experts + 1) * 2, nullptr);
+            if (sharedScale != 0.0f) {
+                ownedWeights[0] = std::make_unique<fastllm::Data>();
+                ownedWeights[1] = std::make_unique<fastllm::Data>();
+                if (weightType == "nvfp4") {
+                    InitNvfp4Weight(*ownedWeights[0], inter * 2, hidden, 101);
+                    InitNvfp4Weight(*ownedWeights[1], hidden, inter, 117);
+                } else {
+                    InitFp8Weight(*ownedWeights[0], inter * 2, hidden, block, 101.0f);
+                    InitFp8Weight(*ownedWeights[1], hidden, inter, block, 117.0f);
+                }
+                weights[0] = ownedWeights[0].get();
+                weights[1] = ownedWeights[1].get();
+            }
             for (int e = 0; e < experts; e++) {
                 int idx = (e + 1) * 2;
                 ownedWeights[idx] = std::make_unique<fastllm::Data>();
@@ -4228,7 +4243,7 @@ namespace {
             if (path == "operator") {
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
-                                  0.0f, output, 0, gateType);
+                                  sharedScale, output, 0, gateType);
             } else if (path == "check_nvfp4") {
                 if (weightType != "nvfp4") {
                     throw std::runtime_error("check_nvfp4 requires weight_type=nvfp4");
@@ -4236,12 +4251,12 @@ namespace {
                 setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   referenceW1, w2, w3, curInput, curOutput,
-                                  0.0f, referenceOutput, 0, gateType);
+                                  sharedScale, referenceOutput, 0, gateType);
                 ForceDeviceSync();
                 setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
-                                  0.0f, output, 0, gateType);
+                                  sharedScale, output, 0, gateType);
                 ForceDeviceSync();
                 ComparisonStats stats = CompareData(
                     ConvertToFloat32Data(referenceOutput),
@@ -4315,7 +4330,9 @@ namespace {
             result.avgMs = 0.0;
         }
         result.bytesMoved = 0.0;
-        result.flops = (double)params.GetInt("batch") * params.GetInt("topk") *
+        const int expertCalls = params.GetInt("topk") +
+                                (params.GetInt("shared_expert") ? 1 : 0);
+        result.flops = (double)params.GetInt("batch") * expertCalls *
                        6.0 * (double)params.GetInt("hidden") * params.GetInt("inter");
         double seconds = result.avgMs / 1000.0;
         if (seconds > 0.0 && result.flops > 0.0) {
@@ -4348,6 +4365,7 @@ namespace {
                 params.Add("weight_type", "fp8", "fp8 or nvfp4");
                 params.Add("scale_layout", "block128", "FP8 scale layout: block128 or perchannel");
                 params.Add("gate_type", "swiglu", "swiglu or geglu");
+                params.Add("shared_expert", "0", "1 enables one separately computed shared expert");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
