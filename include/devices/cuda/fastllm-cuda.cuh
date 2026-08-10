@@ -643,7 +643,7 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     const int *routeRows, const float *routeScales,
     const int *routePositions, const int *expertStarts,
     const int *expertCounts, int batch, int topk, int totalTasks,
-    int hidden, int inter);
+    int hidden, int inter, fastllm::MoeGateType gateType);
 #else
 inline bool TryCudaCutlassNvfp4W4A4(
     const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
@@ -658,7 +658,8 @@ inline void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *) {}
 inline bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     const fastllm::Data &, fastllm::Data &, fastllm::Data &,
     fastllm::Data &, fastllm::Data **, int, const int *, const float *,
-    const int *, const int *, const int *, int, int, int, int, int) {
+    const int *, const int *, const int *, int, int, int, int, int,
+    fastllm::MoeGateType) {
     return false;
 }
 #endif

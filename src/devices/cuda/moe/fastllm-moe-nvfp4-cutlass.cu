@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -50,6 +51,45 @@ __global__ void ReduceRoutes(const T *parts, const int *routePositions,
 }
 
 /**
+ * 对grouped MoE第一层输出执行GeGLU，供后续独立NVFP4量化使用。
+ *
+ * vLLM仅为SwiGLU提供“激活+FP4量化”融合kernel；GeGLU走普通门控激活
+ * 后再独立量化。本kernel实现其中的普通GeGLU阶段，并与grouped GEMM使用
+ * 同一CUDA流，避免借用Data高级接口时改变流边界或产生额外同步。
+ *
+ * 输入每行按[gate, up]连续存放，数学语义为：
+ * output[row,col] = GELU(input[row,col]) * input[row,hidden+col]。
+ * GELU采用FastLLM现有GeGLU相同的erf精确形式。
+ *
+ * @tparam T      输入输出类型，仅支持half或__nv_bfloat16。
+ * @param input   第一层输出，逻辑形状为[rows, 2 * hidden]。
+ * @param output  GeGLU结果，逻辑形状为[rows, hidden]。
+ * @param rows    当前expert分到的路由行数。
+ * @param hidden  GeGLU输出宽度。
+ */
+template <typename T>
+__global__ void GegluRows(const T *input, T *output, int rows, int hidden) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t count = (size_t)rows * hidden;
+    if (index >= count) return;
+    const int row = int(index / hidden);
+    const int column = int(index - (size_t)row * hidden);
+    const size_t inputOffset = (size_t)row * hidden * 2 + column;
+    float gate, up;
+    if constexpr (std::is_same_v<T, half>) {
+        gate = __half2float(input[inputOffset]);
+        up = __half2float(input[inputOffset + hidden]);
+        output[index] = __float2half_rn(
+            gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up);
+    } else {
+        gate = __bfloat162float(input[inputOffset]);
+        up = __bfloat162float(input[inputOffset + hidden]);
+        output[index] = __float2bfloat16_rn(
+            gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up);
+    }
+}
+
+/**
  * Grouped NVFP4 MoE在一张GPU、一个调用线程上的持久临时缓冲区。
  *
  * 路由表、gather结果以及两层激活量化结果均按需扩容并跨调用复用，避免
@@ -66,6 +106,7 @@ struct MoeScratch {
     uint8_t *gateScales = nullptr;
     uint8_t *downValues = nullptr;
     uint8_t *downScales = nullptr;
+    uint8_t *activated = nullptr;
     size_t routeRowsCapacity = 0;
     size_t routePositionsCapacity = 0;
     size_t routeScalesCapacity = 0;
@@ -74,6 +115,7 @@ struct MoeScratch {
     size_t gateScaleCapacity = 0;
     size_t downValueCapacity = 0;
     size_t downScaleCapacity = 0;
+    size_t activatedCapacity = 0;
 };
 
 static thread_local std::map<int, MoeScratch> moeScratch;
@@ -92,7 +134,8 @@ static bool EnsureScratchBuffer(T *&buffer, size_t &capacity, size_t bytes) {
 /** 获取并扩容当前GPU/线程的MoE scratch；正式计算阶段不再释放。 */
 static MoeScratch *GetMoeScratch(size_t routeCount, size_t gatheredBytes,
                                  size_t gateValueBytes, size_t gateScaleBytes,
-                                 size_t downValueBytes, size_t downScaleBytes) {
+                                 size_t downValueBytes, size_t downScaleBytes,
+                                 size_t activatedBytes) {
     const int device = FastllmCudaGetDevice();
     MoeScratch &scratch = moeScratch[device];
     const size_t routeBytes = routeCount * sizeof(int);
@@ -104,7 +147,8 @@ static MoeScratch *GetMoeScratch(size_t routeCount, size_t gatheredBytes,
         !EnsureScratchBuffer(scratch.gateValues, scratch.gateValueCapacity, gateValueBytes) ||
         !EnsureScratchBuffer(scratch.gateScales, scratch.gateScaleCapacity, gateScaleBytes) ||
         !EnsureScratchBuffer(scratch.downValues, scratch.downValueCapacity, downValueBytes) ||
-        !EnsureScratchBuffer(scratch.downScales, scratch.downScaleCapacity, downScaleBytes)) {
+        !EnsureScratchBuffer(scratch.downScales, scratch.downScaleCapacity, downScaleBytes) ||
+        !EnsureScratchBuffer(scratch.activated, scratch.activatedCapacity, activatedBytes)) {
         return nullptr;
     }
     return &scratch;
@@ -132,7 +176,7 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
          const int *routeRows, const float *routeScales,
          const int *routePositions, const int *expertStarts,
          const int *expertCounts, int batch, int topk, int totalTasks,
-         int hidden, int inter) {
+         int hidden, int inter, fastllm::MoeGateType gateType) {
     const fastllm::DataType dtype = std::is_same_v<T, half>
         ? fastllm::DataType::FLOAT16 : fastllm::DataType::BFLOAT16;
     const int experts = weightsBatch / 2 - 1;
@@ -140,6 +184,8 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     // vLLM 的 SM120 grouped kernel 固定输出 BF16；SM100 同时支持 FP16/BF16。
     if (input.dataType != dtype || input.dataDevice != fastllm::DataDevice::CUDA ||
         (arch >= 120 && dtype != fastllm::DataType::BFLOAT16) ||
+        (gateType != fastllm::MoeGateSwiglu &&
+         gateType != fastllm::MoeGateGeglu) ||
         batch < MinBatch() || topk <= 0 || totalTasks != batch * topk ||
         experts <= 0 || experts > 256 || hidden % 32 != 0 || inter % 32 != 0 ||
         routeRows == nullptr || routeScales == nullptr || routePositions == nullptr ||
@@ -195,7 +241,9 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     MoeScratch *scratch = GetMoeScratch(
         totalTasks, (size_t)totalTasks * hidden * sizeof(T),
         (size_t)totalTasks * hidden / 2, gateScaleBytes,
-        (size_t)totalTasks * inter / 2, downScaleBytes);
+        (size_t)totalTasks * inter / 2, downScaleBytes,
+        gateType == fastllm::MoeGateGeglu
+            ? (size_t)totalTasks * inter * sizeof(T) : sizeof(T));
     if (scratch == nullptr) return false;
 
     int *cudaRouteRows = scratch->routeRows;
@@ -264,11 +312,28 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         const uint8_t *weight = nullptr, *weightScales = nullptr;
         const float *weightAlpha = nullptr;
         fastllm::Data &down = *weights[(e + 1) * 2 + 1];
-        ok = FastllmCudaSiluMulNvfp4Quantize(
-                 static_cast<T *>(w1.cudaData) + (size_t)start * inter * 2,
-                 dtype, quantValues, quantScales, count, inter, 1.0f, (void *)stream) &&
-             FastllmCudaPrepareNvfp4W4A4Weight(
-                 down, inter, hidden, &weight, &weightScales, &weightAlpha);
+        const T *gateInput = static_cast<T *>(w1.cudaData) +
+                             (size_t)start * inter * 2;
+        if (gateType == fastllm::MoeGateSwiglu) {
+            // SwiGLU沿用vLLM对应的激活+FP4量化融合路径。
+            ok = FastllmCudaSiluMulNvfp4Quantize(
+                gateInput, dtype, quantValues, quantScales,
+                count, inter, 1.0f, (void *)stream);
+        } else {
+            // vLLM的GeGLU路径并不融合量化：先完成门控激活，再调用普通
+            // NVFP4动态量化。activated按路由顺序复用持久scratch。
+            T *activated = reinterpret_cast<T *>(scratch->activated) +
+                           (size_t)start * inter;
+            const size_t elements = (size_t)count * inter;
+            GegluRows<<<(elements + 255) / 256, 256, 0, stream>>>(
+                gateInput, activated, count, inter);
+            ok = cudaGetLastError() == cudaSuccess &&
+                 FastllmCudaNvfp4QuantizeActivation(
+                     activated, dtype, quantValues, quantScales,
+                     count, inter, 1.0f, (void *)stream);
+        }
+        ok = ok && FastllmCudaPrepareNvfp4W4A4Weight(
+            down, inter, hidden, &weight, &weightScales, &weightAlpha);
         if (ok) {
             rows.push_back(count); a.push_back(quantValues); b.push_back(weight);
             scaleA.push_back(quantScales); scaleB.push_back(weightScales);
@@ -304,7 +369,7 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
         const int *routeRows, const float *routeScales,
         const int *routePositions, const int *expertStarts,
         const int *expertCounts, int batch, int topk, int totalTasks,
-        int hidden, int inter) {
+        int hidden, int inter, fastllm::MoeGateType gateType) {
     int arch = FastllmCudaRuntimeArch();
     if (!Enabled() || arch < 100 || arch >= 130 || weights == nullptr || weightsBatch < 4 ||
         (weightsBatch & 1)) return false;
@@ -312,11 +377,11 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     if (input.dataType == fastllm::DataType::FLOAT16)
         ok = Run<half>(input, w1, w2, output, weights, weightsBatch,
             routeRows, routeScales, routePositions, expertStarts, expertCounts,
-            batch, topk, totalTasks, hidden, inter);
+            batch, topk, totalTasks, hidden, inter, gateType);
     else if (input.dataType == fastllm::DataType::BFLOAT16)
         ok = Run<__nv_bfloat16>(input, w1, w2, output, weights, weightsBatch,
             routeRows, routeScales, routePositions, expertStarts, expertCounts,
-            batch, topk, totalTasks, hidden, inter);
+            batch, topk, totalTasks, hidden, inter, gateType);
     if (!ok) {
         for (int i = 2; i < weightsBatch; ++i) {
             fastllm::Data *weight = weights[i];

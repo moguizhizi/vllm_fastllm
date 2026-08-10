@@ -6149,7 +6149,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
     static bool TryCudaMergeMOELargeBatchFp8Grouped(
         Data &input, Data &output, const int32_t *indexData, const float *scoreData, int batch, int topk,
         Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
-        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) ||
+        if ((gateType != MoeGateSwiglu && gateType != MoeGateGeglu) ||
+            !IsCudaMergeMoeFp8InputType(input.dataType) ||
             input.dims.size() == 0 || weightsBatch < 4 || (weightsBatch & 1) ||
             indexData == nullptr || scoreData == nullptr) {
             return false;
@@ -6165,6 +6166,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                      gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
         bool isNVFP4 = gateup != nullptr && down != nullptr &&
                        IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
+        // 旧FP8 grouped实现只支持SwiGLU；GeGLU仅接入原生NVFP4 W4A4。
+        if (gateType == MoeGateGeglu && !isNVFP4) {
+            return false;
+        }
         const int minGroupedBatch = isNVFP4
             ? CudaEnvInt("FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH", 1)
             : CudaEnvInt("FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH", 16);
@@ -6225,7 +6230,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 input, w1, w2, output, weights, weightsBatch,
                 routeRows.data(), routeScales.data(), routePositions.data(),
                 expertStarts.data(), expertCounts.data(), batch, topk,
-                totalTasks, hidden, inter)) {
+                totalTasks, hidden, inter, gateType)) {
             return true;
         }
         if (isFp8 && FastllmCudaRuntimeArch() == 90 &&
@@ -6357,8 +6362,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
      * 权重；每个expert依次执行gate/up Linear、门控激活和down Linear，最后
      * 按score归并到output。函数先清理位于其他GPU的临时张量，再依次尝试
      * batch=1、小batch、原生NVFP4 grouped CUTLASS、W4A8 grouped等专用
-     * 路径；均不满足时使用通用逐expert路径。NVFP4且batch>1时优先选择
-     * W4A4 grouped CUTLASS，避免被旧W4A16小batch实现提前截获。
+     * 路径；均不满足时使用通用逐expert路径。原生NVFP4不按batch过滤，
+     * batch=1的decode同样优先选择W4A4 grouped CUTLASS，避免被旧W4A16
+     * 实现提前截获。
      *
      * 需要CPU整理路由或动态分配临时缓冲区的fallback会把本次CUDA Graph
      * 标记为不安全。函数本身不建立跨调用的后端生命周期；权重重排、缓存和
@@ -6377,7 +6383,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
      * @param biass         expert偏置指针数组；当前CUDA MergeMOE分支保留该接口，
      *                      优化路径不消费偏置。
      * @param sharedScale   shared expert输出的合并系数；没有shared expert时为0。
-     * @param gateType      expert中间激活类型，专用NVFP4路径要求SwiGLU。
+     * @param gateType      expert中间激活类型；NVFP4 grouped路径支持SwiGLU
+     *                      和GeGLU，其他专用路径按各自能力判断。
      * @param weightsBatch  weights数组中的Data指针数量，通常为
      *                      2 * (expert数量 + 1)。
      */
@@ -6408,17 +6415,24 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             int batch = input.dims[0];
             Data *firstGate = weights != nullptr && weightsBatch >= 4
                 ? weights[2] : nullptr;
+            const bool hasSharedExpert =
+                weights != nullptr && weightsBatch >= 2 &&
+                weights[0] != nullptr && weights[1] != nullptr &&
+                sharedScale != 0.0f;
             const int runtimeArch = FastllmCudaRuntimeArch();
-            // 原生NVFP4 grouped CUTLASS是正式W4A4后端。batch>1时优先于
-            // 旧W4A16 small-batch kernel，避免性能测试和正式推理静默走旧路径。
+            // 原生NVFP4 grouped CUTLASS是正式W4A4后端。它不按batch/M过滤，
+            // batch=1时也优先于旧W4A16 decode kernel，与vLLM后端选择一致。
             const bool preferNvfp4Grouped =
-                batch > 1 && gateType == MoeGateSwiglu && firstGate != nullptr &&
+                batch > 0 &&
+                (gateType == MoeGateSwiglu || gateType == MoeGateGeglu) &&
+                firstGate != nullptr &&
+                !hasSharedExpert &&
                 firstGate->dataType == DataType::NVFP4_BLOCK_16 &&
                 runtimeArch >= 100 && runtimeArch < 130 &&
                 (runtimeArch < 120 || input.dataType == DataType::BFLOAT16) &&
                 CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_MOE_NVFP4_W4A4", true);
 
-            if (batch == 1 && index.dims.size() >= 2) {
+            if (!preferNvfp4Grouped && batch == 1 && index.dims.size() >= 2) {
                 int topk = index.dims[1];
                 if (TryCudaMergeMOEBatch1Int8Indexed(
                         input, output, index, score, topk, w1,
