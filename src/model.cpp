@@ -521,34 +521,6 @@ namespace fastllm {
         return std::atoi(weightName.substr(begin, end - begin).c_str());
     }
 
-    static int GetMoeWeightLayerId(const std::string &weightName) {
-        // Auxiliary stacks such as mtp.layers use their own layer numbering.
-        // Only infer main-decoder paths when no explicit merge metadata exists.
-        size_t begin = std::string::npos;
-        const std::string modelMarker = "model.layers.";
-        size_t modelMarkerPos = weightName.find(modelMarker);
-        if (modelMarkerPos != std::string::npos &&
-            (modelMarkerPos == 0 || weightName[modelMarkerPos - 1] == '.')) {
-            begin = modelMarkerPos + modelMarker.size();
-        } else if (weightName.rfind("layers.", 0) == 0) {
-            begin = strlen("layers.");
-        }
-        if (begin == std::string::npos) {
-            return -1;
-        }
-
-        size_t end = begin;
-        while (end < weightName.size() &&
-               std::isdigit((unsigned char)weightName[end])) {
-            end++;
-        }
-        if (end == begin || end >= weightName.size() ||
-            weightName[end] != '.') {
-            return -1;
-        }
-        return std::atoi(weightName.substr(begin, end - begin).c_str());
-    }
-
     static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
         if (model == nullptr) {
             return "";
