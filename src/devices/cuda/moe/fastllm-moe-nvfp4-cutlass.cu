@@ -181,6 +181,8 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         ? fastllm::DataType::FLOAT16 : fastllm::DataType::BFLOAT16;
     const int experts = weightsBatch / 2 - 1;
     const int arch = FastllmCudaRuntimeArch();
+    // 先验证架构、输入类型、路由规模和张量布局；任一条件不满足时交由
+    // 外层决定是否进入Legacy，不在本函数中改变后端生命周期。
     // vLLM 的 SM120 grouped kernel 固定输出 BF16；SM100 同时支持 FP16/BF16。
     if (input.dataType != dtype || input.dataDevice != fastllm::DataDevice::CUDA ||
         (arch >= 120 && dtype != fastllm::DataType::BFLOAT16) ||
@@ -202,6 +204,8 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
             down->dims != std::vector<int>({hidden, inter})) return false;
     }
 
+    // 为两次grouped GEMM准备正式推理使用的中间张量：w1保存gate/up，
+    // w2保存down结果；output保持与输入相同的batch/token布局。
     w1.dataDevice = fastllm::DataDevice::CUDA;
     w1.dataDeviceIds = input.dataDeviceIds;
     w1.dataType = dtype;
@@ -246,6 +250,8 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
             ? (size_t)totalTasks * inter * sizeof(T) : sizeof(T));
     if (scratch == nullptr) return false;
 
+    // 路由元数据由CPU按expert连续排列；异步上传后，gather kernel把原始
+    // token行重排为grouped GEMM要求的expert分组输入。
     int *cudaRouteRows = scratch->routeRows;
     int *cudaRoutePositions = scratch->routePositions;
     float *cudaRouteScales = scratch->routeScales;
@@ -265,6 +271,8 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         ok = cudaGetLastError() == cudaSuccess;
     } else ok = false;
 
+    // 第一层：逐个活跃expert量化输入、取得对应CUTLASS重排权重，然后
+    // 将各expert的指针和实际行数组成一次grouped W4A4 GEMM参数。
     std::vector<const uint8_t *> a, b, scaleA, scaleB;
     std::vector<const float *> alpha;
     std::vector<void *> d;
@@ -304,6 +312,8 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
                   rows.data(), (int)rows.size(), inter * 2, hidden, dtype, (void *)stream);
     }
 
+    // 第二层：复用同一组参数容器和持久scratch。SwiGLU走融合激活量化，
+    // GeGLU先计算门控激活再独立量化，最终调用down grouped W4A4 GEMM。
     a.clear(); b.clear(); scaleA.clear(); scaleB.clear(); alpha.clear(); d.clear(); rows.clear();
     for (size_t i = 0; ok && i < activeExperts.size(); ++i) {
         int e = activeExperts[i], count = expertCounts[e], start = expertStarts[e];
@@ -351,6 +361,8 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
                   rows.data(), (int)rows.size(), hidden, inter, dtype, (void *)stream);
     }
     if (ok) {
+        // grouped GEMM输出按路由顺序排列；根据原始token/topk位置和路由
+        // 分数做加权归并，恢复为output[batch, hidden]。
         size_t elements = (size_t)batch * hidden;
         ReduceRoutes<<<(elements + 255) / 256, 256, 0, stream>>>(
             static_cast<const T *>(w2.cudaData), cudaRoutePositions,
@@ -363,6 +375,51 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
 }
 } // namespace
 
+/**
+ * 执行一次NVFP4 W4A4 grouped MoE计算。
+ *
+ * 本函数是CUDA grouped W4A4 MoE的公开入口，负责检查运行时开关和GPU
+ * 架构，并按输入类型分派到内部Run实现。内部流程依次完成路由行gather、
+ * gate/up激活动态NVFP4量化、第一层grouped GEMM、SwiGLU或GeGLU门控、
+ * down激活动态NVFP4量化、第二层grouped GEMM，以及top-k路由加权归并。
+ * 本函数不构造路由表；调用方必须提前按expert连续排列路由元数据。
+ *
+ * 数学语义为：对每个token选中的top-k expert分别计算
+ * down(activation(gate_up(input)))，再乘以对应routeScales并求和。
+ * gate/up权重逻辑形状为[2 * inter, hidden]，down权重逻辑形状为
+ * [hidden, inter]，两者均为NVFP4_BLOCK_16布局。
+ *
+ * 执行失败时，本函数恢复已经释放原始CUDA表示的NVFP4权重，使调用方
+ * 可以安全进入Legacy路径；STRICT模式下直接抛出异常，禁止静默降级。
+ *
+ * @param input           FP16或BF16输入，逻辑形状为[batch, hidden]；SM120
+ *                        当前仅接受BF16。
+ * @param w1              第一层grouped GEMM临时输出，函数内调整为
+ *                        [totalTasks, 2 * inter]。
+ * @param w2              第二层grouped GEMM临时输出，函数内调整为
+ *                        [totalTasks, hidden]。
+ * @param output           最终MoE输出，逻辑形状与input一致。
+ * @param weights          expert权重指针数组；第0对为可选shared expert，
+ *                        routed expert e使用第e+1对gate/up和down权重。
+ * @param weightsBatch     weights数组中的Data指针数量，必须为偶数且至少为4。
+ * @param routeRows        按expert分组后的任务到原始input行号的映射，长度为
+ *                        totalTasks。
+ * @param routeScales      每条路由的top-k权重，按分组后任务顺序排列，长度为
+ *                        totalTasks。
+ * @param routePositions   原始[token, topk]位置到分组后任务位置的映射，长度
+ *                        为batch * topk。
+ * @param expertStarts     每个expert在分组任务数组中的起始位置。
+ * @param expertCounts     每个expert本次参与计算的任务数量。
+ * @param batch            输入token行数，即grouped MoE的M总规模。
+ * @param topk             每个token选中的routed expert数量。
+ * @param totalTasks       总路由任务数，必须等于batch * topk。
+ * @param hidden           模型隐藏维度，必须按32对齐。
+ * @param inter            单个expert的中间维度，必须按32对齐。
+ * @param gateType         门控激活类型，当前支持MoeGateSwiglu和
+ *                        MoeGateGeglu。
+ * @return true表示两次grouped W4A4 GEMM和路由归并均成功；false表示条件
+ *         不满足或执行失败，具体路径可通过FASTLLM_CUDA_NVFP4_TRACE查看。
+ */
 bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
@@ -383,6 +440,8 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
             routeRows, routeScales, routePositions, expertStarts, expertCounts,
             batch, topk, totalTasks, hidden, inter, gateType);
     if (!ok) {
+        // CUTLASS路径失败后恢复原始权重表示，保证后续Legacy计算不会读取
+        // 已释放的cudaData；STRICT模式用于测试时阻止这种回退。
         for (int i = 2; i < weightsBatch; ++i) {
             fastllm::Data *weight = weights[i];
             if (weight != nullptr && weight->dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
