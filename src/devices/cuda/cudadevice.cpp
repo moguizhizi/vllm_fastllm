@@ -7769,12 +7769,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         FastllmCudaFree(cudaScales);
     }
 
-    static bool IsCudaMergeMoeFp8InputType(DataType dataType) {
+    static bool IsCudaMergeMoeFp16Bf16InputType(DataType dataType) {
         return dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16;
     }
 
     static bool IsCudaMergeMoeGGUFInputType(DataType dataType) {
-        return dataType == DataType::FLOAT32 || IsCudaMergeMoeFp8InputType(dataType);
+        return dataType == DataType::FLOAT32 || IsCudaMergeMoeFp16Bf16InputType(dataType);
     }
 
     static bool IsCudaMergeMoeNVFP4WeightType(DataType dataType) {
@@ -7912,7 +7912,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
     static bool TryCudaMergeMOEBatch1Fp8(
         Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
         Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
-        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0) {
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp16Bf16InputType(input.dataType) || input.dims.size() == 0) {
             return false;
         }
         if (weights[0] != nullptr && sharedScale != 0.0f) {
@@ -8120,7 +8120,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
     static bool TryCudaMergeMOEBatch1Fp8Indexed(
         Data &input, Data &output, Data &index, Data &score, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
-        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0 ||
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp16Bf16InputType(input.dataType) || input.dims.size() == 0 ||
             index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
             score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
             weightsBatch < 4) {
@@ -8198,7 +8198,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         Data &input, Data &output, Data &index, Data &score, int batch, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
         if (batch <= 1 || batch > 64 ||
-            gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0 ||
+            gateType != MoeGateSwiglu || !IsCudaMergeMoeFp16Bf16InputType(input.dataType) || input.dims.size() == 0 ||
             index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
             score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
             weightsBatch < 4) {
@@ -8274,7 +8274,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         Data &input, Data &output, const int32_t *indexData, const float *scoreData, int batch, int topk,
         Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
         if ((gateType != MoeGateSwiglu && gateType != MoeGateGeglu) ||
-            !IsCudaMergeMoeFp8InputType(input.dataType) ||
+            !IsCudaMergeMoeFp16Bf16InputType(input.dataType) ||
             input.dims.size() == 0 || batch <= 0 || topk <= 0 ||
             weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
             indexData == nullptr || scoreData == nullptr) {
@@ -8379,7 +8379,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
         int minGroupedBatch = CudaEnvInt("FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH", 16);
         if (batch < minGroupedBatch || gateType != MoeGateSwiglu ||
-            !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0 ||
+            !IsCudaMergeMoeFp16Bf16InputType(input.dataType) || input.dims.size() == 0 ||
             weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
             indexData == nullptr || scoreData == nullptr) {
             return false;
@@ -8944,7 +8944,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         bool isFp8Block128 = gate.dataType == DataType::FP8_E4M3_BLOCK_128 &&
                              up.dataType == DataType::FP8_E4M3_BLOCK_128 &&
                              down.dataType == DataType::FP8_E4M3_BLOCK_128;
-        if (!IsCudaMergeMoeFp8InputType(input.dataType) || input.dataDevice != DataDevice::CUDA ||
+        if (!IsCudaMergeMoeFp16Bf16InputType(input.dataType) || input.dataDevice != DataDevice::CUDA ||
             index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
             score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
             gate.dataDevice != DataDevice::CUDA || up.dataDevice != DataDevice::CUDA || down.dataDevice != DataDevice::CUDA ||
