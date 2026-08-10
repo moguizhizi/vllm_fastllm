@@ -215,6 +215,12 @@ namespace fastllm {
         this->specialWeightLayerIds[weightName] = layerId;
     }
 
+    std::string basellm::SelectSpecialWeightDevice(const std::string &weightName,
+                                                   int layerId) const {
+        (void)weightName;
+        return this->SelectMoeDeviceForLayer(layerId);
+    }
+
     bool basellm::UseLayeredMoeDevice(int layerId) const {
         if (this->moeDeviceLayers < 0 || this->layeredMoeDeviceMap.empty() ||
             this->block_cnt <= 0 || layerId < 0) {
@@ -291,12 +297,20 @@ namespace fastllm {
     }
 
     static int ParseRoutedExpertIndex(const std::string &weightName) {
-        const std::string marker = ".ffn.experts.";
-        size_t pos = weightName.find(marker);
-        if (pos == std::string::npos) {
+        const char *markers[] = {".ffn.experts.", ".moe.experts."};
+        size_t pos = std::string::npos;
+        size_t markerSize = 0;
+        for (const char *marker : markers) {
+            pos = weightName.find(marker);
+            if (pos != std::string::npos) {
+                markerSize = std::strlen(marker);
+                break;
+            }
+        }
+        if (pos == std::string::npos || markerSize == 0) {
             return -1;
         }
-        pos += marker.size();
+        pos += markerSize;
         size_t end = pos;
         while (end < weightName.size() && std::isdigit((unsigned char)weightName[end])) {
             end++;
@@ -344,6 +358,7 @@ namespace fastllm {
         if ((model->model_type != "qwen3_moe" &&
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
+             model->model_type != "laguna" &&
              model->model_type != "minimax_m2" &&
              model->model_type != "deepseek_v4" &&
              model->model_struct != "qwen3_5") ||
@@ -361,8 +376,74 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        const DeepSeekV4Model *deepseekV4 =
+            model->model_type == "deepseek_v4" ?
+                dynamic_cast<const DeepSeekV4Model*>(model) : nullptr;
+        if (deepseekV4 != nullptr) {
+            if (weightName.find(".attn.wq_b.weight") !=
+                std::string::npos) {
+                data.tpSplitUnit =
+                    deepseekV4->GetTensorParallelAttentionSplitUnit();
+            } else if (weightName.find(".attn.wo_a.weight") !=
+                           std::string::npos ||
+                       weightName.find(".attn.wo_b.weight") !=
+                           std::string::npos) {
+                data.tpSplitUnit =
+                    deepseekV4->GetTensorParallelOutputGroupSplitUnit();
+            }
+        }
         int routedExpert = ParseRoutedExpertIndex(weightName);
-        if (model->model_type == "deepseek_v4" && routedExpert >= 0) {
+        if (model->model_type == "laguna" && routedExpert >= 0 &&
+            model->num_experts > 0) {
+            int totalRatio = 0;
+            for (int device : devices) {
+                auto ratioIt = ratios.find(device);
+                totalRatio += ratioIt == ratios.end()
+                    ? 1 : std::max(1, ratioIt->second);
+            }
+            int accumulatedRatio = 0;
+            int expertStart = 0;
+            for (int i = 0; i < (int)devices.size(); i++) {
+                auto ratioIt = ratios.find(devices[i]);
+                accumulatedRatio += ratioIt == ratios.end()
+                    ? 1 : std::max(1, ratioIt->second);
+                int expertEnd = i + 1 == (int)devices.size()
+                    ? model->num_experts
+                    : (int)((long long)model->num_experts *
+                            accumulatedRatio / totalRatio);
+                if (routedExpert >= expertStart && routedExpert < expertEnd) {
+                    // These source tensors are consumed layer-by-layer into a
+                    // local fused MoE tensor before the first ForwardGPU call.
+                    // On four Blackwell GPUs, keeping every 3 MiB down-proj in
+                    // an individual cudaMalloc rounds it to a 4 MiB allocation
+                    // and wastes about 3 GiB per rank across 47 x 64 experts.
+                    // Pack TP=4 sources into weight slabs; once a layer is
+                    // fused all of its source blocks retire together.  Keep the
+                    // established direct-allocation path for other TP sizes.
+                    data.directMemory = devices.size() != 4;
+                    return PlaceMultiCudaWeightOnDevice(
+                        data, devices, devices[i]);
+                }
+                expertStart = expertEnd;
+            }
+            return false;
+        }
+        // Qwen3.5 AWQ routed experts are repacked once into a consolidated
+        // grouped-Marlin layout. Keep their TP shards out of the mixed
+        // model-weight slab so that dropping the compact representation
+        // actually returns its memory instead of leaving slab holes.
+        // Embedded DeepSeek-V4 DSpark runs in no-EP mode: shard every expert's
+        // intermediate dimension across the TP devices.  Ordinary DeepSeek-V4
+        // execution keeps the established round-robin expert placement.
+        const bool deepSeekV4TensorParallelExperts =
+            deepseekV4 != nullptr &&
+            deepseekV4->UseTensorParallelRoutedExperts();
+        bool directLocalMemory =
+            model->model_struct == "qwen3_5" &&
+            weightName.find(".mlp.experts.") != std::string::npos &&
+            data.dataType == DataType::INT4_GROUP;
+        if (model->model_type == "deepseek_v4" && routedExpert >= 0 &&
+            !deepSeekV4TensorParallelExperts) {
             constexpr int ownerOffset = 0;
             int ownerCount = (int)devices.size();
             if (ownerCount <= 0) {
@@ -375,17 +456,23 @@ namespace fastllm {
             data.tpLinearType = TP_LINEAR_ROW;
             data.tpPackType = TP_PACK_GATEUP;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 0, explicitDeviceRatios,
+                directLocalMemory);
         }
         if (typeIt->second == "linearRow") {
             data.tpLinearType = TP_LINEAR_ROW;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 0, explicitDeviceRatios,
+                directLocalMemory);
         }
         if (typeIt->second == "linearColumn") {
             data.tpLinearType = TP_LINEAR_COLUMN;
             DivisionScheme scheme = BuildMultiCudaColumnSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 1, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 1, explicitDeviceRatios,
+                directLocalMemory);
         }
         return false;
     }
@@ -403,7 +490,35 @@ namespace fastllm {
         if (layerIt == model->specialWeightLayerIds.end() || layerIt->second < 0) {
             return "";
         }
-        return model->SelectMoeDeviceForLayer(layerIt->second);
+        return model->SelectSpecialWeightDevice(weightName, layerIt->second);
+    }
+
+    static int GetMoeWeightLayerId(const std::string &weightName) {
+        // Auxiliary stacks such as mtp.layers use their own layer numbering.
+        // Only infer main-decoder paths when no explicit merge metadata exists.
+        size_t begin = std::string::npos;
+        const std::string modelMarker = "model.layers.";
+        size_t modelMarkerPos = weightName.find(modelMarker);
+        if (modelMarkerPos != std::string::npos &&
+            (modelMarkerPos == 0 || weightName[modelMarkerPos - 1] == '.')) {
+            begin = modelMarkerPos + modelMarker.size();
+        } else if (weightName.rfind("layers.", 0) == 0) {
+            begin = strlen("layers.");
+        }
+        if (begin == std::string::npos) {
+            return -1;
+        }
+
+        size_t end = begin;
+        while (end < weightName.size() &&
+               std::isdigit((unsigned char)weightName[end])) {
+            end++;
+        }
+        if (end == begin || end >= weightName.size() ||
+            weightName[end] != '.') {
+            return -1;
+        }
+        return std::atoi(weightName.substr(begin, end - begin).c_str());
     }
 
     static int GetMoeWeightLayerId(const std::string &weightName) {
@@ -500,7 +615,9 @@ namespace fastllm {
             moeSpecialCount++;
             auto layerIt = this->specialWeightLayerIds.find(weightName);
             if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0 ||
-                !DeviceNameMatchesType(this->SelectMoeDeviceForLayer(layerIt->second), "numa")) {
+                !DeviceNameMatchesType(
+                    this->SelectSpecialWeightDevice(weightName, layerIt->second),
+                    "numa")) {
                 continue;
             }
             numaSelectedCount++;
@@ -941,6 +1058,18 @@ namespace fastllm {
 
                     nvfp4GroupScales.clear();
                     nvfp4GlobalScale = 1.0f;
+                    // Keep the per-tensor dequant multiplier as metadata.  The
+                    // compact CUDA layout below stores only the already-combined
+                    // float scale (FP8 scale * multiplier) in each 16-value
+                    // block.  NVFP4 Marlin needs a tensor-level multiplier as
+                    // well, so retain it here rather than trying to infer it
+                    // later from rounded block scales.  Merged linear weights
+                    // append this vector, allowing the Marlin preparation path
+                    // to choose a common multiplier for all merged partitions.
+                    if (dstType == DataType::NVFP4_BLOCK_16) {
+                        scalesBuffer = new float[1];
+                        scalesBuffer[0] = scale2Value;
+                    }
 
                     size_t blockBytes = dstType == DataType::NVFP4_BLOCK_16 ? 8 + sizeof(float) : 9;
                     size_t scaleCols = (m - 1) / 16 + 1;
