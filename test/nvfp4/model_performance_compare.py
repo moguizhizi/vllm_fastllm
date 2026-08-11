@@ -427,6 +427,9 @@ def run_vllm(args, prompts, result_dir, mode):
         "--max-num-seqs", str(max(decode_batch_cases(args))),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--trust-remote-code", "--linear-backend", "cutlass",
+        # Dense Linear与NVFP4 MoE分别受linear_backend和moe_backend控制。
+        # 固定vLLM原生CUTLASS，避免auto选择FLASHINFER_CUTLASS触发运行时JIT。
+        "--moe-backend", "cutlass",
         "--enable-prefix-caching", "--enable-force-include-usage",
     ]
     if mode == "eager":
