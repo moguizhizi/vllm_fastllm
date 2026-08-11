@@ -96,6 +96,9 @@ def run_vllm(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=True,
         linear_backend="cutlass",
+        # linear_backend只控制Dense Linear；MoE必须单独固定为vLLM
+        # CUTLASS，否则auto会优先选择FLASHINFER_CUTLASS并触发运行时JIT。
+        moe_backend="cutlass",
     )
     params = SamplingParams(
         temperature=0.0,
