@@ -164,6 +164,54 @@ static bool StrictEnabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+/**
+ * 执行一次NVFP4 W4A4 CUTLASS grouped MoE计算。
+ *
+ * 本函数只负责单次设备计算，不选择或固定MoE后端，也不处理失败后的
+ * CUTLASS cache销毁和原始权重恢复。执行流程为：校验输入、路由和全部
+ * routed expert权重；将input按expert聚集；动态量化激活；执行gate/up
+ * grouped W4A4 GEMM；完成SwiGLU或GeGLU；再次动态量化并执行down
+ * grouped W4A4 GEMM；最后按照routePositions和routeScales归并top-k结果。
+ *
+ * 数学语义为：对每个token x及其选中的expert e，计算
+ * down_e(activation(gate_up_e(x)))，乘以对应路由权重后在top-k维求和。
+ * input和output逻辑形状为[batch, hidden]；gate/up权重形状为
+ * [2 * inter, hidden]；down权重形状为[hidden, inter]。权重必须采用
+ * NVFP4_BLOCK_16，hidden和inter必须按32对齐。SM120仅接受BF16，
+ * SM100路径可接受FP16或BF16。CUDA Graph捕获期间不在此路径首次执行。
+ *
+ * @tparam T              激活及输出的CUDA元素类型，仅支持half或
+ *                        __nv_bfloat16，并且必须与input.dataType一致。
+ * @param input           CUDA输入张量，逻辑形状为[batch, hidden]。
+ * @param w1              gate/up grouped GEMM临时输出；函数内调整为
+ *                        [totalTasks, 2 * inter]。
+ * @param w2              down grouped GEMM临时输出；函数内调整为
+ *                        [totalTasks, hidden]。
+ * @param output          最终加权归并结果，逻辑形状与input一致。
+ * @param weights         MoE权重指针数组；前两个槽位保留给shared expert，
+ *                        routed expert e使用weights[2 + 2 * e]作为gate/up，
+ *                        weights[3 + 2 * e]作为down。
+ * @param weightsBatch    weights中的指针数量，routed expert数量为
+ *                        weightsBatch / 2 - 1。
+ * @param routeRows       按expert连续分组后，每条任务对应的input行号，
+ *                        长度为totalTasks。
+ * @param routeScales     每条分组任务的路由权重，长度为totalTasks。
+ * @param routePositions  原始[token, topk]槽位到分组任务位置的反向映射，
+ *                        长度为batch * topk。
+ * @param expertStarts    每个routed expert在分组任务数组中的起始偏移，
+ *                        长度为expert数量。
+ * @param expertCounts    每个routed expert本次处理的任务行数，长度为
+ *                        expert数量。
+ * @param batch           输入token行数，即总的MoE输入M维。
+ * @param topk            每个token选中的routed expert数量。
+ * @param totalTasks      路由任务总数，必须等于batch * topk。
+ * @param hidden          模型隐藏维度，也是gate/up GEMM的K维和down GEMM的N维。
+ * @param inter           单个expert中间维度，也是gate/up输出半宽和down GEMM的K维。
+ * @param gateType        门控激活类型，支持MoeGateSwiglu和MoeGateGeglu。
+ * @return true表示聚集、两次量化、两次grouped GEMM及归并均成功；false
+ *         表示语义、布局、资源申请或CUDA启动失败，由外层生命周期入口
+ *         决定首次回退或固定后报错。
+ */
 template <typename T>
 bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
          fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
