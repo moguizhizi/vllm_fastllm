@@ -4010,6 +4010,8 @@ namespace {
         fastllm::Data referenceW1, referenceOutput;
         std::vector<std::unique_ptr<fastllm::Data>> ownedWeights;
         std::vector<fastllm::Data*> weights;
+        std::vector<std::unique_ptr<fastllm::Data>> referenceOwnedWeights;
+        std::vector<fastllm::Data*> referenceWeights;
         std::vector<fastllm::Data*> biass;
 
         static void InitFp8Weight(fastllm::Data &weight, int rows, int cols, int block, float seed) {
@@ -4176,6 +4178,30 @@ namespace {
                 weights[idx + 1] = ownedWeights[idx + 1].get();
             }
 
+            // grouped正确性检查使用独立权重对象生成非grouped参考值，避免
+            // 参考计算提前改变正式被测权重的Prepared/Cutlass生命周期。
+            if (weightType == "nvfp4" && path == "check_nvfp4") {
+                referenceOwnedWeights.resize(weights.size());
+                referenceWeights.assign(weights.size(), nullptr);
+                if (sharedScale != 0.0f) {
+                    referenceOwnedWeights[0] = std::make_unique<fastllm::Data>();
+                    referenceOwnedWeights[1] = std::make_unique<fastllm::Data>();
+                    InitNvfp4Weight(*referenceOwnedWeights[0], inter * 2, hidden, 101);
+                    InitNvfp4Weight(*referenceOwnedWeights[1], hidden, inter, 117);
+                    referenceWeights[0] = referenceOwnedWeights[0].get();
+                    referenceWeights[1] = referenceOwnedWeights[1].get();
+                }
+                for (int e = 0; e < experts; ++e) {
+                    const int idx = (e + 1) * 2;
+                    referenceOwnedWeights[idx] = std::make_unique<fastllm::Data>();
+                    referenceOwnedWeights[idx + 1] = std::make_unique<fastllm::Data>();
+                    InitNvfp4Weight(*referenceOwnedWeights[idx], inter * 2, hidden, e + 3);
+                    InitNvfp4Weight(*referenceOwnedWeights[idx + 1], hidden, inter, e + 17);
+                    referenceWeights[idx] = referenceOwnedWeights[idx].get();
+                    referenceWeights[idx + 1] = referenceOwnedWeights[idx + 1].get();
+                }
+            }
+
             output.dataType = input.dataType;
             output.UpdateUnitSize();
             output.Resize({batch, hidden});
@@ -4248,21 +4274,67 @@ namespace {
                 if (weightType != "nvfp4") {
                     throw std::runtime_error("check_nvfp4 requires weight_type=nvfp4");
                 }
-                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
-                fastllm::MergeMOE(input, index, score, weights, biass,
-                                  referenceW1, w2, w3, curInput, curOutput,
-                                  sharedScale, referenceOutput, 0, gateType);
-                ForceDeviceSync();
+                // 先用正式权重走grouped入口完成首次后端选择；随后关闭MoE
+                // grouped，使用数值相同但生命周期独立的权重计算参考值。
                 setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
                                   sharedScale, output, 0, gateType);
                 ForceDeviceSync();
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT", "0", 1);
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
+                fastllm::MergeMOE(input, index, score, referenceWeights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  sharedScale, referenceOutput, 0, gateType);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT", "1", 1);
                 ComparisonStats stats = CompareData(
                     ConvertToFloat32Data(referenceOutput),
                     ConvertToFloat32Data(output), 0.25f, 0.25f);
                 if (!stats.passed) {
-                    throw std::runtime_error("grouped NVFP4 W4A4 differs from W4A16 reference");
+                    throw std::runtime_error(
+                        "grouped NVFP4 W4A4 differs from non-grouped reference");
+                }
+            } else if (path == "check_nvfp4_lifecycle") {
+                if (weightType != "nvfp4") {
+                    throw std::runtime_error(
+                        "check_nvfp4_lifecycle requires weight_type=nvfp4");
+                }
+                // 人为让首次grouped选择失败；主流程应整层清cache、恢复原始
+                // 权重并固定Rejected，随后即使条件恢复也不得再次尝试CUTLASS。
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  sharedScale, referenceOutput, 0, gateType);
+                ForceDeviceSync();
+
+                const int device = FastllmCudaGetDevice();
+                for (size_t i = 2; i < weights.size(); ++i) {
+                    if (weights[i] == nullptr || weights[i]->cudaData == nullptr ||
+                        FastllmCudaGetNvfp4W4A4BackendState(*weights[i], device) !=
+                            FastllmCudaNvfp4BackendState::Rejected) {
+                        throw std::runtime_error(
+                            "grouped NVFP4 fallback did not restore and reject all routed weights");
+                    }
+                }
+
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  sharedScale, output, 0, gateType);
+                ForceDeviceSync();
+                if (FastllmCudaGetNvfp4W4A4BackendState(*weights[2], device) !=
+                    FastllmCudaNvfp4BackendState::Rejected) {
+                    throw std::runtime_error(
+                        "grouped NVFP4 fallback retried after backend rejection");
+                }
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "fixed NVFP4 Legacy output changed after retry conditions recovered");
                 }
             } else if (path == "check_fp8") {
                 if (weightType != "fp8" || scaleLayout != "perchannel" ||
@@ -4297,7 +4369,8 @@ namespace {
                 }
             } else {
                 throw std::runtime_error(
-                    "path must be operator, check_fp8, check_nvfp4, legacy or warp");
+                    "path must be operator, check_fp8, check_nvfp4, "
+                    "check_nvfp4_lifecycle, legacy or warp");
             }
         }
     };
@@ -4361,7 +4434,8 @@ namespace {
                 params.Add("topk", "8", "experts per token");
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("path", "operator", "operator, check_fp8, check_nvfp4, legacy or warp");
+                params.Add("path", "operator",
+                           "operator, check_fp8, check_nvfp4, check_nvfp4_lifecycle, legacy or warp");
                 params.Add("weight_type", "fp8", "fp8 or nvfp4");
                 params.Add("scale_layout", "block128", "FP8 scale layout: block128 or perchannel");
                 params.Add("gate_type", "swiglu", "swiglu or geglu");

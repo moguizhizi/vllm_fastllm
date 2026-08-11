@@ -26,7 +26,8 @@
 - `FASTLLM_CUDA_NVFP4_TRACE=1`：在 log 中打印命中或回退原因；该模式会
   插入CUDA流同步，只用于功能诊断，不用于正式性能测试。
 - `FASTLLM_CUDA_MOE_NVFP4_W4A4=0`：关闭 grouped MoE W4A4。
-- `FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH=N`：grouped MoE 门槛，默认 1；
+- MoE grouped W4A4后端选择不使用batch/M门槛；首次选择后固定为CUTLASS
+  或Legacy，正式推理期间不再切换；
   decode的batch=1仍保留专用路径，batch>1默认优先使用原生grouped W4A4。
 
 ## 权重显存生命周期
