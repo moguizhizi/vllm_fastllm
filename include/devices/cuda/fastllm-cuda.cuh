@@ -906,6 +906,15 @@ bool FastllmCudaPermuteTo(const fastllm::Data &input, fastllm::Data &output,
 bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
                            const fastllm::Data &bias, fastllm::Data &output,
                            int numTokens, int inChannels, int outChannels);
+
+/** NVFP4 W4A4权重在指定GPU上的固定后端状态。 */
+enum class FastllmCudaNvfp4BackendState : uint8_t {
+    Uninitialized,
+    Prepared,
+    Cutlass,
+    Rejected,
+};
+
 #ifdef FASTLLM_ENABLE_CUTLASS_NVFP4
 size_t FastllmCudaNvfp4SwizzledScaleBytes(int rows, int columns);
 bool FastllmCudaNvfp4QuantizeActivation(
@@ -970,6 +979,13 @@ bool FastllmCudaPrepareNvfp4W4A4Weight(
     const uint8_t **packedWeight, const uint8_t **scales,
     const float **alpha);
 bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight);
+FastllmCudaNvfp4BackendState FastllmCudaGetNvfp4W4A4BackendState(
+    const fastllm::Data &weight, int device);
+void FastllmCudaSetNvfp4W4A4BackendState(
+    const fastllm::Data &weight, int device,
+    FastllmCudaNvfp4BackendState state);
+void FastllmCudaReleaseNvfp4W4A4CacheForDevice(
+    const fastllm::Data *weight, int device);
 bool TryCudaCutlassNvfp4W4A4(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output,
@@ -993,6 +1009,14 @@ inline bool TryCudaCutlassNvfp4W4A4(
 inline bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &) {
     return false;
 }
+inline FastllmCudaNvfp4BackendState FastllmCudaGetNvfp4W4A4BackendState(
+        const fastllm::Data &, int) {
+    return FastllmCudaNvfp4BackendState::Rejected;
+}
+inline void FastllmCudaSetNvfp4W4A4BackendState(
+        const fastllm::Data &, int, FastllmCudaNvfp4BackendState) {}
+inline void FastllmCudaReleaseNvfp4W4A4CacheForDevice(
+        const fastllm::Data *, int) {}
 inline bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
     const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
     fastllm::Data &, int, int, int) { return false; }

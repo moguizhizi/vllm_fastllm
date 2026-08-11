@@ -154,12 +154,6 @@ static MoeScratch *GetMoeScratch(size_t routeCount, size_t gatheredBytes,
     return &scratch;
 }
 
-static int MinBatch() {
-    const char *value = std::getenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH");
-    // 与vLLM一致，不按M过滤后端；环境变量仅保留给显式性能调优。
-    return value ? std::max(1, std::atoi(value)) : 1;
-}
-
 static bool Enabled() {
     const char *value = std::getenv("FASTLLM_CUDA_MOE_NVFP4_W4A4");
     return value == nullptr || value[0] == '\0' || value[0] != '0';
@@ -188,7 +182,7 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         (arch >= 120 && dtype != fastllm::DataType::BFLOAT16) ||
         (gateType != fastllm::MoeGateSwiglu &&
          gateType != fastllm::MoeGateGeglu) ||
-        batch < MinBatch() || topk <= 0 || totalTasks != batch * topk ||
+        batch <= 0 || topk <= 0 || totalTasks != batch * topk ||
         experts <= 0 || experts > 256 || hidden % 32 != 0 || inter % 32 != 0 ||
         routeRows == nullptr || routeScales == nullptr || routePositions == nullptr ||
         expertStarts == nullptr || expertCounts == nullptr ||
@@ -373,13 +367,132 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     if (cudaInput) FastllmCudaFinishInput(input, cudaInput);
     return ok;
 }
+
+static bool TraceEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_NVFP4_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+/** 返回代表本层routed experts后端生命周期的首个gate/up权重。 */
+static fastllm::Data *BackendAnchor(fastllm::Data **weights, int weightsBatch) {
+    return weights != nullptr && weightsBatch >= 4 ? weights[2] : nullptr;
+}
+
+/**
+ * 在首次grouped GEMM前确认全部routed expert权重均已完成重排。
+ *
+ * 首批token通常只命中部分expert，不能仅提交活跃权重，否则尚未执行的
+ * expert会被错误标成Cutlass。这里遍历整层routed权重；正常模型加载路径
+ * 已逐权重预重排，因此这里只命中cache。直接调用路径则补做重排，并把
+ * Uninitialized更新为Prepared，仍保留首次真实GEMM的一次性验证机会。
+ *
+ * @param weights      MoE权重数组。
+ * @param weightsBatch 权重指针数量。
+ * @param device       当前CUDA设备号。
+ * @return true表示全部routed权重都具备CUTLASS表示。
+ */
+static bool PrepareRoutedWeights(fastllm::Data **weights, int weightsBatch,
+                                 int device) {
+    for (int i = 2; i < weightsBatch; ++i) {
+        fastllm::Data *weight = weights[i];
+        if (weight == nullptr ||
+            weight->dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+            weight->dims.size() != 2 ||
+            FastllmCudaGetNvfp4W4A4BackendState(*weight, device) ==
+                FastllmCudaNvfp4BackendState::Rejected) {
+            return false;
+        }
+        const uint8_t *packed = nullptr, *scales = nullptr;
+        const float *alpha = nullptr;
+        if (!FastllmCudaPrepareNvfp4W4A4Weight(
+                *weight, weight->dims[1], weight->dims[0],
+                &packed, &scales, &alpha)) {
+            return false;
+        }
+        if (FastllmCudaGetNvfp4W4A4BackendState(*weight, device) ==
+            FastllmCudaNvfp4BackendState::Uninitialized) {
+            FastllmCudaSetNvfp4W4A4BackendState(
+                *weight, device, FastllmCudaNvfp4BackendState::Prepared);
+        }
+    }
+    return true;
+}
+
+/**
+ * 将本层全部routed expert权重提交为固定CUTLASS后端。
+ *
+ * grouped GEMM首次同步验证成功后统一提交状态。shared expert位于前两个
+ * 槽位，由独立Dense Linear维护自己的生命周期，不在此处修改。
+ *
+ * @param weights      MoE权重数组。
+ * @param weightsBatch 权重指针数量。
+ * @param device       当前CUDA设备号。
+ */
+static void CommitRoutedWeights(fastllm::Data **weights, int weightsBatch,
+                                int device) {
+    for (int i = 2; i < weightsBatch; ++i) {
+        fastllm::Data *weight = weights[i];
+        if (weight != nullptr &&
+            weight->dataType == fastllm::DataType::NVFP4_BLOCK_16) {
+            FastllmCudaSetNvfp4W4A4BackendState(
+                *weight, device, FastllmCudaNvfp4BackendState::Cutlass);
+        }
+    }
+}
+
+/**
+ * 把本层全部routed expert权重一次性固定为Legacy后端。
+ *
+ * 首次grouped GEMM验证失败时先释放整层在当前GPU上的CUTLASS重排cache，
+ * 再从CPU/NUMA/mmap原始表示逐个恢复CUDA权重，最后统一写入Rejected。
+ * 这种两阶段顺序避免整层原始权重与整层重排权重同时占用显存。shared
+ * expert不属于grouped计算，继续由Dense Linear独立管理。
+ *
+ * @param weights      MoE权重数组。
+ * @param weightsBatch 权重指针数量。
+ * @param device       当前CUDA设备号。
+ * @return true表示全部原始CUDA权重恢复成功并已固定为Rejected。
+ */
+static bool RejectRoutedWeights(fastllm::Data **weights, int weightsBatch,
+                                int device) {
+    // 第一阶段只清cache，不立即恢复，先降低整层回退时的显存峰值。
+    for (int i = 2; i < weightsBatch; ++i) {
+        fastllm::Data *weight = weights[i];
+        if (weight != nullptr &&
+            weight->dataType == fastllm::DataType::NVFP4_BLOCK_16) {
+            FastllmCudaReleaseNvfp4W4A4CacheForDevice(weight, device);
+        }
+    }
+
+    // 第二阶段恢复Legacy需要的原始设备表示。
+    for (int i = 2; i < weightsBatch; ++i) {
+        fastllm::Data *weight = weights[i];
+        if (weight != nullptr &&
+            weight->dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
+            weight->cudaData == nullptr &&
+            !weight->RestoreCudaDataForRepackedWeight(device)) {
+            return false;
+        }
+    }
+
+    // 资源全部就绪后再提交状态，正式推理不再重复尝试grouped CUTLASS。
+    for (int i = 2; i < weightsBatch; ++i) {
+        fastllm::Data *weight = weights[i];
+        if (weight != nullptr &&
+            weight->dataType == fastllm::DataType::NVFP4_BLOCK_16) {
+            FastllmCudaSetNvfp4W4A4BackendState(
+                *weight, device, FastllmCudaNvfp4BackendState::Rejected);
+        }
+    }
+    return true;
+}
 } // namespace
 
 /**
  * 执行一次NVFP4 W4A4 grouped MoE计算。
  *
- * 本函数是CUDA grouped W4A4 MoE的公开入口，负责检查运行时开关和GPU
- * 架构，并按输入类型分派到内部Run实现。内部流程依次完成路由行gather、
+ * 本函数是CUDA grouped W4A4 MoE的公开入口，负责首次选择并固定本层
+ * routed experts后端，再按输入类型分派到内部Run实现。内部流程依次完成路由行gather、
  * gate/up激活动态NVFP4量化、第一层grouped GEMM、SwiGLU或GeGLU门控、
  * down激活动态NVFP4量化、第二层grouped GEMM，以及top-k路由加权归并。
  * 本函数不构造路由表；调用方必须提前按expert连续排列路由元数据。
@@ -389,8 +502,10 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
  * gate/up权重逻辑形状为[2 * inter, hidden]，down权重逻辑形状为
  * [hidden, inter]，两者均为NVFP4_BLOCK_16布局。
  *
- * 执行失败时，本函数恢复已经释放原始CUDA表示的NVFP4权重，使调用方
- * 可以安全进入Legacy路径；STRICT模式下直接抛出异常，禁止静默降级。
+ * Prepared或Uninitialized状态下会对首次真实GEMM强制同步验证。成功后
+ * 全部routed权重固定为Cutlass；失败则先清整层cache、再恢复整层原始
+ * CUDA权重并固定为Rejected。正式推理进入Cutlass后禁止运行时切换；
+ * 此后若kernel失败直接抛错。STRICT模式下首次失败也禁止静默降级。
  *
  * @param input           FP16或BF16输入，逻辑形状为[batch, hidden]；SM120
  *                        当前仅接受BF16。
@@ -427,41 +542,77 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
         const int *routePositions, const int *expertStarts,
         const int *expertCounts, int batch, int topk, int totalTasks,
         int hidden, int inter, fastllm::MoeGateType gateType) {
-    int arch = FastllmCudaRuntimeArch();
-    if (!Enabled() || arch < 100 || arch >= 130 || weights == nullptr || weightsBatch < 4 ||
-        (weightsBatch & 1)) return false;
-    bool ok = false;
-    if (input.dataType == fastllm::DataType::FLOAT16)
+    const int arch = FastllmCudaRuntimeArch();
+    const int device = FastllmCudaGetDevice();
+    fastllm::Data *anchor = BackendAnchor(weights, weightsBatch);
+    if (device < 0 || anchor == nullptr) return false;
+
+    const FastllmCudaNvfp4BackendState state =
+        FastllmCudaGetNvfp4W4A4BackendState(*anchor, device);
+    if (state == FastllmCudaNvfp4BackendState::Rejected) {
+        if (StrictEnabled()) {
+            throw std::runtime_error(
+                "strict NVFP4 grouped MoE backend was already rejected");
+        }
+        return false;
+    }
+    const bool selecting =
+        state == FastllmCudaNvfp4BackendState::Uninitialized ||
+        state == FastllmCudaNvfp4BackendState::Prepared;
+    if ((!Enabled() && selecting) || arch < 100 || arch >= 130 ||
+        weights == nullptr || weightsBatch < 4 || (weightsBatch & 1)) {
+        if (selecting) {
+            if (!RejectRoutedWeights(weights, weightsBatch, device)) {
+                throw std::runtime_error(
+                    "NVFP4 grouped MoE fallback cannot restore original weights");
+            }
+            if (StrictEnabled()) {
+                throw std::runtime_error(
+                    "strict NVFP4 grouped MoE requires the CUTLASS backend");
+            }
+            return false;
+        }
+        throw std::runtime_error(
+            "NVFP4 grouped MoE fixed CUTLASS backend became unavailable");
+    }
+
+    // 首次选择时必须先验证整层所有routed权重，而不是只检查本批活跃expert。
+    bool ok = !selecting || PrepareRoutedWeights(weights, weightsBatch, device);
+    if (ok && input.dataType == fastllm::DataType::FLOAT16)
         ok = Run<half>(input, w1, w2, output, weights, weightsBatch,
             routeRows, routeScales, routePositions, expertStarts, expertCounts,
             batch, topk, totalTasks, hidden, inter, gateType);
-    else if (input.dataType == fastllm::DataType::BFLOAT16)
+    else if (ok && input.dataType == fastllm::DataType::BFLOAT16)
         ok = Run<__nv_bfloat16>(input, w1, w2, output, weights, weightsBatch,
             routeRows, routeScales, routePositions, expertStarts, expertCounts,
             batch, topk, totalTasks, hidden, inter, gateType);
-    if (!ok) {
-        // CUTLASS路径失败后恢复原始权重表示，保证后续Legacy计算不会读取
-        // 已释放的cudaData；STRICT模式用于测试时阻止这种回退。
-        for (int i = 2; i < weightsBatch; ++i) {
-            fastllm::Data *weight = weights[i];
-            if (weight != nullptr && weight->dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
-                weight->cudaData == nullptr &&
-                !weight->RestoreCudaDataForRepackedWeight()) {
-                throw ("NVFP4 grouped MoE fallback cannot restore an original weight.");
-            }
+    if (ok && selecting) {
+        // CUDA kernel异步返回；首次必须同步验证后才能释放回退机会并固定后端。
+        ok = cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+    }
+
+    if (ok && selecting) {
+        CommitRoutedWeights(weights, weightsBatch, device);
+    } else if (!ok && selecting) {
+        // 一次性兜底只发生在正式后端固定前。
+        if (!RejectRoutedWeights(weights, weightsBatch, device)) {
+            throw std::runtime_error(
+                "NVFP4 grouped MoE fallback cannot restore original weights");
         }
-        // strict用于算子验证和性能测试：禁止Legacy静默兜底，确保测到的
-        // 一定是grouped CUTLASS，而不是“测试通过但实际跑了fallback”。
         if (StrictEnabled()) {
             throw std::runtime_error(
                 "strict NVFP4 grouped MoE requires the CUTLASS backend");
         }
+    } else if (!ok) {
+        // 已固定CUTLASS后不得混推或临时切回Legacy。
+        throw std::runtime_error(
+            "NVFP4 grouped MoE CUTLASS failed after backend selection");
     }
-    const char *trace = std::getenv("FASTLLM_CUDA_NVFP4_TRACE");
-    if (trace && trace[0] != '\0' && trace[0] != '0') {
+    if (TraceEnabled()) {
         std::fprintf(stderr,
-            "[fastllm][nvfp4] path=%s batch=%d topk=%d hidden=%d inter=%d sm=%d\n",
+            "[fastllm][nvfp4] path=%s state=%s batch=%d topk=%d hidden=%d inter=%d sm=%d\n",
             ok ? "grouped-moe-w4a4-cutlass" : "grouped-moe-fallback",
+            selecting ? "selected" : "fixed",
             batch, topk, hidden, inter, arch);
     }
     return ok;

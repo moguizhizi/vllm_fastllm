@@ -54,12 +54,7 @@ std::map<std::pair<const fastllm::Data *, int>, WeightCache> weightCaches;
 std::map<int, ActivationScratch> activationScratch;
 std::map<int, OutputScratch> outputScratch;
 
-enum class BackendState : uint8_t {
-    Uninitialized,
-    Prepared,
-    Cutlass,
-    Rejected,
-};
+using BackendState = FastllmCudaNvfp4BackendState;
 
 enum class FusionState : uint8_t {
     Uninitialized,
@@ -469,6 +464,53 @@ static bool FinalizeOutput(const void *source, void *destination,
 }
 
 } // namespace
+
+/**
+ * 查询NVFP4权重在指定GPU上的固定后端状态。
+ *
+ * MoE grouped路径复用Dense权重的状态表，把首个routed expert作为整层
+ * 生命周期锚点；这样权重上传阶段的Prepared状态和首次真实GEMM验证可以
+ * 连续衔接，无需再维护一份容易失效的MoE指针状态表。
+ *
+ * @param weight NVFP4_BLOCK_16逻辑权重。
+ * @param device CUDA设备号。
+ * @return 当前设备上的Uninitialized、Prepared、Cutlass或Rejected状态。
+ */
+FastllmCudaNvfp4BackendState FastllmCudaGetNvfp4W4A4BackendState(
+        const fastllm::Data &weight, int device) {
+    return GetBackendState(weight, device);
+}
+
+/**
+ * 更新NVFP4权重在指定GPU上的固定后端状态。
+ *
+ * 该接口仅同步生命周期结论，不创建、释放或恢复设备权重；调用方必须先
+ * 完成对应的cache提交或Legacy原始权重恢复，再写入最终状态。
+ *
+ * @param weight NVFP4_BLOCK_16逻辑权重。
+ * @param device CUDA设备号。
+ * @param state  已完成资源转换后需要记录的最终状态。
+ */
+void FastllmCudaSetNvfp4W4A4BackendState(
+        const fastllm::Data &weight, int device,
+        FastllmCudaNvfp4BackendState state) {
+    SetBackendState(weight, device, state);
+}
+
+/**
+ * 仅释放NVFP4权重在指定GPU上的CUTLASS重排cache。
+ *
+ * 本函数用于MoE首次验证失败时的两阶段回退：调用方先清空整层所有
+ * routed expert cache，再统一恢复原始CUDA权重，避免逐个恢复时出现整层
+ * 原始权重和整层CUTLASS权重同时驻留的峰值。
+ *
+ * @param weight 需要释放重排表示的逻辑权重。
+ * @param device cache所属CUDA设备号。
+ */
+void FastllmCudaReleaseNvfp4W4A4CacheForDevice(
+        const fastllm::Data *weight, int device) {
+    ReleaseWeightCacheForDevice(weight, device);
+}
 
 bool FastllmCudaPrepareNvfp4W4A4Weight(
         fastllm::Data &weight, int inFeatures, int outFeatures,

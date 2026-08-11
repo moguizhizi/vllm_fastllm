@@ -8273,28 +8273,40 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
     static bool TryCudaMergeMOENvfp4W4A4Grouped(
         Data &input, Data &output, const int32_t *indexData, const float *scoreData, int batch, int topk,
         Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        Data *backendAnchor = weights != nullptr && weightsBatch >= 4
+            ? weights[2] : nullptr;
+        const bool fixedCutlass = backendAnchor != nullptr &&
+            FastllmCudaGetNvfp4W4A4BackendState(
+                *backendAnchor, FastllmCudaGetDevice()) ==
+                FastllmCudaNvfp4BackendState::Cutlass;
+        auto rejectCall = [fixedCutlass]() -> bool {
+            // 后端固定后，路由或张量语义异常属于正式推理错误，不能静默
+            // 切到Legacy形成同一层前后混推。
+            if (fixedCutlass) {
+                throw std::runtime_error(
+                    "fixed NVFP4 grouped MoE received an invalid runtime request");
+            }
+            return false;
+        };
         if ((gateType != MoeGateSwiglu && gateType != MoeGateGeglu) ||
             !IsCudaMergeMoeFp16Bf16InputType(input.dataType) ||
             input.dims.size() == 0 || batch <= 0 || topk <= 0 ||
             weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
             indexData == nullptr || scoreData == nullptr) {
-            return false;
+            return rejectCall();
         }
         const int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
         const bool hasSharedExpert =
             weights[0] != nullptr && weights[1] != nullptr && sharedScale != 0.0f;
-        const int minGroupedBatch =
-            CudaEnvInt("FASTLLM_CUDA_MOE_NVFP4_W4A4_MIN_BATCH", 1);
         if (gateup == nullptr || down == nullptr ||
-            batch < minGroupedBatch ||
             gateup->dataType != DataType::NVFP4_BLOCK_16 ||
             down->dataType != DataType::NVFP4_BLOCK_16 ||
             gateup->dims.size() != 2 || down->dims.size() != 2 ||
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
-            return false;
+            return rejectCall();
         }
 
         // shared expert不属于top-k路由集合。先验证其独立MLP布局，避免
@@ -8306,14 +8318,14 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 sharedGateup->dims[1] != hidden ||
                 sharedGateup->dims[0] != sharedDown->dims[1] * 2 ||
                 sharedDown->dims[0] != hidden) {
-                return false;
+                return rejectCall();
             }
         }
 
         int inter = down->dims[1];
         int experts = weightsBatch / 2 - 1;
         if (experts <= 0) {
-            return false;
+            return rejectCall();
         }
 
         std::vector<int> expertCounts(experts, 0);
@@ -8321,7 +8333,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             for (int j = 0; j < topk; j++) {
                 int expert = indexData[b * topk + j];
                 if (expert < 0 || expert >= experts) {
-                    return false;
+                    return rejectCall();
                 }
                 expertCounts[expert]++;
             }
@@ -8334,7 +8346,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             totalTasks += expertCounts[e];
         }
         if (totalTasks <= 0) {
-            return false;
+            return rejectCall();
         }
 
         std::vector<int> offsets = expertStarts;
@@ -8615,8 +8627,14 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             Data *firstGate = weights != nullptr && weightsBatch >= 4
                 ? weights[2] : nullptr;
             const int runtimeArch = FastllmCudaRuntimeArch();
+            const FastllmCudaNvfp4BackendState nvfp4Backend = firstGate != nullptr
+                ? FastllmCudaGetNvfp4W4A4BackendState(*firstGate, curDeviceId)
+                : FastllmCudaNvfp4BackendState::Rejected;
             // 原生NVFP4 grouped CUTLASS是正式W4A4后端。它不按batch/M过滤，
             // batch=1时也优先于旧W4A16 decode kernel，与vLLM后端选择一致。
+            // 即使首次策略开关关闭，Prepared权重也进入一次生命周期入口，
+            // 由入口清理重排cache并固定Rejected；Cutlass固定后继续走grouped，
+            // Rejected固定后直接进入Legacy，不在正式推理期间反复探测或切换。
             const bool preferNvfp4W4A4 =
                 batch > 0 &&
                 (gateType == MoeGateSwiglu || gateType == MoeGateGeglu) &&
@@ -8624,7 +8642,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 firstGate->dataType == DataType::NVFP4_BLOCK_16 &&
                 runtimeArch >= 100 && runtimeArch < 130 &&
                 (runtimeArch < 120 || input.dataType == DataType::BFLOAT16) &&
-                CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_MOE_NVFP4_W4A4", true);
+                nvfp4Backend != FastllmCudaNvfp4BackendState::Rejected;
 
             // 只有未选择NVFP4 W4A4时才探测旧后端，避免small-batch INT4或
             // large-batch Triton FP8在未来扩展格式后意外截获NVFP4请求。
