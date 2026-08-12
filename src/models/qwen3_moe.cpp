@@ -1006,6 +1006,10 @@ namespace fastllm {
                 }
             }
 
+            bool Enabled() const {
+                return enabled;
+            }
+
         private:
             using Clock = std::chrono::steady_clock;
 
@@ -1016,6 +1020,83 @@ namespace fastllm {
 
             bool enabled;
             int gpuId;
+            int batch;
+            const char *path;
+            Clock::time_point begin;
+            Clock::time_point last;
+            std::vector<std::pair<const char*, long long> > stages;
+        };
+
+        /**
+         * 判断是否开启Qwen3-MOE ForwardGPU的CPU分段耗时诊断。
+         *
+         * 该开关只增加CPU单调时钟记录和单行日志，不改变模型计算、采样、
+         * 同步或后端选择。正式性能测试应保持关闭。
+         *
+         * @return 环境变量FASTLLM_QWEN3_MOE_FORWARD_CPU_TRACE为真值时返回true。
+         */
+        static bool Qwen3MoeForwardCpuTraceEnabled() {
+            const char *env = std::getenv("FASTLLM_QWEN3_MOE_FORWARD_CPU_TRACE");
+            return env != nullptr && Qwen3MoeIsTrueString(env);
+        }
+
+        /**
+         * 收集一次Qwen3-MOE ForwardGPU的CPU分段耗时。
+         *
+         * prepare覆盖输入、权重和KV元数据准备；model_forward覆盖单卡或多卡
+         * 模型计算；sampling_prepare和sampling分别覆盖采样输入准备与取回
+         * Token。析构时统一输出，避免逐阶段打印干扰主线程。
+         */
+        class Qwen3MoeForwardCpuTrace {
+        public:
+            explicit Qwen3MoeForwardCpuTrace(int batch)
+                    : enabled(Qwen3MoeForwardCpuTraceEnabled()),
+                      batch(batch), path("incomplete") {
+                if (enabled) {
+                    begin = last = Clock::now();
+                }
+            }
+
+            ~Qwen3MoeForwardCpuTrace() {
+                if (!enabled) {
+                    return;
+                }
+                const auto end = Clock::now();
+                std::ostringstream line;
+                line << "[fastllm][qwen3-moe][forward-cpu]"
+                     << " batch=" << batch << " path=" << path;
+                for (const auto &stage : stages) {
+                    line << " " << stage.first << "_us=" << stage.second;
+                }
+                line << " total_us=" << ToMicroseconds(end - begin) << "\n";
+                const std::string text = line.str();
+                std::fwrite(text.data(), 1, text.size(), stderr);
+            }
+
+            void Mark(const char *stage) {
+                if (!enabled) {
+                    return;
+                }
+                const auto now = Clock::now();
+                stages.emplace_back(stage, ToMicroseconds(now - last));
+                last = now;
+            }
+
+            void SetPath(const char *value) {
+                if (enabled) {
+                    path = value;
+                }
+            }
+
+        private:
+            using Clock = std::chrono::steady_clock;
+
+            template <typename Duration>
+            static long long ToMicroseconds(const Duration &duration) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+            }
+
+            bool enabled;
             int batch;
             const char *path;
             Clock::time_point begin;
@@ -1807,7 +1888,14 @@ namespace fastllm {
             }
         }
 
-        static void Qwen3MoePrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
+        /**
+         * 保证CUDA Graph固定张量具有与源张量一致的存储，但不复制内容。
+         *
+         * @param dst     Graph生命周期内复用的目标张量。
+         * @param src     提供形状、类型和设备信息的CUDA源张量。
+         * @param device  目标CUDA设备编号。
+         */
+        static void Qwen3MoeEnsureGraphCudaTensor(Data &dst, const Data &src, int device) {
             AssertInFastLLM(src.dataDevice == DataDevice::CUDA && src.cudaData != nullptr,
                             "Qwen3-MOE CUDA graph requires CUDA source tensor.\n");
             FastllmCudaSetDevice(device);
@@ -1838,6 +1926,10 @@ namespace fastllm {
                 dst.Resize(src.dims);
             }
             dst.Allocate(false);
+        }
+
+        static void Qwen3MoePrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
+            Qwen3MoeEnsureGraphCudaTensor(dst, src, device);
             FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
         }
 
@@ -3255,49 +3347,102 @@ namespace fastllm {
             localPositionIds->dims.empty() || localPositionIds->Count(0) != (uint64_t)batch) {
             return rejectGraph("input/position dims mismatch");
         }
+        cpuTrace.Mark("input_localize");
 
         int currentTokens = 0;
-        for (int i = 0; i < block_cnt; i++) {
-            Data *firstBatchKey = pastKeyValues[i].first;
-            Data *firstBatchValue = pastKeyValues[i].second;
-            if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
-                firstBatchKey->pagedKVCacheData == nullptr ||
-                firstBatchValue->pagedKVCacheData == nullptr) {
-                return rejectGraph("kv cache is not paged");
-            }
-            for (int b = 0; b < batch; b++) {
-                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
-                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
-                if (pastKey == nullptr || pastValue == nullptr) {
-                    return rejectGraph("null kv cache");
-                }
-                if (pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
-                    pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
-                    pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData) {
+        if (cpuTrace.Enabled()) {
+            // 诊断开启时才拆成两次遍历；默认关闭时仍执行原始单循环，避免
+            // 为正式推理增加额外的KV元数据访问。
+            for (int i = 0; i < block_cnt; i++) {
+                Data *firstBatchKey = pastKeyValues[i].first;
+                Data *firstBatchValue = pastKeyValues[i].second;
+                if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
+                    firstBatchKey->pagedKVCacheData == nullptr ||
+                    firstBatchValue->pagedKVCacheData == nullptr) {
                     return rejectGraph("kv cache is not paged");
                 }
-                if (pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
-                    return rejectGraph("empty kv page index");
+                for (int b = 0; b < batch; b++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr) {
+                        return rejectGraph("null kv cache");
+                    }
+                    if (pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                        pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
+                        pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData) {
+                        return rejectGraph("kv cache is not paged");
+                    }
+                    if (pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA) {
+                        return rejectGraph("kv cache not on cuda");
+                    }
+                    if (pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3) {
+                        return rejectGraph("fp8 kv cache");
+                    }
+                    if (pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen) {
+                        return rejectGraph("unaligned kv cache metadata");
+                    }
                 }
-                if (pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA) {
-                    return rejectGraph("kv cache not on cuda");
+            }
+            cpuTrace.Mark("kv_static_validate");
+
+            for (int i = 0; i < block_cnt; i++) {
+                for (int b = 0; b < batch; b++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
+                        return rejectGraph("empty kv page index");
+                    }
+                    if (pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                        pastKey->lastPageLen != pastValue->lastPageLen) {
+                        return rejectGraph("unaligned kv cache metadata");
+                    }
+                    int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
+                    currentTokens = std::max(currentTokens, layerTokens);
                 }
-                if (pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3) {
-                    return rejectGraph("fp8 kv cache");
+            }
+            cpuTrace.Mark("kv_dynamic_validate");
+        } else {
+            for (int i = 0; i < block_cnt; i++) {
+                Data *firstBatchKey = pastKeyValues[i].first;
+                Data *firstBatchValue = pastKeyValues[i].second;
+                if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
+                    firstBatchKey->pagedKVCacheData == nullptr ||
+                    firstBatchValue->pagedKVCacheData == nullptr) {
+                    return rejectGraph("kv cache is not paged");
                 }
-                if (pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
-                    pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
-                    pastKey->lastPageLen != pastValue->lastPageLen) {
-                    return rejectGraph("unaligned kv cache metadata");
+                for (int b = 0; b < batch; b++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr) {
+                        return rejectGraph("null kv cache");
+                    }
+                    if (pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                        pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
+                        pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData) {
+                        return rejectGraph("kv cache is not paged");
+                    }
+                    if (pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
+                        return rejectGraph("empty kv page index");
+                    }
+                    if (pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA) {
+                        return rejectGraph("kv cache not on cuda");
+                    }
+                    if (pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3) {
+                        return rejectGraph("fp8 kv cache");
+                    }
+                    if (pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
+                        pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                        pastKey->lastPageLen != pastValue->lastPageLen) {
+                        return rejectGraph("unaligned kv cache metadata");
+                    }
+                    int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
+                    currentTokens = std::max(currentTokens, layerTokens);
                 }
-                int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
-                currentTokens = std::max(currentTokens, layerTokens);
             }
         }
         if (rope_type == RoPEType::DYMAMIC_NTK && currentTokens + 1 >= max_positions) {
             return rejectGraph("dynamic ntk beyond max position");
         }
-        cpuTrace.Mark("input_kv_validate");
 
         if (Qwen3MoeCudaGraphIsDisabled(this)) {
             Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject",
@@ -3708,7 +3853,11 @@ namespace fastllm {
         };
 
         auto finishWithLogits = [&]() {
-            Qwen3MoePrepareGraphCudaTensor(logits, state.logits, gpuId);
+            Qwen3MoeEnsureGraphCudaTensor(logits, state.logits, gpuId);
+            cpuTrace.Mark("logits_prepare");
+            FastllmCudaCopyFromDeviceToDevice(logits.cudaData, state.logits.cudaData,
+                                              state.logits.GetBytes());
+            cpuTrace.Mark("logits_copy");
         };
 
         auto runWithoutGraph = [&]() -> bool {
@@ -3731,7 +3880,6 @@ namespace fastllm {
                 cpuTrace.Mark("replay_status");
                 Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "replay", "success");
                 finishWithLogits();
-                cpuTrace.Mark("finish_logits");
                 cpuTrace.SetPath("replay");
                 return true;
             }
@@ -3846,7 +3994,6 @@ namespace fastllm {
         cpuTrace.Mark("first_launch_status");
         Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "first-launch", "success");
         finishWithLogits();
-        cpuTrace.Mark("finish_logits");
         cpuTrace.SetPath("first_launch");
         return true;
 #endif
@@ -4154,6 +4301,7 @@ namespace fastllm {
         return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
 #else
+        Qwen3MoeForwardCpuTrace forwardCpuTrace(batch);
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!CanUseGPUForward() ||
@@ -4557,6 +4705,7 @@ namespace fastllm {
             }
         }
 
+        forwardCpuTrace.Mark("prepare");
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
         if (devices.size() == 1) {
@@ -4583,6 +4732,7 @@ namespace fastllm {
                 }
             }
         }
+        forwardCpuTrace.Mark("model_forward");
 
         if (tensorParallel) {
             auto validLocalMeta = [](Data *data) {
@@ -4622,6 +4772,7 @@ namespace fastllm {
                 }
             }
         }
+        forwardCpuTrace.Mark("post_forward");
 
         int vocabSize = lmHead.dims[0];
         bool allSimpleCudaSampling = true;
@@ -4638,9 +4789,12 @@ namespace fastllm {
             SetCurrentThreadExecutor(&samplingExecutor);
             ResetLogitsOfEOS(batch, &fullCudaLogits, pastKeyValues, generationConfigs);
             SetCurrentThreadExecutor(oldExecutor);
+            forwardCpuTrace.Mark("sampling_prepare");
             std::vector<int> lastRet = Qwen3MoeSampleFromRootCudaLogits(devices[0], fullCudaLogits, batch,
                                                                          cudaSamplingTopK, allSimpleCudaSampling,
                                                                          generationConfigs);
+            forwardCpuTrace.Mark("sampling");
+            forwardCpuTrace.SetPath("cuda_sampling");
             return lastRet;
         }
 
@@ -4678,6 +4832,7 @@ namespace fastllm {
         }
 
         ResetLogitsOfEOS(batch, &fullLogits, pastKeyValues, generationConfigs);
+        forwardCpuTrace.Mark("sampling_prepare");
 
         std::vector<int> lastRet;
         LastTokensUnit emptyLastTokens;
@@ -4693,6 +4848,8 @@ namespace fastllm {
                 lastTokens.units[b] : emptyLastTokens;
             lastRet.push_back(LLMSampling(fullLogits, b, generationConfigs[b], unit));
         }
+        forwardCpuTrace.Mark("sampling");
+        forwardCpuTrace.SetPath("cpu_sampling");
         return lastRet;
 #endif
     }

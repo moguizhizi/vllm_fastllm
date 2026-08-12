@@ -13,6 +13,8 @@
 #include <exception>
 #include <set>
 #include <tuple>
+#include <cstdio>
+#include <cctype>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -20,6 +22,33 @@
 
 namespace fastllm {
     namespace {
+        /**
+         * 判断是否开启异步响应调度器的CPU分段耗时诊断。
+         *
+         * 开关默认关闭；开启后仅记录批次准备、Forward锁等待、模型Forward、
+         * Forward后处理和结果入队耗时，不改变调度与同步语义。
+         *
+         * @return 环境变量FASTLLM_RESPONSE_CPU_TRACE为真值时返回true。
+         */
+        static bool ResponseCpuTraceEnabled() {
+            static const bool enabled = []() {
+                const char *env = std::getenv("FASTLLM_RESPONSE_CPU_TRACE");
+                if (env == nullptr) {
+                    return false;
+                }
+                std::string value(env);
+                std::transform(value.begin(), value.end(), value.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                return value == "1" || value == "true" || value == "on";
+            }();
+            return enabled;
+        }
+
+        template <typename Duration>
+        static long long ResponseCpuTraceMicroseconds(const Duration &duration) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+        }
+
         static bool NeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -1620,6 +1649,10 @@ namespace fastllm {
             if (model->isFree) {
                 break;
             }
+            const bool responseCpuTrace = ResponseCpuTraceEnabled();
+            const auto responseLoopBegin = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             std::vector <Data*> attentionMasks;
             std::vector <Data*> positionIds;
             std::vector <Data*> ownedAttentionMasks;
@@ -2431,6 +2464,9 @@ namespace fastllm {
             }
 
             if (seqLens.size() > 0) {
+                const auto selectionDone = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
                 ResponseContext *singleContext = nullptr;
                 bool isSingleMultimodal = false;
                 if (handles.size() == 1) {
@@ -2441,7 +2477,13 @@ namespace fastllm {
                     }
                 }
                 dictLocker.unlock();
+                const auto forwardLockBegin = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
                 forwardLocker.lock();
+                const auto forwardBegin = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
 #ifdef USE_CUDA
                 // FastllmCudaClearBigBuffer();
 #endif
@@ -2569,6 +2611,9 @@ namespace fastllm {
                 if (printProfile) {
                     PrintLoopProfile("new", seqLens, (int)ret.size(), profileStartTime);
                 }
+                const auto forwardDone = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
 
                 forwardLocker.unlock();
                 dictLocker.lock();
@@ -2596,6 +2641,9 @@ namespace fastllm {
                     }
                 }
 
+                const auto enqueueBegin = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
                 for (int i = 0; i < handles.size(); i++) {
                     ResponseContext *ctx = tokenContexts[i];
                     int curRet = ret[i];
@@ -2641,6 +2689,23 @@ namespace fastllm {
                 }
                 model->dictCV.notify_all();
                 ReleasePendingResultLogits(logits);
+                if (responseCpuTrace) {
+                    const auto enqueueDone = std::chrono::steady_clock::now();
+                    std::fprintf(
+                        stderr,
+                        "[fastllm][response][cpu] batch=%zu workload=%s "
+                        "batch_prepare_us=%lld forward_lock_us=%lld "
+                        "forward_us=%lld post_forward_us=%lld "
+                        "enqueue_us=%lld total_us=%lld\n",
+                        seqLens.size(),
+                        selectedHasDecode && !selectedHasPrompt ? "decode" : "prefill",
+                        ResponseCpuTraceMicroseconds(selectionDone - responseLoopBegin),
+                        ResponseCpuTraceMicroseconds(forwardBegin - forwardLockBegin),
+                        ResponseCpuTraceMicroseconds(forwardDone - forwardBegin),
+                        ResponseCpuTraceMicroseconds(enqueueBegin - forwardDone),
+                        ResponseCpuTraceMicroseconds(enqueueDone - enqueueBegin),
+                        ResponseCpuTraceMicroseconds(enqueueDone - responseLoopBegin));
+                }
             } else {
                 // 没有任何请求可以调度时，等待新请求
             }
