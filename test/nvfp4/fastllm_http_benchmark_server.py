@@ -5,6 +5,7 @@ import argparse
 import ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import sys
 import time
 
@@ -55,6 +56,16 @@ def make_handler(model):
                 self.send_json(404, {"error": "not found"})
                 return
             try:
+                trace_cpu = os.environ.get(
+                    "FASTLLM_HTTP_CPU_TRACE", "").lower() in ("1", "true", "on")
+                request_begin_ns = time.perf_counter_ns() if trace_cpu else 0
+                launch_us = 0
+                can_fetch_us = 0
+                poll_sleep_us = 0
+                statistics_us = 0
+                fetch_us = 0
+                sse_us = 0
+                poll_checks = 0
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length))
                 input_tokens = request.get("prompt")
@@ -69,12 +80,15 @@ def make_handler(model):
                 empty_stops = (ctypes.c_int * 0)()
                 # min_length与max_length相同，从logits中屏蔽EOS，保证双方都
                 # 严格生成指定数量的Token。
+                stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                 handle = llm.fastllm_lib.launch_response_llm_model(
                     model.model, len(input_tokens), token_buffer,
                     ctypes.c_int(output_tokens), ctypes.c_int(output_tokens),
                     ctypes.c_bool(False), ctypes.c_float(1.0), ctypes.c_int(1),
                     ctypes.c_float(1.0), ctypes.c_float(1.0), ctypes.c_bool(False),
                     ctypes.c_int(0), empty_stops)
+                if trace_cpu:
+                    launch_us = (time.perf_counter_ns() - stage_begin_ns) // 1000
 
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -85,27 +99,45 @@ def make_handler(model):
                 first = True
                 statistics = {}
                 while True:
-                    if not llm.fastllm_lib.can_fetch_response_llm_model(
-                            model.model, handle):
+                    stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
+                    can_fetch = llm.fastllm_lib.can_fetch_response_llm_model(
+                        model.model, handle)
+                    if trace_cpu:
+                        can_fetch_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
+                        poll_checks += 1
+                    if not can_fetch:
+                        stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                         time.sleep(0.0005)
+                        if trace_cpu:
+                            poll_sleep_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
                         continue
                     # 最后一次fetch会删除ResponseContext，因此必须在fetch前
                     # 保存本请求的Prefix Cache命中统计。
+                    stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                     statistics = model.get_response_statistics(handle) or statistics
+                    if trace_cpu:
+                        statistics_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
+                    stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                     token = llm.fastllm_lib.fetch_response_llm_model(
                         model.model, handle)
+                    if trace_cpu:
+                        fetch_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
                     if token <= -1:
                         break
                     choice = {"index": 0, "token_ids": [token], "text": ""}
                     if first:
                         choice["prompt_token_ids"] = input_tokens
                         first = False
+                    stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                     write_sse(self, {"choices": [choice]})
+                    if trace_cpu:
+                        sse_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
                     generated += 1
                 cached = max(0, int(statistics.get("cached_input_tokens", 0)))
                 missed = max(
                     0, int(statistics.get(
                         "missed_input_tokens", len(input_tokens) - cached)))
+                stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                 write_sse(self, {
                     "choices": [],
                     "usage": {
@@ -120,6 +152,19 @@ def make_handler(model):
                 })
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
+                if trace_cpu:
+                    sse_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
+                    total_us = (time.perf_counter_ns() - request_begin_ns) // 1000
+                    print(
+                        "[fastllm][http][cpu] "
+                        f"prompt={len(input_tokens)} generated={generated} "
+                        f"launch_us={launch_us} poll_checks={poll_checks} "
+                        f"can_fetch_us={can_fetch_us} poll_sleep_us={poll_sleep_us} "
+                        f"statistics_us={statistics_us} fetch_us={fetch_us} "
+                        f"sse_us={sse_us} total_us={total_us}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 self.close_connection = True
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
