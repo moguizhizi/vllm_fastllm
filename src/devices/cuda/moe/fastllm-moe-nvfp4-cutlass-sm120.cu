@@ -86,6 +86,39 @@ __global__ void SetupMetadataSm120(int32_t *shapes, StrideA *strideA,
         cute::make_shape(rows[group], n, k, 1));
 }
 
+template <typename ElementA, typename ElementD, typename ElementSF,
+          typename StrideA, typename StrideB, typename StrideD,
+          typename LayoutSFA, typename LayoutSFB, typename ScaleConfig>
+__global__ void SetupDeviceRouteMetadataSm120(
+        const uint8_t *aBase, const uint8_t *scaleABase, void *dBase,
+        const int *expertOffsets, const int *blockscaleOffsets,
+        const ElementA **a, ElementD **d, const ElementSF **sa, int *rows,
+        int32_t *shapes, StrideA *strideA, StrideB *strideB,
+        StrideD *strideD, LayoutSFA *layoutA, LayoutSFB *layoutB,
+        int groups, int n, int k) {
+    const int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= groups) return;
+    const int begin = expertOffsets[group];
+    const int groupRows = expertOffsets[group + 1] - begin;
+    const int roundedScaleColumns = ((k / 16) + 3) / 4 * 4;
+    a[group] = reinterpret_cast<const ElementA *>(
+        aBase + (size_t)begin * (k / 2));
+    sa[group] = reinterpret_cast<const ElementSF *>(
+        scaleABase + (size_t)blockscaleOffsets[group] * roundedScaleColumns);
+    d[group] = reinterpret_cast<ElementD *>(dBase) + (size_t)begin * n;
+    rows[group] = groupRows;
+    shapes[group * 3] = groupRows;
+    shapes[group * 3 + 1] = n;
+    shapes[group * 3 + 2] = k;
+    reinterpret_cast<int64_t *>(strideA)[group] = k;
+    reinterpret_cast<int64_t *>(strideB)[group] = k;
+    reinterpret_cast<int64_t *>(strideD)[group] = n;
+    layoutA[group] = ScaleConfig::tile_atom_to_shape_SFA(
+        cute::make_shape(groupRows, n, k, 1));
+    layoutB[group] = ScaleConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(groupRows, n, k, 1));
+}
+
 /** SM120 grouped GEMM复用的device metadata和CUTLASS workspace。 */
 struct GroupedScratchSm120 {
     uint8_t *metadata = nullptr;
@@ -94,9 +127,15 @@ struct GroupedScratchSm120 {
     size_t workspaceCapacity = 0;
     int device = -1;
     int smCount = 0;
+    bool staticMetadataReady = false;
+    int staticGroups = 0;
+    int staticN = 0;
+    int staticK = 0;
 };
 
-static thread_local std::map<int, GroupedScratchSm120> groupedScratchSm120;
+using GroupedScratchKeySm120 = std::pair<int, const void *>;
+static thread_local std::map<GroupedScratchKeySm120, GroupedScratchSm120>
+    groupedScratchSm120;
 
 template <typename T>
 static bool EnsureBufferSm120(T *&buffer, size_t &capacity, size_t bytes) {
@@ -114,10 +153,11 @@ static size_t AlignMetadataSm120(size_t offset, size_t alignment) {
 }
 
 /** 获取当前GPU/线程的持久metadata；thread_local防止per-thread stream互相覆盖。 */
-static GroupedScratchSm120 *GetGroupedScratchSm120(size_t metadataBytes) {
+static GroupedScratchSm120 *GetGroupedScratchSm120(
+        size_t metadataBytes, const void *staticKey = nullptr) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
-    GroupedScratchSm120 &scratch = groupedScratchSm120[device];
+    GroupedScratchSm120 &scratch = groupedScratchSm120[{device, staticKey}];
     scratch.device = device;
     // SM数量属于稳定设备属性，只在该线程首次使用当前GPU时读取一次。
     if (scratch.smCount <= 0 &&
@@ -125,6 +165,10 @@ static GroupedScratchSm120 *GetGroupedScratchSm120(size_t metadataBytes) {
                                cudaDevAttrMultiProcessorCount,
                                device) != cudaSuccess) {
         scratch.smCount = 0;
+        return nullptr;
+    }
+    if (FastllmCudaGraphIsCapturing() &&
+        (scratch.metadata == nullptr || scratch.metadataCapacity < metadataBytes)) {
         return nullptr;
     }
     return EnsureBufferSm120(
@@ -245,6 +289,154 @@ bool RunGroupedSm120(const uint8_t *const *hostA, const uint8_t *const *hostB,
     }
     return ok;
 }
+
+/**
+ * 使用GPU端expert偏移执行SM120 NVFP4 grouped GEMM。
+ *
+ * routed expert的M值、A/D起始地址和激活scale地址全部由GPU metadata
+ * kernel根据expertOffsets生成；权重指针属于层级静态数据，只在该
+ * gate/up或down权重组首次使用时上传。这样正式decode不再依赖CPU路由
+ * 结果，也不重复搬运稳定权重metadata。
+ *
+ * @param aBase              按expert排序后的FP4激活基址。
+ * @param scaleABase         按expert分块存放的E4M3激活scale基址。
+ * @param dBase              按expert排序的BF16输出基址。
+ * @param hostB              各expert的CUTLASS FP4权重指针。
+ * @param hostScaleB         各expert的E4M3权重scale指针。
+ * @param hostAlpha          各expert的FP32全局scale指针。
+ * @param expertOffsets      GPU端expert路由前缀和，长度groups+1。
+ * @param blockscaleOffsets  GPU端scale行前缀和，长度groups+1，按128行补齐。
+ * @param groups             routed expert数量。
+ * @param n                  GEMM输出宽度。
+ * @param k                  GEMM归约宽度。
+ * @param stream             正式推理CUDA流。
+ * @return metadata准备和CUTLASS启动均成功时返回true。
+ */
+bool RunGroupedDeviceRoutesSm120(
+        const uint8_t *aBase, const uint8_t *scaleABase, void *dBase,
+        const uint8_t *const *hostB, const uint8_t *const *hostScaleB,
+        const float *const *hostAlpha, const int *expertOffsets,
+        const int *blockscaleOffsets, int groups, int n, int k,
+        cudaStream_t stream) {
+    using Config = GroupedConfigSm120;
+    using Gemm = Config::Gemm;
+    using Kernel = Config::Kernel;
+    using ShapeType = Config::ProblemShape::UnderlyingProblemShape;
+    using StrideA = Kernel::InternalStrideA;
+    using StrideB = Kernel::InternalStrideB;
+    using StrideD = Kernel::InternalStrideD;
+    using LayoutSFA = Kernel::CollectiveMainloop::InternalLayoutSFA;
+    using LayoutSFB = Kernel::CollectiveMainloop::InternalLayoutSFB;
+    using ScaleConfig = Kernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+    size_t metadataBytes = 0;
+#define RESERVE_DEVICE_META(type, count) \
+    do { metadataBytes = AlignMetadataSm120(metadataBytes, alignof(type)); \
+         metadataBytes += sizeof(type) * (size_t)(count); } while (0)
+    RESERVE_DEVICE_META(const Config::ElementType *, groups);
+    RESERVE_DEVICE_META(const Config::ElementType *, groups);
+    RESERVE_DEVICE_META(const Config::ElementSFType *, groups);
+    RESERVE_DEVICE_META(const Config::ElementSFType *, groups);
+    RESERVE_DEVICE_META(const float *, groups);
+    RESERVE_DEVICE_META(Config::ElementD *, groups);
+    RESERVE_DEVICE_META(int, groups);
+    RESERVE_DEVICE_META(int32_t, (size_t)groups * 3);
+    RESERVE_DEVICE_META(StrideA, groups);
+    RESERVE_DEVICE_META(StrideB, groups);
+    RESERVE_DEVICE_META(StrideD, groups);
+    RESERVE_DEVICE_META(LayoutSFA, groups);
+    RESERVE_DEVICE_META(LayoutSFB, groups);
+#undef RESERVE_DEVICE_META
+    GroupedScratchSm120 *scratch = GetGroupedScratchSm120(
+        metadataBytes, hostB[0]);
+    if (scratch == nullptr) return false;
+    if (FastllmCudaGraphIsCapturing() && !scratch->staticMetadataReady) return false;
+    size_t offset = 0;
+#define TAKE_DEVICE_META(name, type, count) \
+    offset = AlignMetadataSm120(offset, alignof(type)); \
+    auto name = reinterpret_cast<type *>(scratch->metadata + offset); \
+    offset += sizeof(type) * (size_t)(count)
+    TAKE_DEVICE_META(a, const Config::ElementType *, groups);
+    TAKE_DEVICE_META(b, const Config::ElementType *, groups);
+    TAKE_DEVICE_META(sa, const Config::ElementSFType *, groups);
+    TAKE_DEVICE_META(sb, const Config::ElementSFType *, groups);
+    TAKE_DEVICE_META(alpha, const float *, groups);
+    TAKE_DEVICE_META(d, Config::ElementD *, groups);
+    TAKE_DEVICE_META(rows, int, groups);
+    TAKE_DEVICE_META(shapes, int32_t, (size_t)groups * 3);
+    TAKE_DEVICE_META(strideA, StrideA, groups);
+    TAKE_DEVICE_META(strideB, StrideB, groups);
+    TAKE_DEVICE_META(strideD, StrideD, groups);
+    TAKE_DEVICE_META(layoutA, LayoutSFA, groups);
+    TAKE_DEVICE_META(layoutB, LayoutSFB, groups);
+#undef TAKE_DEVICE_META
+
+    bool ok = true;
+    if (!scratch->staticMetadataReady || scratch->staticGroups != groups ||
+        scratch->staticN != n || scratch->staticK != k) {
+        std::vector<const Config::ElementType *> castB(groups);
+        std::vector<const Config::ElementSFType *> castSB(groups);
+        for (int i = 0; i < groups; ++i) {
+            castB[i] = reinterpret_cast<const Config::ElementType *>(hostB[i]);
+            castSB[i] = reinterpret_cast<const Config::ElementSFType *>(hostScaleB[i]);
+        }
+        ok = cudaMemcpyAsync(b, castB.data(), sizeof(void *) * groups,
+                             cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+             cudaMemcpyAsync(sb, castSB.data(), sizeof(void *) * groups,
+                             cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+             cudaMemcpyAsync(alpha, hostAlpha, sizeof(void *) * groups,
+                             cudaMemcpyHostToDevice, stream) == cudaSuccess;
+        if (ok) {
+            scratch->staticMetadataReady = true;
+            scratch->staticGroups = groups;
+            scratch->staticN = n;
+            scratch->staticK = k;
+        }
+    }
+    if (ok) {
+        const int threads = std::min(256, groups);
+        SetupDeviceRouteMetadataSm120<
+            Config::ElementType, Config::ElementD, Config::ElementSFType,
+            StrideA, StrideB, StrideD, LayoutSFA, LayoutSFB, ScaleConfig>
+            <<<(groups + threads - 1) / threads, threads, 0, stream>>>(
+                aBase, scaleABase, dBase, expertOffsets, blockscaleOffsets,
+                a, d, sa, rows, shapes, strideA, strideB, strideD,
+                layoutA, layoutB, groups, n, k);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        typename Kernel::MainloopArguments mainloop{
+            a, strideA, b, strideB, sa, layoutA, sb, layoutB};
+        typename Kernel::EpilogueArguments epilogue{{}, nullptr, strideD, d, strideD};
+        epilogue.thread.alpha_ptr_array = const_cast<float **>(alpha);
+        epilogue.thread.dAlpha = {_0{}, _0{}, 1};
+        epilogue.thread.beta = 0.0f;
+        cutlass::KernelHardwareInfo hw;
+        hw.device_id = scratch->device;
+        hw.sm_count = scratch->smCount;
+        typename Kernel::TileSchedulerArguments scheduler;
+        using Raster = cutlass::gemm::kernel::detail::RasterOrderOptions;
+        scheduler.raster_order = Raster::AlongM;
+        typename Gemm::Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGrouped,
+            {groups, reinterpret_cast<ShapeType *>(shapes), nullptr},
+            mainloop, epilogue, hw, scheduler};
+        Gemm gemm;
+        const size_t workspaceBytes = Gemm::get_workspace_size(args);
+        if (FastllmCudaGraphIsCapturing() &&
+            (scratch->workspaceCapacity < workspaceBytes ||
+             (workspaceBytes > 0 && scratch->workspace == nullptr))) {
+            return false;
+        }
+        ok = EnsureBufferSm120(
+                 scratch->workspace, scratch->workspaceCapacity, workspaceBytes) &&
+             gemm.can_implement(args) == cutlass::Status::kSuccess &&
+             gemm.initialize(args, scratch->workspace, stream) == cutlass::Status::kSuccess &&
+             gemm.run(args, scratch->workspace, stream) == cutlass::Status::kSuccess &&
+             cudaGetLastError() == cudaSuccess;
+    }
+    return ok;
+}
 } // namespace fastllm_nvfp4_moe_sm120
 #endif
 
@@ -265,6 +457,29 @@ bool FastllmCudaNvfp4GroupedGemmSm120(
 #else
     (void)a; (void)b; (void)scaleA; (void)scaleB; (void)alpha; (void)d;
     (void)rows; (void)groups; (void)n; (void)k; (void)outputType; (void)streamPtr;
+#endif
+    return false;
+}
+
+bool FastllmCudaNvfp4GroupedGemmSm120DeviceRoutes(
+        const uint8_t *aBase, const uint8_t *scaleABase, void *dBase,
+        const uint8_t *const *b, const uint8_t *const *scaleB,
+        const float *const *alpha, const int *expertOffsets,
+        const int *blockscaleOffsets, int groups, int n, int k,
+        fastllm::DataType outputType, void *streamPtr) {
+#if defined(FASTLLM_ENABLE_CUTLASS_NVFP4_SM120)
+    if (!aBase || !scaleABase || !dBase || !b || !scaleB || !alpha ||
+        !expertOffsets || !blockscaleOffsets || groups <= 0 || groups > 256 ||
+        n <= 0 || k <= 0 || n % 32 != 0 || k % 32 != 0 ||
+        outputType != fastllm::DataType::BFLOAT16) return false;
+    cudaStream_t stream = streamPtr ? static_cast<cudaStream_t>(streamPtr) : 0;
+    return fastllm_nvfp4_moe_sm120::RunGroupedDeviceRoutesSm120(
+        aBase, scaleABase, dBase, b, scaleB, alpha,
+        expertOffsets, blockscaleOffsets, groups, n, k, stream);
+#else
+    (void)aBase; (void)scaleABase; (void)dBase; (void)b; (void)scaleB;
+    (void)alpha; (void)expertOffsets; (void)blockscaleOffsets; (void)groups;
+    (void)n; (void)k; (void)outputType; (void)streamPtr;
 #endif
     return false;
 }

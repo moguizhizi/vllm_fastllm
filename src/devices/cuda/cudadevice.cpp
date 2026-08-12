@@ -8258,8 +8258,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
      *
      * @param input         FP16/BF16输入，逻辑形状为[batch, hidden]。
      * @param output        最终MoE输出。
-     * @param indexData     CPU端expert索引，形状为[batch, topk]。
-     * @param scoreData     CPU端路由分数，形状为[batch, topk]。
+     * @param index         CUDA端expert索引，形状为[batch, topk]，类型INT32。
+     * @param score         CUDA端路由分数，形状为[batch, topk]，类型FP32。
      * @param batch         token行数，允许从1开始。
      * @param topk          每个token选中的expert数量。
      * @param w1            gate/up grouped GEMM临时张量。
@@ -8271,7 +8271,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
      * @return true表示W4A4 grouped计算成功；false表示条件不满足或执行失败。
      */
     static bool TryCudaMergeMOENvfp4W4A4Grouped(
-        Data &input, Data &output, const int32_t *indexData, const float *scoreData, int batch, int topk,
+        Data &input, Data &output, const Data &index, const Data &score,
+        int batch, int topk,
         Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
         Data *backendAnchor = weights != nullptr && weightsBatch >= 4
             ? weights[2] : nullptr;
@@ -8292,7 +8293,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             !IsCudaMergeMoeFp16Bf16InputType(input.dataType) ||
             input.dims.size() == 0 || batch <= 0 || topk <= 0 ||
             weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
-            indexData == nullptr || scoreData == nullptr) {
+            index.dataDevice != DataDevice::CUDA ||
+            index.dataType != DataType::INT32 || index.cudaData == nullptr ||
+            score.dataDevice != DataDevice::CUDA ||
+            score.dataType != DataType::FLOAT32 || score.cudaData == nullptr ||
+            index.dims.size() != 2 || score.dims != index.dims ||
+            index.dims[0] != batch || index.dims[1] != topk) {
             return rejectCall();
         }
         const int hidden = input.dims.back();
@@ -8328,45 +8334,11 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             return rejectCall();
         }
 
-        std::vector<int> expertCounts(experts, 0);
-        for (int b = 0; b < batch; b++) {
-            for (int j = 0; j < topk; j++) {
-                int expert = indexData[b * topk + j];
-                if (expert < 0 || expert >= experts) {
-                    return rejectCall();
-                }
-                expertCounts[expert]++;
-            }
-        }
-
-        std::vector<int> expertStarts(experts, 0);
-        int totalTasks = 0;
-        for (int e = 0; e < experts; e++) {
-            expertStarts[e] = totalTasks;
-            totalTasks += expertCounts[e];
-        }
-        if (totalTasks <= 0) {
-            return rejectCall();
-        }
-
-        std::vector<int> offsets = expertStarts;
-        std::vector<int> routeRows(totalTasks);
-        std::vector<float> routeScales(totalTasks);
-        std::vector<int> routePositions((size_t)batch * topk);
-        for (int b = 0; b < batch; b++) {
-            for (int j = 0; j < topk; j++) {
-                int expert = indexData[b * topk + j];
-                int pos = offsets[expert]++;
-                routeRows[pos] = b;
-                routeScales[pos] = scoreData[b * topk + j];
-                routePositions[b * topk + j] = pos;
-            }
-        }
+        // 路由统计、前缀和、重排和激活量化全部由CUDA入口完成。这里不再
+        // 把index/score拉回CPU，避免每个MoE层、每个decode步产生流同步。
         bool ok = FastllmCudaMergeMoeNvfp4W4A4Grouped(
             input, w1, w2, output, weights, weightsBatch,
-            routeRows.data(), routeScales.data(), routePositions.data(),
-            expertStarts.data(), expertCounts.data(), batch, topk,
-            totalTasks, hidden, inter, gateType);
+            index, score, batch, topk, hidden, inter, gateType);
         if (!ok || !hasSharedExpert) {
             return ok;
         }
@@ -8689,6 +8661,15 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     }
                 }
             }
+
+            // NVFP4 grouped主路径直接消费CUDA路由张量。必须放在任何
+            // ToDevice(CPU)之前，否则decode每层都会因D2H拷贝强制同步。
+            if (preferNvfp4W4A4 && index.dims.size() >= 2 &&
+                TryCudaMergeMOENvfp4W4A4Grouped(
+                    input, output, index, score, batch, index.dims[1],
+                    w1, w2, weights, weightsBatch, sharedScale, gateType)) {
+                return;
+            }
             cudaMergeMOEUsedGraphUnsafeFallback = true;
             // batch=1 fast path only needs index on CPU to choose expert weights;
             // scores can stay on CUDA and be consumed by the grouped down kernel.
@@ -8716,15 +8697,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             score.ToDevice(DataDevice::CPU);
             ToDataType(score, DataType::FLOAT32);
             float *scoreData = (float*)score.cpuData;
-
-            // NVFP4 W4A4 CUTLASS拥有独立Try流程，优先于Legacy和纯FP8
-            // grouped分支，并覆盖batch=1 decode及更大的prefill批次。
-            if (preferNvfp4W4A4 &&
-                TryCudaMergeMOENvfp4W4A4Grouped(
-                    input, output, indexData, scoreData, batch, topk,
-                    w1, w2, weights, weightsBatch, sharedScale, gateType)) {
-                return;
-            }
 
             if (TryCudaMergeMOEW4A8Grouped(
                     input, output, indexData, scoreData, batch, topk,

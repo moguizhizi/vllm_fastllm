@@ -974,6 +974,12 @@ bool FastllmCudaNvfp4GroupedGemmSm120(
     const float *const *alpha, void *const *d, const int *rows,
     int groups, int n, int k, fastllm::DataType outputType,
     void *streamPtr = nullptr);
+bool FastllmCudaNvfp4GroupedGemmSm120DeviceRoutes(
+    const uint8_t *aBase, const uint8_t *scaleABase, void *dBase,
+    const uint8_t *const *b, const uint8_t *const *scaleB,
+    const float *const *alpha, const int *expertOffsets,
+    const int *blockscaleOffsets, int groups, int n, int k,
+    fastllm::DataType outputType, void *streamPtr = nullptr);
 bool FastllmCudaPrepareNvfp4W4A4Weight(
     fastllm::Data &weight, int inFeatures, int outFeatures,
     const uint8_t **packedWeight, const uint8_t **scales,
@@ -998,10 +1004,9 @@ void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight);
 bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
-    const int *routeRows, const float *routeScales,
-    const int *routePositions, const int *expertStarts,
-    const int *expertCounts, int batch, int topk, int totalTasks,
-    int hidden, int inter, fastllm::MoeGateType gateType);
+    const fastllm::Data &index, const fastllm::Data &score,
+    int batch, int topk, int hidden, int inter,
+    fastllm::MoeGateType gateType);
 #else
 inline bool TryCudaCutlassNvfp4W4A4(
     const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
@@ -1023,8 +1028,8 @@ inline bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
 inline void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *) {}
 inline bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     const fastllm::Data &, fastllm::Data &, fastllm::Data &,
-    fastllm::Data &, fastllm::Data **, int, const int *, const float *,
-    const int *, const int *, const int *, int, int, int, int, int,
+    fastllm::Data &, fastllm::Data **, int, const fastllm::Data &,
+    const fastllm::Data &, int, int, int, int,
     fastllm::MoeGateType) {
     return false;
 }

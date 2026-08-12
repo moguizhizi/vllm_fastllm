@@ -1,5 +1,7 @@
 /* NVFP4 routed MoE integration around vLLM's SM100/SM120 grouped W4A4 CUTLASS GEMM. */
 #include "fastllm-cuda.cuh"
+#define NVFP4_ENABLE_ELTS16 1
+#include "../fp4/fastllm-nvfp4-utils.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -15,6 +17,101 @@
 #include <vector>
 
 namespace {
+
+/** GPU并行统计每个expert收到的有效路由数量。 */
+__global__ void CountRoutes(const int32_t *indices, int *expertCounts,
+                            int routes, int experts) {
+    const int route = blockIdx.x * blockDim.x + threadIdx.x;
+    if (route >= routes) return;
+    const int expert = indices[route];
+    if (expert >= 0 && expert < experts) {
+        atomicAdd(expertCounts + expert, 1);
+    }
+}
+
+/** 在GPU上生成路由前缀和、128行scale前缀和及scatter游标。 */
+__global__ void BuildRouteOffsets(const int *expertCounts, int *expertOffsets,
+                                  int *blockscaleOffsets, int *expertCursors,
+                                  int experts) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int routeOffset = 0;
+    int scaleOffset = 0;
+    expertOffsets[0] = 0;
+    blockscaleOffsets[0] = 0;
+    for (int expert = 0; expert < experts; ++expert) {
+        expertCursors[expert] = routeOffset;
+        routeOffset += expertCounts[expert];
+        scaleOffset += (expertCounts[expert] + 127) / 128 * 128;
+        expertOffsets[expert + 1] = routeOffset;
+        blockscaleOffsets[expert + 1] = scaleOffset;
+    }
+}
+
+/** 按expert连续重排[token,topk]路由，同时保留反向位置和路由权重。 */
+__global__ void ScatterRoutes(const int32_t *indices, const float *scores,
+                              int *expertCursors, int *routeRows,
+                              float *routeScales, int *routePositions,
+                              int routes, int topk, int experts) {
+    const int route = blockIdx.x * blockDim.x + threadIdx.x;
+    if (route >= routes) return;
+    const int expert = indices[route];
+    if (expert < 0 || expert >= experts) return;
+    const int position = atomicAdd(expertCursors + expert, 1);
+    routeRows[position] = route / topk;
+    routeScales[position] = scores[route];
+    routePositions[route] = position;
+}
+
+/**
+ * 用一个kernel量化全部expert的连续路由行。
+ *
+ * expertOffsets定位每行所属expert；blockscaleOffsets保证每个expert的
+ * E4M3 scale区域独立按128行对齐。FusedSiluMul为true时输入采用
+ * [gate,up]布局并在量化前融合SwiGLU。
+ */
+template <typename T, bool FusedSiluMul>
+__global__ void __launch_bounds__(512)
+QuantizeExpertRows(const T *input, uint8_t *output, uint8_t *outputScales,
+                   const int *expertOffsets,
+                   const int *blockscaleOffsets, int rows, int columns,
+                   int experts) {
+    const int pack = blockIdx.y * blockDim.x + threadIdx.x;
+    const int packs = columns / fastllm_nvfp4::kElementsPerThread;
+    if (pack >= packs) return;
+    const int roundedScaleColumns = ((columns / 16) + 3) / 4 * 4;
+    const int kTiles = (columns + 63) / 64;
+    for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+        int left = 0, right = experts - 1, expert = 0;
+        while (left <= right) {
+            const int middle = (left + right) / 2;
+            const int begin = expertOffsets[middle];
+            const int end = expertOffsets[middle + 1];
+            if (row < begin) right = middle - 1;
+            else if (row >= end) left = middle + 1;
+            else { expert = middle; break; }
+        }
+        const int rowInExpert = row - expertOffsets[expert];
+        const int element = pack * fastllm_nvfp4::kElementsPerThread;
+        fastllm_nvfp4::PackedVec<T> values;
+        if constexpr (FusedSiluMul) {
+            fastllm_nvfp4::PackedVec<T> gate, up;
+            const T *rowInput = input + (size_t)row * columns * 2;
+            fastllm_nvfp4::LoadOrZero(gate, rowInput + element, true);
+            fastllm_nvfp4::LoadOrZero(up, rowInput + columns + element, true);
+            values = fastllm_nvfp4::SiluMul(gate, up);
+        } else {
+            fastllm_nvfp4::LoadOrZero(
+                values, input + (size_t)row * columns + element, true);
+        }
+        uint8_t *expertScales = outputScales +
+            (size_t)blockscaleOffsets[expert] * roundedScaleColumns;
+        uint8_t *scale = fastllm_nvfp4::QuantScaleAddress(
+            rowInExpert, pack, kTiles, expertScales);
+        const auto packed = fastllm_nvfp4::Quantize(values, 1.0f, scale);
+        fastllm_nvfp4::StoreFp4(
+            output + (size_t)row * (columns / 2) + element / 2, packed);
+    }
+}
 
 template <typename T>
 __global__ void GatherRows(const T *input, const int *routeRows, T *output,
@@ -98,6 +195,10 @@ __global__ void GegluRows(const T *input, T *output, int rows, int hidden) {
  * cudaStreamPerThread的生命周期保持一致。
  */
 struct MoeScratch {
+    int *expertCounts = nullptr;
+    int *expertOffsets = nullptr;
+    int *blockscaleOffsets = nullptr;
+    int *expertCursors = nullptr;
     int *routeRows = nullptr;
     int *routePositions = nullptr;
     float *routeScales = nullptr;
@@ -107,6 +208,10 @@ struct MoeScratch {
     uint8_t *downValues = nullptr;
     uint8_t *downScales = nullptr;
     uint8_t *activated = nullptr;
+    size_t expertCountsCapacity = 0;
+    size_t expertOffsetsCapacity = 0;
+    size_t blockscaleOffsetsCapacity = 0;
+    size_t expertCursorsCapacity = 0;
     size_t routeRowsCapacity = 0;
     size_t routePositionsCapacity = 0;
     size_t routeScalesCapacity = 0;
@@ -119,6 +224,73 @@ struct MoeScratch {
 };
 
 static thread_local std::map<int, MoeScratch> moeScratch;
+
+struct MoeLayerWeightMetadata {
+    std::vector<const uint8_t *> gateWeights;
+    std::vector<const uint8_t *> gateScales;
+    std::vector<const float *> gateAlphas;
+    std::vector<const uint8_t *> downWeights;
+    std::vector<const uint8_t *> downScales;
+    std::vector<const float *> downAlphas;
+};
+
+using MoeLayerWeightKey = std::pair<const fastllm::Data *, int>;
+static thread_local std::map<MoeLayerWeightKey, MoeLayerWeightMetadata>
+    moeLayerWeightMetadata;
+
+/**
+ * 获取本层routed expert的CUTLASS权重指针表，并缓存稳定热路径结果。
+ *
+ * 每次调用只重新查询首个gate权重以检测GPU迁移或cache重建；首指针保持
+ * 不变时直接返回整层指针表，避免每个token对全部expert重复执行全局
+ * weight cache map和mutex查询。首指针变化时重新扫描整层，保证不会使用
+ * 已释放的重排权重地址。
+ *
+ * @param weights       MoE权重数组。
+ * @param weightsBatch  权重指针数量。
+ * @param hidden        模型隐藏维度。
+ * @param inter         expert中间维度。
+ * @return 成功时返回当前GPU上的整层指针表，否则返回nullptr。
+ */
+static MoeLayerWeightMetadata *GetLayerWeightMetadata(
+        fastllm::Data **weights, int weightsBatch, int hidden, int inter) {
+    const int experts = weightsBatch / 2 - 1;
+    const int device = FastllmCudaGetDevice();
+    if (!weights || experts <= 0 || device < 0 || !weights[2]) return nullptr;
+    const uint8_t *firstWeight = nullptr, *firstScale = nullptr;
+    const float *firstAlpha = nullptr;
+    if (!FastllmCudaPrepareNvfp4W4A4Weight(
+            *weights[2], hidden, inter * 2,
+            &firstWeight, &firstScale, &firstAlpha)) return nullptr;
+    MoeLayerWeightMetadata &metadata =
+        moeLayerWeightMetadata[{weights[2], device}];
+    if ((int)metadata.gateWeights.size() == experts &&
+        metadata.gateWeights[0] == firstWeight) {
+        return &metadata;
+    }
+    metadata = {};
+    metadata.gateWeights.resize(experts);
+    metadata.gateScales.resize(experts);
+    metadata.gateAlphas.resize(experts);
+    metadata.downWeights.resize(experts);
+    metadata.downScales.resize(experts);
+    metadata.downAlphas.resize(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        fastllm::Data *gate = weights[2 + expert * 2];
+        fastllm::Data *down = weights[3 + expert * 2];
+        if (!gate || !down ||
+            !FastllmCudaPrepareNvfp4W4A4Weight(
+                *gate, hidden, inter * 2, &metadata.gateWeights[expert],
+                &metadata.gateScales[expert], &metadata.gateAlphas[expert]) ||
+            !FastllmCudaPrepareNvfp4W4A4Weight(
+                *down, inter, hidden, &metadata.downWeights[expert],
+                &metadata.downScales[expert], &metadata.downAlphas[expert])) {
+            metadata = {};
+            return nullptr;
+        }
+    }
+    return &metadata;
+}
 
 template <typename T>
 static bool EnsureScratchBuffer(T *&buffer, size_t &capacity, size_t bytes) {
@@ -135,11 +307,32 @@ static bool EnsureScratchBuffer(T *&buffer, size_t &capacity, size_t bytes) {
 static MoeScratch *GetMoeScratch(size_t routeCount, size_t gatheredBytes,
                                  size_t gateValueBytes, size_t gateScaleBytes,
                                  size_t downValueBytes, size_t downScaleBytes,
-                                 size_t activatedBytes) {
+                                 size_t activatedBytes, int experts) {
     const int device = FastllmCudaGetDevice();
     MoeScratch &scratch = moeScratch[device];
     const size_t routeBytes = routeCount * sizeof(int);
-    if (!EnsureScratchBuffer(scratch.routeRows, scratch.routeRowsCapacity, routeBytes) ||
+    const size_t expertBytes = (size_t)(experts + 1) * sizeof(int);
+    if (FastllmCudaGraphIsCapturing() &&
+        (scratch.expertCountsCapacity < expertBytes ||
+         scratch.expertOffsetsCapacity < expertBytes ||
+         scratch.blockscaleOffsetsCapacity < expertBytes ||
+         scratch.expertCursorsCapacity < expertBytes ||
+         scratch.routeRowsCapacity < routeBytes ||
+         scratch.routePositionsCapacity < routeBytes ||
+         scratch.routeScalesCapacity < routeCount * sizeof(float) ||
+         scratch.gatheredCapacity < gatheredBytes ||
+         scratch.gateValueCapacity < gateValueBytes ||
+         scratch.gateScaleCapacity < gateScaleBytes ||
+         scratch.downValueCapacity < downValueBytes ||
+         scratch.downScaleCapacity < downScaleBytes ||
+         scratch.activatedCapacity < activatedBytes)) {
+        return nullptr;
+    }
+    if (!EnsureScratchBuffer(scratch.expertCounts, scratch.expertCountsCapacity, expertBytes) ||
+        !EnsureScratchBuffer(scratch.expertOffsets, scratch.expertOffsetsCapacity, expertBytes) ||
+        !EnsureScratchBuffer(scratch.blockscaleOffsets, scratch.blockscaleOffsetsCapacity, expertBytes) ||
+        !EnsureScratchBuffer(scratch.expertCursors, scratch.expertCursorsCapacity, expertBytes) ||
+        !EnsureScratchBuffer(scratch.routeRows, scratch.routeRowsCapacity, routeBytes) ||
         !EnsureScratchBuffer(scratch.routePositions, scratch.routePositionsCapacity, routeBytes) ||
         !EnsureScratchBuffer(scratch.routeScales, scratch.routeScalesCapacity,
                              routeCount * sizeof(float)) ||
@@ -213,7 +406,7 @@ static bool StrictEnabled() {
  *         决定首次回退或固定后报错。
  */
 template <typename T>
-bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
+bool RunHostRoutes(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
          fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
          const int *routeRows, const float *routeScales,
          const int *routePositions, const int *expertStarts,
@@ -289,7 +482,7 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         (size_t)totalTasks * hidden / 2, gateScaleBytes,
         (size_t)totalTasks * inter / 2, downScaleBytes,
         gateType == fastllm::MoeGateGeglu
-            ? (size_t)totalTasks * inter * sizeof(T) : sizeof(T));
+            ? (size_t)totalTasks * inter * sizeof(T) : sizeof(T), experts);
     if (scratch == nullptr) return false;
 
     // 路由元数据由CPU按expert连续排列；异步上传后，gather kernel把原始
@@ -412,6 +605,186 @@ bool Run(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         ok = cudaGetLastError() == cudaSuccess;
     }
 
+    if (cudaInput) FastllmCudaFinishInput(input, cudaInput);
+    return ok;
+}
+
+/**
+ * 在SM120上使用GPU常驻路由执行一次NVFP4 grouped MoE。
+ *
+ * 本路径忠实采用vLLM的设备侧流程：GPU统计每个expert的路由数量并生成
+ * 前缀和，按expert重排输入，再用单个expert-aware kernel量化全部路由行。
+ * 两次grouped GEMM都直接读取GPU端expertOffsets，不把index、score或
+ * expert计数复制回CPU。当前函数只负责单次计算，后端固定与首次失败回退
+ * 仍由外层FastllmCudaMergeMoeNvfp4W4A4Grouped处理。
+ *
+ * @tparam T          激活类型，SM120当前仅实例化__nv_bfloat16。
+ * @param input       BF16输入，逻辑形状为[batch, hidden]。
+ * @param index       CUDA INT32路由索引，形状为[batch, topk]。
+ * @param score       CUDA FP32路由权重，形状为[batch, topk]。
+ * @param w1          gate/up grouped GEMM输出，形状为[batch*topk,2*inter]。
+ * @param w2          down grouped GEMM输出，形状为[batch*topk,hidden]。
+ * @param output      加权归并后的BF16输出，形状为[batch,hidden]。
+ * @param weights     MoE权重数组；routed expert从下标2开始成对存放。
+ * @param weightsBatch 权重指针数量。
+ * @param batch       token行数。
+ * @param topk        每个token的routed expert数。
+ * @param hidden      模型隐藏维度。
+ * @param inter       expert中间维度。
+ * @param gateType    SwiGLU或GeGLU。
+ * @return 全部CUDA阶段成功启动时返回true，否则返回false。
+ */
+template <typename T>
+bool RunDeviceRoutesSm120(
+        const fastllm::Data &input, const fastllm::Data &index,
+        const fastllm::Data &score, fastllm::Data &w1, fastllm::Data &w2,
+        fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+        int batch, int topk, int hidden, int inter,
+        fastllm::MoeGateType gateType) {
+    const int experts = weightsBatch / 2 - 1;
+    const int totalTasks = batch * topk;
+    if (!std::is_same_v<T, __nv_bfloat16> ||
+        (gateType != fastllm::MoeGateSwiglu &&
+         gateType != fastllm::MoeGateGeglu) ||
+        FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() >= 130 ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::BFLOAT16 ||
+        index.dataDevice != fastllm::DataDevice::CUDA ||
+        index.dataType != fastllm::DataType::INT32 ||
+        score.dataDevice != fastllm::DataDevice::CUDA ||
+        score.dataType != fastllm::DataType::FLOAT32 ||
+        batch <= 0 || topk <= 0 || experts <= 0 || experts > 256 ||
+        totalTasks <= 0 || hidden % 32 != 0 || inter % 32 != 0) return false;
+
+    w1.dataDevice = fastllm::DataDevice::CUDA;
+    w1.dataDeviceIds = input.dataDeviceIds;
+    w1.dataType = fastllm::DataType::BFLOAT16;
+    w1.UpdateUnitSize();
+    w1.Resize({totalTasks, inter * 2});
+    w1.Allocate(false);
+    w2.dataDevice = fastllm::DataDevice::CUDA;
+    w2.dataDeviceIds = input.dataDeviceIds;
+    w2.dataType = fastllm::DataType::BFLOAT16;
+    w2.UpdateUnitSize();
+    w2.Resize({totalTasks, hidden});
+    w2.Allocate(false);
+    output.dataDevice = fastllm::DataDevice::CUDA;
+    output.dataDeviceIds = input.dataDeviceIds;
+    output.dataType = fastllm::DataType::BFLOAT16;
+    output.UpdateUnitSize();
+    output.Resize(input.dims);
+    output.Allocate(false);
+    if (!w1.cudaData || !w2.cudaData || !output.cudaData) return false;
+
+    // scale按每个expert独立补齐到128行；总容量取最坏上界，真实偏移由
+    // BuildRouteOffsets在GPU上计算，无需把expertCounts同步回CPU。
+    const size_t paddedRows = (size_t)totalTasks +
+        (size_t)std::min(experts, totalTasks) * 127;
+    const size_t gateScaleBytes = paddedRows * (((hidden / 16) + 3) / 4 * 4);
+    const size_t downScaleBytes = paddedRows * (((inter / 16) + 3) / 4 * 4);
+    MoeScratch *scratch = GetMoeScratch(
+        totalTasks, (size_t)totalTasks * hidden * sizeof(T),
+        (size_t)totalTasks * hidden / 2, gateScaleBytes,
+        (size_t)totalTasks * inter / 2, downScaleBytes,
+        gateType == fastllm::MoeGateGeglu
+            ? (size_t)totalTasks * inter * sizeof(T) : sizeof(T), experts);
+    if (scratch == nullptr) return false;
+
+    cudaStream_t stream = cudaStreamPerThread;
+    constexpr int threads = 256;
+    bool ok = cudaMemsetAsync(scratch->expertCounts, 0,
+                              sizeof(int) * (size_t)(experts + 1), stream) == cudaSuccess;
+    if (ok) {
+        CountRoutes<<<(totalTasks + threads - 1) / threads, threads, 0, stream>>>(
+            static_cast<const int32_t *>(index.cudaData), scratch->expertCounts,
+            totalTasks, experts);
+        BuildRouteOffsets<<<1, 1, 0, stream>>>(
+            scratch->expertCounts, scratch->expertOffsets,
+            scratch->blockscaleOffsets, scratch->expertCursors, experts);
+        ScatterRoutes<<<(totalTasks + threads - 1) / threads, threads, 0, stream>>>(
+            static_cast<const int32_t *>(index.cudaData),
+            static_cast<const float *>(score.cudaData), scratch->expertCursors,
+            scratch->routeRows, scratch->routeScales, scratch->routePositions,
+            totalTasks, topk, experts);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    T *cudaInput = static_cast<T *>(FastllmCudaPrepareInput(input));
+    if (ok && cudaInput != nullptr) {
+        const size_t elements = (size_t)totalTasks * hidden;
+        GatherRows<<<(elements + threads - 1) / threads, threads, 0, stream>>>(
+            cudaInput, scratch->routeRows, reinterpret_cast<T *>(scratch->gathered),
+            totalTasks, hidden);
+        ok = cudaGetLastError() == cudaSuccess;
+    } else {
+        ok = false;
+    }
+
+    MoeLayerWeightMetadata *weightMetadata = ok
+        ? GetLayerWeightMetadata(weights, weightsBatch, hidden, inter) : nullptr;
+    ok = ok && weightMetadata != nullptr;
+
+    const int gatePacks = hidden / fastllm_nvfp4::kElementsPerThread;
+    if (ok) {
+        const int quantThreads = std::min(512, gatePacks);
+        QuantizeExpertRows<T, false>
+            <<<dim3(std::min(totalTasks, 128),
+                    (gatePacks + quantThreads - 1) / quantThreads),
+               quantThreads, 0, stream>>>(
+                reinterpret_cast<const T *>(scratch->gathered),
+                scratch->gateValues, scratch->gateScales,
+                scratch->expertOffsets, scratch->blockscaleOffsets,
+                totalTasks, hidden, experts);
+        ok = cudaGetLastError() == cudaSuccess &&
+             FastllmCudaNvfp4GroupedGemmSm120DeviceRoutes(
+                 scratch->gateValues, scratch->gateScales, w1.cudaData,
+                 weightMetadata->gateWeights.data(),
+                 weightMetadata->gateScales.data(),
+                 weightMetadata->gateAlphas.data(),
+                 scratch->expertOffsets, scratch->blockscaleOffsets,
+                 experts, inter * 2, hidden, fastllm::DataType::BFLOAT16,
+                 (void *)stream);
+    }
+
+    const int downPacks = inter / fastllm_nvfp4::kElementsPerThread;
+    if (ok) {
+        const int quantThreads = std::min(512, downPacks);
+        const dim3 quantGrid(
+            std::min(totalTasks, 128),
+            (downPacks + quantThreads - 1) / quantThreads);
+        if (gateType == fastllm::MoeGateSwiglu) {
+            QuantizeExpertRows<T, true><<<quantGrid, quantThreads, 0, stream>>>(
+                static_cast<const T *>(w1.cudaData), scratch->downValues,
+                scratch->downScales, scratch->expertOffsets,
+                scratch->blockscaleOffsets, totalTasks, inter, experts);
+        } else {
+            const size_t elements = (size_t)totalTasks * inter;
+            GegluRows<<<(elements + threads - 1) / threads, threads, 0, stream>>>(
+                static_cast<const T *>(w1.cudaData),
+                reinterpret_cast<T *>(scratch->activated), totalTasks, inter);
+            QuantizeExpertRows<T, false><<<quantGrid, quantThreads, 0, stream>>>(
+                reinterpret_cast<const T *>(scratch->activated),
+                scratch->downValues, scratch->downScales,
+                scratch->expertOffsets, scratch->blockscaleOffsets,
+                totalTasks, inter, experts);
+        }
+        ok = cudaGetLastError() == cudaSuccess &&
+             FastllmCudaNvfp4GroupedGemmSm120DeviceRoutes(
+                 scratch->downValues, scratch->downScales, w2.cudaData,
+                 weightMetadata->downWeights.data(),
+                 weightMetadata->downScales.data(),
+                 weightMetadata->downAlphas.data(),
+                 scratch->expertOffsets, scratch->blockscaleOffsets,
+                 experts, hidden, inter, fastllm::DataType::BFLOAT16,
+                 (void *)stream);
+    }
+    if (ok) {
+        const size_t elements = (size_t)batch * hidden;
+        ReduceRoutes<<<(elements + threads - 1) / threads, threads, 0, stream>>>(
+            static_cast<const T *>(w2.cudaData), scratch->routePositions,
+            scratch->routeScales, static_cast<T *>(output.cudaData),
+            batch, topk, hidden);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
     if (cudaInput) FastllmCudaFinishInput(input, cudaInput);
     return ok;
 }
@@ -543,7 +916,8 @@ static bool RejectRoutedWeights(fastllm::Data **weights, int weightsBatch,
  * routed experts后端，再按输入类型分派到内部Run实现。内部流程依次完成路由行gather、
  * gate/up激活动态NVFP4量化、第一层grouped GEMM、SwiGLU或GeGLU门控、
  * down激活动态NVFP4量化、第二层grouped GEMM，以及top-k路由加权归并。
- * 本函数不构造路由表；调用方必须提前按expert连续排列路由元数据。
+ * SM120直接接收CUDA端index/score并在GPU上构造路由表；SM100暂时保留
+ * host-routes兼容实现，等待对应device metadata launcher完成后再切换。
  *
  * 数学语义为：对每个token选中的top-k expert分别计算
  * down(activation(gate_up(input)))，再乘以对应routeScales并求和。
@@ -565,17 +939,10 @@ static bool RejectRoutedWeights(fastllm::Data **weights, int weightsBatch,
  * @param weights          expert权重指针数组；第0对为可选shared expert，
  *                        routed expert e使用第e+1对gate/up和down权重。
  * @param weightsBatch     weights数组中的Data指针数量，必须为偶数且至少为4。
- * @param routeRows        按expert分组后的任务到原始input行号的映射，长度为
- *                        totalTasks。
- * @param routeScales      每条路由的top-k权重，按分组后任务顺序排列，长度为
- *                        totalTasks。
- * @param routePositions   原始[token, topk]位置到分组后任务位置的映射，长度
- *                        为batch * topk。
- * @param expertStarts     每个expert在分组任务数组中的起始位置。
- * @param expertCounts     每个expert本次参与计算的任务数量。
+ * @param index            CUDA INT32 expert索引，形状为[batch,topk]。
+ * @param score            CUDA FP32路由权重，形状为[batch,topk]。
  * @param batch            输入token行数，即grouped MoE的M总规模。
  * @param topk             每个token选中的routed expert数量。
- * @param totalTasks       总路由任务数，必须等于batch * topk。
  * @param hidden           模型隐藏维度，必须按32对齐。
  * @param inter            单个expert的中间维度，必须按32对齐。
  * @param gateType         门控激活类型，当前支持MoeGateSwiglu和
@@ -586,10 +953,9 @@ static bool RejectRoutedWeights(fastllm::Data **weights, int weightsBatch,
 bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
-        const int *routeRows, const float *routeScales,
-        const int *routePositions, const int *expertStarts,
-        const int *expertCounts, int batch, int topk, int totalTasks,
-        int hidden, int inter, fastllm::MoeGateType gateType) {
+        const fastllm::Data &index, const fastllm::Data &score,
+        int batch, int topk, int hidden, int inter,
+        fastllm::MoeGateType gateType) {
     const int arch = FastllmCudaRuntimeArch();
     const int device = FastllmCudaGetDevice();
     fastllm::Data *anchor = BackendAnchor(weights, weightsBatch);
@@ -626,14 +992,59 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
 
     // 首次选择时必须先验证整层所有routed权重，而不是只检查本批活跃expert。
     bool ok = !selecting || PrepareRoutedWeights(weights, weightsBatch, device);
-    if (ok && input.dataType == fastllm::DataType::FLOAT16)
-        ok = Run<half>(input, w1, w2, output, weights, weightsBatch,
-            routeRows, routeScales, routePositions, expertStarts, expertCounts,
-            batch, topk, totalTasks, hidden, inter, gateType);
-    else if (ok && input.dataType == fastllm::DataType::BFLOAT16)
-        ok = Run<__nv_bfloat16>(input, w1, w2, output, weights, weightsBatch,
-            routeRows, routeScales, routePositions, expertStarts, expertCounts,
-            batch, topk, totalTasks, hidden, inter, gateType);
+    if (ok && arch >= 120 && input.dataType == fastllm::DataType::BFLOAT16) {
+        ok = RunDeviceRoutesSm120<__nv_bfloat16>(
+            input, index, score, w1, w2, output, weights, weightsBatch,
+            batch, topk, hidden, inter, gateType);
+    } else if (ok && arch < 120) {
+        // SM100兼容路径暂时保留原实现；仅该架构仍发生一次D2H同步。
+        const int totalTasks = batch * topk;
+        std::vector<int32_t> hostIndex(totalTasks);
+        std::vector<float> hostScore(totalTasks);
+        ok = index.dataDevice == fastllm::DataDevice::CUDA &&
+             index.dataType == fastllm::DataType::INT32 &&
+             score.dataDevice == fastllm::DataDevice::CUDA &&
+             score.dataType == fastllm::DataType::FLOAT32 &&
+             cudaMemcpyAsync(hostIndex.data(), index.cudaData,
+                             sizeof(int32_t) * (size_t)totalTasks,
+                             cudaMemcpyDeviceToHost, cudaStreamPerThread) == cudaSuccess &&
+             cudaMemcpyAsync(hostScore.data(), score.cudaData,
+                             sizeof(float) * (size_t)totalTasks,
+                             cudaMemcpyDeviceToHost, cudaStreamPerThread) == cudaSuccess &&
+             cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+        const int experts = weightsBatch / 2 - 1;
+        std::vector<int> counts(experts, 0), starts(experts, 0);
+        for (int route = 0; ok && route < totalTasks; ++route) {
+            const int expert = hostIndex[route];
+            if (expert < 0 || expert >= experts) ok = false;
+            else counts[expert]++;
+        }
+        int total = 0;
+        for (int expert = 0; expert < experts; ++expert) {
+            starts[expert] = total;
+            total += counts[expert];
+        }
+        std::vector<int> cursors = starts, rows(totalTasks), positions(totalTasks);
+        std::vector<float> scales(totalTasks);
+        for (int route = 0; ok && route < totalTasks; ++route) {
+            const int position = cursors[hostIndex[route]]++;
+            rows[position] = route / topk;
+            scales[position] = hostScore[route];
+            positions[route] = position;
+        }
+        if (ok && input.dataType == fastllm::DataType::FLOAT16)
+            ok = RunHostRoutes<half>(
+                input, w1, w2, output, weights, weightsBatch,
+                rows.data(), scales.data(), positions.data(), starts.data(),
+                counts.data(), batch, topk, totalTasks, hidden, inter, gateType);
+        else if (ok && input.dataType == fastllm::DataType::BFLOAT16)
+            ok = RunHostRoutes<__nv_bfloat16>(
+                input, w1, w2, output, weights, weightsBatch,
+                rows.data(), scales.data(), positions.data(), starts.data(),
+                counts.data(), batch, topk, totalTasks, hidden, inter, gateType);
+    } else {
+        ok = false;
+    }
     if (ok && selecting) {
         // CUDA kernel异步返回；首次必须同步验证后才能释放回退机会并固定后端。
         ok = cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
@@ -658,9 +1069,10 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
     }
     if (TraceEnabled()) {
         std::fprintf(stderr,
-            "[fastllm][nvfp4] path=%s state=%s batch=%d topk=%d hidden=%d inter=%d sm=%d\n",
+            "[fastllm][nvfp4] path=%s state=%s route=%s batch=%d topk=%d hidden=%d inter=%d sm=%d\n",
             ok ? "grouped-moe-w4a4-cutlass" : "grouped-moe-fallback",
             selecting ? "selected" : "fixed",
+            arch >= 120 ? "gpu" : "host",
             batch, topk, hidden, inter, arch);
     }
     return ok;
