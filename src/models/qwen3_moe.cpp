@@ -1051,7 +1051,7 @@ namespace fastllm {
         public:
             explicit Qwen3MoeForwardCpuTrace(int batch)
                     : enabled(Qwen3MoeForwardCpuTraceEnabled()),
-                      batch(batch), path("incomplete") {
+                      batch(batch), workload("unknown"), path("incomplete") {
                 if (enabled) {
                     begin = last = Clock::now();
                 }
@@ -1064,7 +1064,9 @@ namespace fastllm {
                 const auto end = Clock::now();
                 std::ostringstream line;
                 line << "[fastllm][qwen3-moe][forward-cpu]"
-                     << " batch=" << batch << " path=" << path;
+                     << " batch=" << batch
+                     << " workload=" << workload
+                     << " path=" << path;
                 for (const auto &stage : stages) {
                     line << " " << stage.first << "_us=" << stage.second;
                 }
@@ -1088,6 +1090,12 @@ namespace fastllm {
                 }
             }
 
+            void SetWorkload(const char *value) {
+                if (enabled) {
+                    workload = value;
+                }
+            }
+
         private:
             using Clock = std::chrono::steady_clock;
 
@@ -1098,6 +1106,7 @@ namespace fastllm {
 
             bool enabled;
             int batch;
+            const char *workload;
             const char *path;
             Clock::time_point begin;
             Clock::time_point last;
@@ -4345,6 +4354,7 @@ namespace fastllm {
             all1 &= (seqLens[i] == 1);
         }
         bool isPrefill = !all1;
+        forwardCpuTrace.SetWorkload(isPrefill ? "prefill" : "decode");
 
         Data allPositionIds;
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
