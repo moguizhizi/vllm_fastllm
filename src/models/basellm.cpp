@@ -25,8 +25,10 @@ namespace fastllm {
         /**
          * 判断是否开启异步响应调度器的CPU分段耗时诊断。
          *
-         * 开关默认关闭；开启后仅记录批次准备、Forward锁等待、模型Forward、
-         * Forward后处理和结果入队耗时，不改变调度与同步语义。
+         * 开关默认关闭；开启后将批次准备细分为临时容器初始化、请求字典锁
+         * 等待、上下文扫描、分页占用查询、请求选择、LastTokens准备及Decode
+         * 分页检查，并继续记录模型Forward和结果入队耗时。诊断不改变调度、
+         * 分页、同步或后端选择语义。
          *
          * @return 环境变量FASTLLM_RESPONSE_CPU_TRACE为真值时返回true。
          */
@@ -1686,7 +1688,13 @@ namespace fastllm {
             decodePositionValues.reserve(reserveBatch);
             decodePositionIds.reserve(reserveBatch);
 
+            const auto containerReady = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            const auto dictLockAcquired = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             auto &forwardLocker = model->forwardLocker;
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
@@ -1802,6 +1810,9 @@ namespace fastllm {
                     }
                 }
             }
+            const auto contextScanDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
@@ -1815,6 +1826,9 @@ namespace fastllm {
                     pagesLimit = totalPages * 4 / 5;
                 }
             }
+            const auto pageUsageDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             // 当busyPages未超过pagesLimit时可以开启新的Prefill；超过时只做Decode
             bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
@@ -2335,6 +2349,9 @@ namespace fastllm {
                     }
                 }
             }
+            const auto requestSelectionDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             if (!seqLens.empty()) {
                 if (selectedHasPrompt && interleaveActivePrefill) {
@@ -2357,6 +2374,9 @@ namespace fastllm {
                     tokensManager.units.push_back(ctx->tokens);
                 }
             }
+            const auto lastTokensDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
             if (seqLens.size() > 0 && selectedHasDecode) {
@@ -2462,6 +2482,9 @@ namespace fastllm {
                     seqLens.clear();
                 }
             }
+            const auto pagedKvDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             if (seqLens.size() > 0) {
                 const auto selectionDone = responseCpuTrace ?
@@ -2694,11 +2717,24 @@ namespace fastllm {
                     std::fprintf(
                         stderr,
                         "[fastllm][response][cpu] batch=%zu workload=%s "
+                        "container_init_us=%lld dict_lock_us=%lld "
+                        "context_scan_us=%lld page_usage_us=%lld "
+                        "request_select_us=%lld "
+                        "last_tokens_us=%lld paged_kv_us=%lld "
+                        "batch_finalize_us=%lld "
                         "batch_prepare_us=%lld forward_lock_us=%lld "
                         "forward_us=%lld post_forward_us=%lld "
                         "enqueue_us=%lld total_us=%lld\n",
                         seqLens.size(),
                         selectedHasDecode && !selectedHasPrompt ? "decode" : "prefill",
+                        ResponseCpuTraceMicroseconds(containerReady - responseLoopBegin),
+                        ResponseCpuTraceMicroseconds(dictLockAcquired - containerReady),
+                        ResponseCpuTraceMicroseconds(contextScanDone - dictLockAcquired),
+                        ResponseCpuTraceMicroseconds(pageUsageDone - contextScanDone),
+                        ResponseCpuTraceMicroseconds(requestSelectionDone - pageUsageDone),
+                        ResponseCpuTraceMicroseconds(lastTokensDone - requestSelectionDone),
+                        ResponseCpuTraceMicroseconds(pagedKvDone - lastTokensDone),
+                        ResponseCpuTraceMicroseconds(selectionDone - pagedKvDone),
                         ResponseCpuTraceMicroseconds(selectionDone - responseLoopBegin),
                         ResponseCpuTraceMicroseconds(forwardBegin - forwardLockBegin),
                         ResponseCpuTraceMicroseconds(forwardDone - forwardBegin),

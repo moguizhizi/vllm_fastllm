@@ -1043,9 +1043,11 @@ namespace fastllm {
         /**
          * 收集一次Qwen3-MOE ForwardGPU的CPU分段耗时。
          *
-         * prepare覆盖输入、权重和KV元数据准备；model_forward覆盖单卡或多卡
-         * 模型计算；sampling_prepare和sampling分别覆盖采样输入准备与取回
-         * Token。析构时统一输出，避免逐阶段打印干扰主线程。
+         * entry_prepare、input_prepare、weight_prepare、embedding_prepare和
+         * kv_cache_prepare依次覆盖入口检查、输入构造、权重状态、Embedding及
+         * KV元数据准备；model_forward覆盖单卡或多卡模型计算；采样阶段分别
+         * 覆盖采样输入准备与取回Token。return_cleanup记录最后一个Mark到函数
+         * 局部对象析构结束的耗时，用于定位返回路径中原先未归类的清理开销。
          */
         class Qwen3MoeForwardCpuTrace {
         public:
@@ -1070,6 +1072,7 @@ namespace fastllm {
                 for (const auto &stage : stages) {
                     line << " " << stage.first << "_us=" << stage.second;
                 }
+                line << " return_cleanup_us=" << ToMicroseconds(end - last);
                 line << " total_us=" << ToMicroseconds(end - begin) << "\n";
                 const std::string text = line.str();
                 std::fwrite(text.data(), 1, text.size(), stderr);
@@ -4355,6 +4358,7 @@ namespace fastllm {
         }
         bool isPrefill = !all1;
         forwardCpuTrace.SetWorkload(isPrefill ? "prefill" : "decode");
+        forwardCpuTrace.Mark("entry_prepare");
 
         Data allPositionIds;
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
@@ -4382,6 +4386,7 @@ namespace fastllm {
             PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
             PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
         }
+        forwardCpuTrace.Mark("input_prepare");
 
         std::vector<DivisionScheme> localKvHeadSchemes;
         DivisionScheme localLmHeadScheme;
@@ -4672,6 +4677,7 @@ namespace fastllm {
             }
             localLmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
+        forwardCpuTrace.Mark("weight_prepare");
 
         if (tensorParallel && !useCpuEmbedding) {
             PrepareMultiCudaReplicatedData(weight["model.embed_tokens.weight"], devices, true);
@@ -4686,6 +4692,7 @@ namespace fastllm {
             PrepareQwen3MoeCpuEmbeddingHiddenStates(cpuEmbeddingHiddenStates, devices, threadTpWorkerGroup);
             precomputedHiddenStates = &cpuEmbeddingHiddenStates;
         }
+        forwardCpuTrace.Mark("embedding_prepare");
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
         if (tensorParallel) {
             localPastKeyValues.resize(devices.size());
@@ -4715,7 +4722,7 @@ namespace fastllm {
             }
         }
 
-        forwardCpuTrace.Mark("prepare");
+        forwardCpuTrace.Mark("kv_cache_prepare");
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
         if (devices.size() == 1) {
