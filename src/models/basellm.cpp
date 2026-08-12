@@ -1618,8 +1618,12 @@ namespace fastllm {
 
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
+        // 这些模型的单Token Decode只需要当前Token和绝对Position，不需要
+        // 重新执行FillLLMInputs构造临时AttentionMask及Position张量。
         const bool canUseFastDecodeInput =
-            model->model_type == "qwen3" || model->model_type == "qwen3_5";
+            model->model_type == "qwen3" ||
+            model->model_type == "qwen3_moe" ||
+            model->model_type == "qwen3_5";
         const bool printProfile = GetFastllmEnv().printProfile;
         int idlePrefillBatchWaitUs =
             useGPUForward && maxBatch > 1 && model->model_type == "qwen3_5" ?
