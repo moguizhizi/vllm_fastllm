@@ -1531,6 +1531,11 @@ namespace fastllm {
         struct Qwen3MoeCudaGraphDecodeState {
             std::mutex mutex;
             std::string signature;
+            // indexed MoE布局只与模型权重和当前GPU有关。缓存检查结果，避免
+            // 每个decode token重复遍历全部层和全部expert权重。
+            bool indexedMoeLayoutChecked = false;
+            bool indexedMoeLayoutSupported = false;
+            std::string indexedMoeLayoutFailure;
             bool warmed = false;
             bool captured = false;
             bool disabled = false;
@@ -1921,23 +1926,47 @@ namespace fastllm {
             return lastRet;
         }
 
+        /**
+         * 检查当前GPU上的indexed MoE权重能否进入Qwen3-MOE CUDA Graph。
+         *
+         * FP8和Legacy NVFP4路径要求原始CUDA权重仍然存在；NVFP4_BLOCK_16
+         * 原生W4A4路径则以CUTLASS重排cache为实际设备表示，原始cudaData
+         * 可能已按生命周期设计释放，因此通过预重排接口验证或补建cache，
+         * 不能把cudaData为空误判为不支持。失败原因返回到调用方用于诊断。
+         *
+         * @param deviceWeights 各GPU、各层的routed expert权重表。
+         * @param device        当前CUDA设备号。
+         * @param blockCnt      Transformer层数。
+         * @param hidden        模型hidden维度。
+         * @param moeAtype      MoE计算激活类型，必须为FP16或BF16。
+         * @param failureReason 可选的失败原因输出。
+         * @return true表示所有有效expert权重均具备图捕获所需的设备表示。
+         */
         static bool Qwen3MoeCanGraphIndexedMoe(
                 const std::unordered_map<int, std::vector<std::vector<Data*> > > &deviceWeights,
                 int device,
                 int blockCnt,
                 int hidden,
-                DataType moeAtype) {
-            if (moeAtype != DataType::FLOAT16 && moeAtype != DataType::BFLOAT16) {
+                DataType moeAtype,
+                std::string *failureReason) {
+            auto reject = [&](const std::string &reason) -> bool {
+                if (failureReason != nullptr) {
+                    *failureReason = reason;
+                }
                 return false;
+            };
+            if (moeAtype != DataType::FLOAT16 && moeAtype != DataType::BFLOAT16) {
+                return reject("MoE activation is not FP16/BF16");
             }
             auto deviceIt = deviceWeights.find(device);
             if (deviceIt == deviceWeights.end() || (int)deviceIt->second.size() < blockCnt) {
-                return false;
+                return reject("missing device weight table");
             }
             for (int i = 0; i < blockCnt; i++) {
                 const std::vector<Data*> &layerWeights = deviceIt->second[i];
                 if ((int)layerWeights.size() < 4 || layerWeights[0] != nullptr) {
-                    return false;
+                    return reject("layer " + std::to_string(i) +
+                                  " uses an unsupported weight layout");
                 }
 
                 bool hasShard = false;
@@ -1950,26 +1979,71 @@ namespace fastllm {
                     if (gateup == nullptr || down == nullptr ||
                         gateup->dataDevice != DataDevice::CUDA ||
                         down->dataDevice != DataDevice::CUDA ||
-                        gateup->cudaData == nullptr || down->cudaData == nullptr ||
                         gateup->dataType != down->dataType ||
                         gateup->dims.size() != 2 || down->dims.size() != 2 ||
                         gateup->dims[1] != hidden ||
                         down->dims[0] != hidden ||
                         gateup->dims[0] != down->dims[1] * 2) {
-                        return false;
+                        return reject("layer " + std::to_string(i) + " expert " +
+                                      std::to_string((j - 2) / 2) +
+                                      " has invalid tensors");
                     }
                     bool supportedWeight =
                         gateup->dataType == DataType::FP8_E4M3 ||
                         gateup->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                         Qwen3MoeIsNVFP4WeightType(gateup->dataType);
                     if (!supportedWeight) {
-                        return false;
+                        return reject("layer " + std::to_string(i) + " expert " +
+                                      std::to_string((j - 2) / 2) +
+                                      " has an unsupported weight type");
+                    }
+
+                    if (gateup->dataType == DataType::NVFP4_BLOCK_16) {
+                        // W4A4正式表示是CUTLASS cache。这里在图捕获之前验证
+                        // cache；cache缺失时允许从host/mmap补建，不能依赖已释放
+                        // 的原始cudaData。
+                        if (FastllmCudaGetNvfp4W4A4BackendState(*gateup, device) ==
+                                FastllmCudaNvfp4BackendState::Rejected ||
+                            FastllmCudaGetNvfp4W4A4BackendState(*down, device) ==
+                                FastllmCudaNvfp4BackendState::Rejected) {
+                            return reject("layer " + std::to_string(i) + " expert " +
+                                          std::to_string((j - 2) / 2) +
+                                          " has a rejected CUTLASS backend");
+                        }
+                        const uint8_t *gateupPacked = nullptr;
+                        const uint8_t *gateupScales = nullptr;
+                        const float *gateupAlpha = nullptr;
+                        const uint8_t *downPacked = nullptr;
+                        const uint8_t *downScales = nullptr;
+                        const float *downAlpha = nullptr;
+                        bool gateupReady = FastllmCudaPrepareNvfp4W4A4Weight(
+                            *gateup, gateup->dims[1], gateup->dims[0],
+                            &gateupPacked, &gateupScales, &gateupAlpha);
+                        bool downReady = FastllmCudaPrepareNvfp4W4A4Weight(
+                            *down, down->dims[1], down->dims[0],
+                            &downPacked, &downScales, &downAlpha);
+                        if (!gateupReady || !downReady || gateupPacked == nullptr ||
+                            gateupScales == nullptr || gateupAlpha == nullptr ||
+                            downPacked == nullptr || downScales == nullptr ||
+                            downAlpha == nullptr) {
+                            return reject("layer " + std::to_string(i) + " expert " +
+                                          std::to_string((j - 2) / 2) +
+                                          " has no usable CUTLASS weight cache");
+                        }
+                    } else if (gateup->cudaData == nullptr || down->cudaData == nullptr) {
+                        return reject("layer " + std::to_string(i) + " expert " +
+                                      std::to_string((j - 2) / 2) +
+                                      " has no original CUDA weight");
                     }
                     hasShard = true;
                 }
                 if (!hasShard) {
-                    return false;
+                    return reject("layer " + std::to_string(i) +
+                                  " has no local expert shard");
                 }
+            }
+            if (failureReason != nullptr) {
+                failureReason->clear();
             }
             return true;
         }
@@ -3051,11 +3125,23 @@ namespace fastllm {
                 graphHidden = normIt->second.dims[0];
             }
         }
-        bool indexedMoeOk = Qwen3MoeCanGraphIndexedMoe(moeWeightsByDevice, gpuId, block_cnt,
-                                                       graphHidden, threadTpMoeAtype);
+        Qwen3MoeCudaGraphDecodeState &state =
+            GetQwen3MoeCudaGraphDecodeState(this, gpuId, batch);
+        std::unique_lock<std::mutex> graphLock(state.mutex);
+        if (!state.indexedMoeLayoutChecked) {
+            FastllmCudaSetDevice(gpuId);
+            state.indexedMoeLayoutSupported = Qwen3MoeCanGraphIndexedMoe(
+                moeWeightsByDevice, gpuId, block_cnt, graphHidden,
+                threadTpMoeAtype, &state.indexedMoeLayoutFailure);
+            state.indexedMoeLayoutChecked = true;
+        }
+        bool indexedMoeOk = state.indexedMoeLayoutSupported;
         bool fusedMoeOk = moeFusedWeightsPrepared;
         if (!syncGraphPeers(indexedMoeOk || fusedMoeOk)) {
-            return rejectGraph("unsupported moe layout");
+            std::string reason = indexedMoeOk || state.indexedMoeLayoutFailure.empty()
+                ? "unsupported moe layout on a peer GPU"
+                : "unsupported moe layout: " + state.indexedMoeLayoutFailure;
+            return rejectGraph(reason);
         }
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
@@ -3124,8 +3210,6 @@ namespace fastllm {
             return rejectGraph("dynamic ntk beyond max position");
         }
 
-        Qwen3MoeCudaGraphDecodeState &state = GetQwen3MoeCudaGraphDecodeState(this, gpuId, batch);
-        std::unique_lock<std::mutex> graphLock(state.mutex);
         if (Qwen3MoeCudaGraphIsDisabled(this)) {
             Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject",
                                        "model graph state disabled");
