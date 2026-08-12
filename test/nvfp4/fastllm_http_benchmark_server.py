@@ -60,12 +60,10 @@ def make_handler(model):
                     "FASTLLM_HTTP_CPU_TRACE", "").lower() in ("1", "true", "on")
                 request_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                 launch_us = 0
-                can_fetch_us = 0
-                poll_sleep_us = 0
+                wait_fetch_us = 0
                 statistics_us = 0
-                fetch_us = 0
                 sse_us = 0
-                poll_checks = 0
+                wait_fetch_calls = 0
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length))
                 input_tokens = request.get("prompt")
@@ -98,32 +96,31 @@ def make_handler(model):
                 generated = 0
                 first = True
                 statistics = {}
+                token_batch = (ctypes.c_int * 1)()
                 while True:
+                    # 使用正式导出的阻塞式取Token入口。其内部通过条件变量等待，
+                    # 等待期间会释放调度器共用的dictLocker，避免HTTP轮询线程每
+                    # 0.5ms抢锁。每次只取一个Token，保持逐Token SSE和ITL语义。
                     stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
-                    can_fetch = llm.fastllm_lib.can_fetch_response_llm_model(
-                        model.model, handle)
+                    fetched = llm.fastllm_lib.fetch_response_tokens_batch_llm_model(
+                        model.model, handle, token_batch, 1)
                     if trace_cpu:
-                        can_fetch_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
-                        poll_checks += 1
-                    if not can_fetch:
-                        stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
-                        time.sleep(0.0005)
-                        if trace_cpu:
-                            poll_sleep_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
+                        wait_fetch_us += (
+                            time.perf_counter_ns() - stage_begin_ns) // 1000
+                        wait_fetch_calls += 1
+                    # 超时只用于兼容旧调度器遗漏通知的情况；继续阻塞等待，
+                    # 不恢复CanFetchResponse忙轮询。
+                    if fetched == 0:
                         continue
-                    # 最后一次fetch会删除ResponseContext，因此必须在fetch前
-                    # 保存本请求的Prefix Cache命中统计。
+                    if fetched < 0:
+                        break
+                    token = int(token_batch[0])
+                    # 最后一个真实Token取出后ResponseContext仍然存在；下一次
+                    # 取Token发现结束状态时才会删除，因此这里可安全保存统计。
                     stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                     statistics = model.get_response_statistics(handle) or statistics
                     if trace_cpu:
                         statistics_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
-                    stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
-                    token = llm.fastllm_lib.fetch_response_llm_model(
-                        model.model, handle)
-                    if trace_cpu:
-                        fetch_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
-                    if token <= -1:
-                        break
                     choice = {"index": 0, "token_ids": [token], "text": ""}
                     if first:
                         choice["prompt_token_ids"] = input_tokens
@@ -158,9 +155,9 @@ def make_handler(model):
                     print(
                         "[fastllm][http][cpu] "
                         f"prompt={len(input_tokens)} generated={generated} "
-                        f"launch_us={launch_us} poll_checks={poll_checks} "
-                        f"can_fetch_us={can_fetch_us} poll_sleep_us={poll_sleep_us} "
-                        f"statistics_us={statistics_us} fetch_us={fetch_us} "
+                        f"launch_us={launch_us} wait_fetch_calls={wait_fetch_calls} "
+                        f"wait_fetch_us={wait_fetch_us} "
+                        f"statistics_us={statistics_us} "
                         f"sse_us={sse_us} total_us={total_us}",
                         file=sys.stderr,
                         flush=True,
