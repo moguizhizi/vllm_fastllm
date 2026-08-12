@@ -4281,6 +4281,11 @@ namespace {
                                   w1, w2, w3, curInput, curOutput,
                                   sharedScale, output, 0, gateType);
                 ForceDeviceSync();
+                if (index.dataDevice != fastllm::DataDevice::CUDA ||
+                    score.dataDevice != fastllm::DataDevice::CUDA) {
+                    throw std::runtime_error(
+                        "grouped NVFP4 W4A4 moved routing tensors off CUDA");
+                }
                 setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT", "0", 1);
                 setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
                 fastllm::MergeMOE(input, index, score, referenceWeights, biass,
