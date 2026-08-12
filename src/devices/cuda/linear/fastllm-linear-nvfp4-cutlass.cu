@@ -869,6 +869,13 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
 }
 
 void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight) {
+    // Data析构、CopyFrom和ToDevice会统一调用缓存释放接口。只有
+    // NVFP4_BLOCK_16权重可能成为W4A4 cache/state的键，普通激活、
+    // position和logits必须在获取全局互斥锁前直接返回。
+    if (weight == nullptr ||
+        weight->dataType != fastllm::DataType::NVFP4_BLOCK_16) {
+        return;
+    }
     {
         std::lock_guard<std::mutex> guard(cacheMutex);
         bool hasCache = false;

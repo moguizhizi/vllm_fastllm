@@ -267,6 +267,13 @@ bool FastllmCudaTryMarlinHalfMatMulNVFP4(
 }
 
 void FastllmCudaReleaseNvfp4MarlinCache(const fastllm::Data *weight) {
+    // Marlin cache只会以NVFP4_BLOCK_16权重为键。通用Data生命周期也会
+    // 调用本接口，因此先按类型拒绝普通临时张量，避免每次Decode为
+    // input、position、embedding和logits获取无关的全局互斥锁。
+    if (weight == nullptr ||
+        weight->dataType != fastllm::DataType::NVFP4_BLOCK_16) {
+        return;
+    }
     {
         std::lock_guard<std::mutex> guard(cacheMutex);
         bool hasCache = false;
