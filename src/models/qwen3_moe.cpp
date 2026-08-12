@@ -1043,11 +1043,11 @@ namespace fastllm {
         /**
          * 收集一次Qwen3-MOE ForwardGPU的CPU分段耗时。
          *
-         * entry_prepare覆盖入口检查；position_collect、position_copy、
-         * input_ids_copy和multi_gpu_replicate进一步拆分输入构造；权重、
-         * Embedding、KV元数据、模型计算及采样继续按原有阶段记录。函数返回时
-         * 由Qwen3MoeForwardCpuCleanupCheckpoint按局部对象的原始析构顺序记录
-         * 各组清理耗时，return_cleanup只保留入口容器等最后一组清理开销。
+         * entry_prepare、input_prepare、weight_prepare、embedding_prepare和
+         * kv_cache_prepare依次覆盖入口检查、输入构造、权重状态、Embedding及
+         * KV元数据准备；model_forward覆盖单卡或多卡模型计算；采样阶段分别
+         * 覆盖采样输入准备与取回Token。return_cleanup记录最后一个Mark到函数
+         * 局部对象析构结束的耗时，用于定位返回路径中原先未归类的清理开销。
          */
         class Qwen3MoeForwardCpuTrace {
         public:
@@ -1114,35 +1114,6 @@ namespace fastllm {
             Clock::time_point begin;
             Clock::time_point last;
             std::vector<std::pair<const char*, long long> > stages;
-        };
-
-        /**
-         * 在ForwardGPU返回时记录一组局部对象的析构耗时。
-         *
-         * 检查点本身不持有模型数据，也不主动释放对象。多个检查点按声明顺序
-         * 插入ForwardGPU，函数返回时利用C++局部对象逆序析构规则调用Mark，
-         * 从而在不改变正式析构顺序的前提下分隔采样、模型缓冲、KV元数据、
-         * Embedding、权重元数据和输入临时张量的清理时间。诊断关闭时Mark为
-         * 空操作，不改变同步边界或后端行为。
-         */
-        class Qwen3MoeForwardCpuCleanupCheckpoint {
-        public:
-            Qwen3MoeForwardCpuCleanupCheckpoint(
-                    Qwen3MoeForwardCpuTrace &trace, const char *stage)
-                    : trace(trace), stage(stage) {}
-
-            ~Qwen3MoeForwardCpuCleanupCheckpoint() {
-                trace.Mark(stage);
-            }
-
-            Qwen3MoeForwardCpuCleanupCheckpoint(
-                    const Qwen3MoeForwardCpuCleanupCheckpoint&) = delete;
-            Qwen3MoeForwardCpuCleanupCheckpoint &operator=(
-                    const Qwen3MoeForwardCpuCleanupCheckpoint&) = delete;
-
-        private:
-            Qwen3MoeForwardCpuTrace &trace;
-            const char *stage;
         };
 
         /**
@@ -4388,17 +4359,17 @@ namespace fastllm {
         bool isPrefill = !all1;
         forwardCpuTrace.SetWorkload(isPrefill ? "prefill" : "decode");
         forwardCpuTrace.Mark("entry_prepare");
-        Qwen3MoeForwardCpuCleanupCheckpoint inputDataCleanupTrace(
-            forwardCpuTrace, "input_data_cleanup");
 
         Data allPositionIds;
-        std::vector<float> vPositionIds;
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
+            std::vector<float> vPositionIds;
             vPositionIds.reserve(batch);
             for (int b = 0; b < batch; b++) {
                 vPositionIds.push_back(((float*)positionIds[b]->cpuData)[0]);
             }
+            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vPositionIds));
         } else {
+            std::vector<float> vPositionIds;
             for (int b = 0; b < batch; b++) {
                 AssertInFastLLM(positionIds[b] != nullptr,
                                 "Qwen3-MOE ForwardGPU: null positionIds.\n");
@@ -4406,25 +4377,16 @@ namespace fastllm {
                     vPositionIds.push_back(((float*)positionIds[b]->cpuData)[i]);
                 }
             }
+            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
-        forwardCpuTrace.Mark("position_collect");
-        const std::vector<int> allPositionDims = all1 ?
-            std::vector<int>{1, seqLen} :
-            std::vector<int>{1, (int)vPositionIds.size()};
-        allPositionIds.CopyFrom(
-            Data(DataType::FLOAT32, allPositionDims, vPositionIds));
-        forwardCpuTrace.Mark("position_copy");
 
         Data gpuInputIds;
         gpuInputIds.CopyFrom(inputIds);
-        forwardCpuTrace.Mark("input_ids_copy");
         if (tensorParallel) {
             PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
             PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
         }
-        forwardCpuTrace.Mark("multi_gpu_replicate");
-        Qwen3MoeForwardCpuCleanupCheckpoint weightMetaCleanupTrace(
-            forwardCpuTrace, "weight_meta_cleanup");
+        forwardCpuTrace.Mark("input_prepare");
 
         std::vector<DivisionScheme> localKvHeadSchemes;
         DivisionScheme localLmHeadScheme;
@@ -4716,8 +4678,6 @@ namespace fastllm {
             localLmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
         forwardCpuTrace.Mark("weight_prepare");
-        Qwen3MoeForwardCpuCleanupCheckpoint embeddingCleanupTrace(
-            forwardCpuTrace, "embedding_cleanup");
 
         if (tensorParallel && !useCpuEmbedding) {
             PrepareMultiCudaReplicatedData(weight["model.embed_tokens.weight"], devices, true);
@@ -4733,8 +4693,6 @@ namespace fastllm {
             precomputedHiddenStates = &cpuEmbeddingHiddenStates;
         }
         forwardCpuTrace.Mark("embedding_prepare");
-        Qwen3MoeForwardCpuCleanupCheckpoint kvMetaCleanupTrace(
-            forwardCpuTrace, "kv_meta_cleanup");
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
         if (tensorParallel) {
             localPastKeyValues.resize(devices.size());
@@ -4765,8 +4723,6 @@ namespace fastllm {
         }
 
         forwardCpuTrace.Mark("kv_cache_prepare");
-        Qwen3MoeForwardCpuCleanupCheckpoint modelBuffersCleanupTrace(
-            forwardCpuTrace, "model_buffers_cleanup");
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
         if (devices.size() == 1) {
@@ -4834,8 +4790,6 @@ namespace fastllm {
             }
         }
         forwardCpuTrace.Mark("post_forward");
-        Qwen3MoeForwardCpuCleanupCheckpoint samplingCleanupTrace(
-            forwardCpuTrace, "sampling_cleanup");
 
         int vocabSize = lmHead.dims[0];
         bool allSimpleCudaSampling = true;
