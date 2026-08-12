@@ -927,6 +927,54 @@ namespace fastllm {
             return GetFastllmEnv().cudaGraph;
         }
 
+        /**
+         * 判断是否开启Qwen3-MOE CUDA Graph生命周期诊断。
+         *
+         * 该开关只控制状态日志，不改变Graph选择、捕获、回放或回退语义。
+         * 正式性能测试应保持关闭，避免日志输出干扰主线程调度。
+         *
+         * @return 环境变量FASTLLM_CUDA_GRAPH_TRACE为真值时返回true。
+         */
+        static bool Qwen3MoeCudaGraphTraceEnabled() {
+            const char *env = std::getenv("FASTLLM_CUDA_GRAPH_TRACE");
+            return env != nullptr && Qwen3MoeIsTrueString(env);
+        }
+
+        /**
+         * 输出一次Qwen3-MOE CUDA Graph状态变化。
+         *
+         * 相同模型、GPU、batch、事件和明细只输出一次，避免decode循环重复打印
+         * 干扰诊断结果。该函数仅用于定位Graph入口拒绝、签名重建以及首次捕获
+         * 和回放，不承担错误处理或后端选择职责。
+         *
+         * @param model   当前Qwen3-MOE模型，用于区分不同模型实例。
+         * @param gpuId   Graph所属CUDA设备编号。
+         * @param batch   Graph对应的decode batch。
+         * @param event   状态事件名称，例如reject、signature、capture或replay。
+         * @param detail  事件的具体原因或状态说明。
+         */
+        static void Qwen3MoeTraceCudaGraphOnce(
+                const Qwen3MOEModel *model, int gpuId, int batch,
+                const std::string &event, const std::string &detail) {
+            if (!Qwen3MoeCudaGraphTraceEnabled()) {
+                return;
+            }
+            static std::mutex traceMutex;
+            static std::set<std::string> emitted;
+            std::ostringstream key;
+            key << model << ":" << gpuId << ":" << batch << ":"
+                << event << ":" << detail;
+            {
+                std::lock_guard<std::mutex> guard(traceMutex);
+                if (!emitted.insert(key.str()).second) {
+                    return;
+                }
+            }
+            std::fprintf(stderr,
+                         "[fastllm][qwen3-moe][cuda-graph] event=%s gpu=%d batch=%d detail=%s\n",
+                         event.c_str(), gpuId, batch, detail.c_str());
+        }
+
         static bool Qwen3MoeNeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -2957,7 +3005,8 @@ namespace fastllm {
 #ifndef USE_CUDA
         return false;
 #else
-        auto rejectGraph = [](const std::string &) -> bool {
+        auto rejectGraph = [&](const std::string &reason) -> bool {
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject", reason);
             return false;
         };
         if (!Qwen3MoeCudaGraphEnabled()) {
@@ -3078,12 +3127,16 @@ namespace fastllm {
         Qwen3MoeCudaGraphDecodeState &state = GetQwen3MoeCudaGraphDecodeState(this, gpuId, batch);
         std::unique_lock<std::mutex> graphLock(state.mutex);
         if (Qwen3MoeCudaGraphIsDisabled(this)) {
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject",
+                                       "model graph state disabled");
             return false;
         }
         if (!syncGraphPeers(!state.disabled)) {
             if (state.disabled) {
                 Qwen3MoeDisableCudaGraph(this);
             }
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject",
+                                       "device graph state disabled");
             return false;
         }
         FastllmCudaSetDevice(gpuId);
@@ -3220,6 +3273,13 @@ namespace fastllm {
         std::string newSignature = signature.str();
         bool signatureChanged = state.signature != newSignature;
         if (signatureChanged) {
+            std::ostringstream detail;
+            detail << "old=" << std::hash<std::string>{}(state.signature)
+                   << " new=" << std::hash<std::string>{}(newSignature)
+                   << " pages=" << pageIndexCapacity
+                   << " warmed=" << (state.warmed ? 1 : 0)
+                   << " captured=" << (state.captured ? 1 : 0);
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "signature", detail.str());
             Qwen3MoeDestroyCudaGraph(state);
             state.signature = newSignature;
         }
@@ -3488,6 +3548,7 @@ namespace fastllm {
             bool launchOk = FastllmCudaGraphLaunch(state.exec);
             if (Qwen3MoeSyncCudaGraphStage(this, state, graphParticipants,
                                            "replay", gpuId, launchOk)) {
+                Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "replay", "success");
                 finishWithLogits();
                 return true;
             }
@@ -3507,6 +3568,7 @@ namespace fastllm {
                 return true;
             }
             state.warmed = true;
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "warmup", "success");
             return true;
         }
 
@@ -3564,6 +3626,7 @@ namespace fastllm {
         state.graph = capturedGraph;
         state.exec = capturedExec;
         state.captured = true;
+        Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "capture", "success");
         if (!syncGraphPeers()) {
             return false;
         }
@@ -3573,6 +3636,7 @@ namespace fastllm {
             runWithoutGraph();
             return true;
         }
+        Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "first-launch", "success");
         finishWithLogits();
         return true;
 #endif
@@ -3623,6 +3687,9 @@ namespace fastllm {
             Data localHiddenStates;
             Data *hiddenStatesPtr = nullptr;
             if (precomputedHiddenStates != nullptr) {
+                Qwen3MoeTraceCudaGraphOnce(
+                    this, gpuId, batch, "bypass",
+                    "precomputed CPU embedding hidden states");
                 hiddenStatesPtr = requireLocal(*precomputedHiddenStates, "precomputedHiddenStates");
             } else {
                 if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,

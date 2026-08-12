@@ -407,6 +407,7 @@ def run_fastllm(args, prompts, result_dir, mode):
     ]
     env = os.environ.copy()
     env.pop("FASTLLM_CUDA_NVFP4_TRACE", None)
+    env.pop("FASTLLM_CUDA_GRAPH_TRACE", None)
     env["FASTLLM_CUDA_NVFP4_W4A4"] = "1"
     env["FASTLLM_CUDA_NVFP4_W4A4_STRICT"] = "1"
     env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
