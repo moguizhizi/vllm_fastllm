@@ -461,6 +461,37 @@ bool FastllmCudaNvfp4GroupedGemmSm120(
     return false;
 }
 
+/**
+ * 使用GPU端路由元数据执行一次SM120 NVFP4 W4A4 grouped GEMM。
+ *
+ * 本函数是SM120设备侧MoE路由路径的公开入口，只负责检查参数并调用
+ * CUTLASS grouped GEMM，不负责生成expert路由、量化激活或决定后端生命周期。
+ * 激活和输出已按expert连续排列；函数根据GPU端expertOffsets为每个expert
+ * 构造独立的[M_e,N,K]问题，并通过blockscaleOffsets定位各组激活scale。
+ * 所有分组共享N和K，且N、K必须为32的倍数；当前输出仅支持BF16。
+ *
+ * @param aBase              按expert连续排列的NVFP4 E2M1激活基址，逻辑上为
+ *                           各组A_e[M_e,K]依次拼接。
+ * @param scaleABase         激活对应的E4M3 block scale基址。
+ * @param dBase              按expert连续写入的BF16输出基址，逻辑上为各组
+ *                           D_e[M_e,N]依次拼接。
+ * @param b                  各expert的CUTLASS NVFP4权重指针数组，长度为groups，
+ *                           每组权重逻辑形状为[N,K]。
+ * @param scaleB             各expert的E4M3权重scale指针数组，长度为groups。
+ * @param alpha              各expert的FP32全局scale指针数组，长度为groups。
+ * @param expertOffsets      GPU端路由行前缀和，长度为groups+1；第e组行数为
+ *                           expertOffsets[e+1]-expertOffsets[e]。
+ * @param blockscaleOffsets  GPU端激活scale行前缀和，长度为groups+1；各组按
+ *                           CUTLASS要求独立对齐。
+ * @param groups             grouped GEMM的问题数量，即routed expert数量，范围
+ *                           为1到256。
+ * @param n                  每组GEMM的N维，即输出特征数，必须为32的倍数。
+ * @param k                  每组GEMM的K维，即输入特征数，必须为32的倍数。
+ * @param outputType         输出数据类型，当前只接受BFLOAT16。
+ * @param streamPtr          可选CUDA stream；为空时使用默认stream。
+ * @return 参数合法、SM120 CUTLASS后端已编译且metadata准备和GEMM启动均
+ *         成功时返回true；否则返回false。
+ */
 bool FastllmCudaNvfp4GroupedGemmSm120DeviceRoutes(
         const uint8_t *aBase, const uint8_t *scaleABase, void *dBase,
         const uint8_t *const *b, const uint8_t *const *scaleB,
