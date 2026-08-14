@@ -13,6 +13,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -3382,10 +3383,10 @@ namespace {
             : FastllmCudaBFloat16MatMulFP8E4M3(state->input, state->weight, state->bias,
                                                 reference, state->batch, state->in, state->out);
         if (!ok) throw std::runtime_error("standard FP8 reference failed");
-        ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
-            state->input, state->weight, state->bias, actual,
-            state->batch, state->in, state->out);
-        if (!ok) throw std::runtime_error("SM120 standard FP8 CUTLASS path failed");
+        // 正确性case走正式Linear入口；严格模式保证该标准FP8权重必须由
+        // SM120 W8A8 CUTLASS完成，避免测试绕过生产后端选择和缓存流程。
+        fastllm::Linear(
+            state->input, state->weight, state->bias, actual);
         ForceDeviceSync();
         fastllm::Data reference32 = ConvertToFloat32Data(reference);
         fastllm::Data actual32 = ConvertToFloat32Data(actual);
@@ -3395,6 +3396,203 @@ namespace {
         ComparisonStats stats = CompareData(reference32, actual32, 0.5f, 0.1f);
         if (!stats.passed)
             throw std::runtime_error("SM120 standard FP8 W8A8 output mismatch");
+    }
+
+    static void CheckLinearFp8StandardSm120LifecycleCuda(
+            const OpTestParams &params) {
+        auto restoreEnv = [](const char *name, const std::string &value,
+                             bool existed) {
+            if (existed) setenv(name, value.c_str(), 1);
+            else unsetenv(name);
+        };
+        const char *enabledValue = std::getenv("FASTLLM_CUDA_W8A8");
+        const char *strictValue = std::getenv("FASTLLM_CUDA_W8A8_STRICT");
+        const bool enabledExisted = enabledValue != nullptr;
+        const bool strictExisted = strictValue != nullptr;
+        const std::string oldEnabled = enabledValue == nullptr ? "" : enabledValue;
+        const std::string oldStrict = strictValue == nullptr ? "" : strictValue;
+
+        try {
+            setenv("FASTLLM_CUDA_W8A8", "1", 1);
+            setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+            auto fixed = std::make_shared<LinearFp8Block128BenchState>();
+            fixed->Init(params);
+            bool ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
+                fixed->input, fixed->weight, fixed->bias, fixed->output,
+                fixed->batch, fixed->in, fixed->out);
+            if (!ok) throw std::runtime_error("W8A8 first backend selection failed");
+
+            // 后端固定为CUTLASS后，运行期开关变化不能令同一权重静默改走
+            // Legacy；第二次调用仍必须由已经固定的CUTLASS完成。
+            setenv("FASTLLM_CUDA_W8A8", "0", 1);
+            ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
+                fixed->input, fixed->weight, fixed->bias, fixed->output,
+                fixed->batch, fixed->in, fixed->out);
+            if (!ok) throw std::runtime_error("fixed W8A8 backend was not retained");
+
+            // 新权重在开关关闭时只能固定为Rejected。关闭strict以便直接
+            // 观察false返回；后续主流程会据此选择既有Legacy后端。
+            unsetenv("FASTLLM_CUDA_W8A8_STRICT");
+            auto rejected = std::make_shared<LinearFp8Block128BenchState>();
+            rejected->Init(params);
+            ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
+                rejected->input, rejected->weight, rejected->bias,
+                rejected->output, rejected->batch, rejected->in, rejected->out);
+            if (ok) throw std::runtime_error("disabled W8A8 backend was not rejected");
+        } catch (...) {
+            restoreEnv("FASTLLM_CUDA_W8A8", oldEnabled, enabledExisted);
+            restoreEnv("FASTLLM_CUDA_W8A8_STRICT", oldStrict, strictExisted);
+            throw;
+        }
+        restoreEnv("FASTLLM_CUDA_W8A8", oldEnabled, enabledExisted);
+        restoreEnv("FASTLLM_CUDA_W8A8_STRICT", oldStrict, strictExisted);
+        std::cout << "SM120 W8A8 fixed backend lifecycle: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8FirstFailureRejectedCuda(
+            const OpTestParams &params) {
+        const char *enabledValue = std::getenv("FASTLLM_CUDA_W8A8");
+        const char *strictValue = std::getenv("FASTLLM_CUDA_W8A8_STRICT");
+        const char *failureValue = std::getenv(
+            "FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+        const std::optional<std::string> oldEnabled = enabledValue == nullptr
+            ? std::nullopt : std::optional<std::string>(enabledValue);
+        const std::optional<std::string> oldStrict = strictValue == nullptr
+            ? std::nullopt : std::optional<std::string>(strictValue);
+        const std::optional<std::string> oldFailure = failureValue == nullptr
+            ? std::nullopt : std::optional<std::string>(failureValue);
+        auto restore = [](const char *name,
+                          const std::optional<std::string> &value) {
+            if (value.has_value()) setenv(name, value->c_str(), 1);
+            else unsetenv(name);
+        };
+
+        try {
+            setenv("FASTLLM_CUDA_W8A8", "1", 1);
+            unsetenv("FASTLLM_CUDA_W8A8_STRICT");
+            setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+            LinearFp8Block128BenchState state;
+            state.Init(params);
+            bool ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out);
+            if (ok || FastllmCudaGetFp8W8A8BackendState(
+                    state.weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaFp8W8A8BackendState::Rejected) {
+                throw std::runtime_error(
+                    "first W8A8 GEMM failure did not fix the backend to Rejected");
+            }
+
+            // 清除故障后同一权重仍必须保持Rejected，不能重新探测CUTLASS。
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out);
+            if (ok) {
+                throw std::runtime_error(
+                    "Rejected W8A8 weight unexpectedly retried CUTLASS");
+            }
+        } catch (...) {
+            restore("FASTLLM_CUDA_W8A8", oldEnabled);
+            restore("FASTLLM_CUDA_W8A8_STRICT", oldStrict);
+            restore("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", oldFailure);
+            throw;
+        }
+        restore("FASTLLM_CUDA_W8A8", oldEnabled);
+        restore("FASTLLM_CUDA_W8A8_STRICT", oldStrict);
+        restore("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", oldFailure);
+        std::cout << "SM120 W8A8 first GEMM failure -> Rejected: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8FixedFailureThrowsCuda(
+            const OpTestParams &params) {
+        const char *failureValue = std::getenv(
+            "FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+        const std::optional<std::string> oldFailure = failureValue == nullptr
+            ? std::nullopt : std::optional<std::string>(failureValue);
+        auto restoreFailure = [&]() {
+            if (oldFailure.has_value()) {
+                setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE",
+                       oldFailure->c_str(), 1);
+            } else {
+                unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            }
+        };
+
+        try {
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            LinearFp8Block128BenchState state;
+            state.Init(params);
+            bool ok = FastllmCudaCutlassLinearFp8W8A8Sm120(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out);
+            if (!ok || FastllmCudaGetFp8W8A8BackendState(
+                    state.weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaFp8W8A8BackendState::Cutlass) {
+                throw std::runtime_error("W8A8 backend was not fixed to CUTLASS");
+            }
+
+            setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+            bool threw = false;
+            try {
+                FastllmCudaCutlassLinearFp8W8A8Sm120(
+                    state.input, state.weight, state.bias, state.output,
+                    state.batch, state.in, state.out);
+            } catch (const std::runtime_error &) {
+                threw = true;
+            }
+            if (!threw || FastllmCudaGetFp8W8A8BackendState(
+                    state.weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaFp8W8A8BackendState::Cutlass) {
+                throw std::runtime_error(
+                    "fixed W8A8 failure did not throw or changed backend");
+            }
+
+            // 故障消失后仍使用原来固定的CUTLASS，不允许中途切到Legacy。
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            if (!FastllmCudaCutlassLinearFp8W8A8Sm120(
+                    state.input, state.weight, state.bias, state.output,
+                    state.batch, state.in, state.out)) {
+                throw std::runtime_error(
+                    "fixed W8A8 backend did not recover after injected failure");
+            }
+        } catch (...) {
+            restoreFailure();
+            throw;
+        }
+        restoreFailure();
+        std::cout << "SM120 W8A8 fixed CUTLASS failure forbids fallback: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8DestructorClearsStateCuda(
+            const OpTestParams &params) {
+        std::optional<LinearFp8Block128BenchState> holder;
+        holder.emplace();
+        holder->Init(params);
+        if (!FastllmCudaCutlassLinearFp8W8A8Sm120(
+                holder->input, holder->weight, holder->bias, holder->output,
+                holder->batch, holder->in, holder->out)) {
+            throw std::runtime_error("W8A8 destructor test selection failed");
+        }
+        const fastllm::Data *oldAddress = &holder->weight;
+        if (FastllmCudaGetFp8W8A8BackendState(
+                holder->weight, FastllmCudaGetDevice()) !=
+                FastllmCudaFp8W8A8BackendState::Cutlass) {
+            throw std::runtime_error("W8A8 destructor test did not reach CUTLASS");
+        }
+
+        // optional在同一内嵌存储上析构并重建对象。新Data地址相同，若析构
+        // 未清状态，它会错误继承旧权重的Cutlass记录。
+        holder.reset();
+        holder.emplace();
+        if (&holder->weight != oldAddress ||
+            FastllmCudaGetFp8W8A8BackendState(
+                holder->weight, FastllmCudaGetDevice()) !=
+                FastllmCudaFp8W8A8BackendState::Uninitialized) {
+            throw std::runtime_error(
+                "destroyed W8A8 weight left a stale backend state");
+        }
+        std::cout << "SM120 W8A8 Data destructor clears backend state: PASS\n";
     }
 
     static void CheckLinearFp8PerChannelCuda(const OpTestParams &params) {
@@ -3776,6 +3974,18 @@ namespace {
         } else if (params.GetInt("check") == 7) {
             CheckLinearFp8StandardSm120Cuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 8) {
+            CheckLinearFp8StandardSm120LifecycleCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 9) {
+            CheckLinearFp8W8A8FirstFailureRejectedCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 10) {
+            CheckLinearFp8W8A8FixedFailureThrowsCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 11) {
+            CheckLinearFp8W8A8DestructorClearsStateCuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -3852,7 +4062,9 @@ namespace {
                 params.Add("check", "0",
                            "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
                            "4 raw batch-one, 5 Marlin/CUTLASS layout safety, "
-                           "6 per-channel CUTLASS scaled-mm, 7 SM120 standard FP8");
+                           "6 per-channel CUTLASS scaled-mm, 7 SM120 standard FP8, "
+                           "8 SM120 fixed backend lifecycle, 9 first failure rejection, "
+                           "10 fixed backend failure, 11 destructor state cleanup");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },
