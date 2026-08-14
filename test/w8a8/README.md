@@ -1,6 +1,12 @@
 # CUDA W8A8 验证
 
-结论：测试只在对应 GPU 机器运行；脚本不负责编译。每条命令、UTC 时间和完整输出都写入 `test/w8a8/logs/<timestamp>/`。
+结论：测试只在对应GPU机器运行。`build`负责编译安装；其他suite把每条
+命令、UTC时间和完整输出写入`test/w8a8/logs/<timestamp>/`。
+
+SM120标准FP8 W8A8采用固定后端生命周期：每份权重在每张GPU上只进行
+一次真实CUTLASS GEMM选择。首次同步验证成功后固定为CUTLASS；失败则固定
+交给Legacy，正式推理期间不再混切。FP8权重本身已经是CUTLASS可消费格式，
+不会复制第二份权重；设备scale/bias及量化、累加、workspace临时区会缓存复用。
 
 ## 严格调用条件
 
@@ -13,33 +19,50 @@
 
 ## 命令
 
-算子功能：
+编译安装：
 
 ```bash
-W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-function" \
+W8A8_NVCC=/usr/local/cuda-13.0/bin/nvcc \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-build" \
+  test/w8a8/run_w8a8_tests.sh build
+```
+
+算子功能（FastLLM分支、固定后端生命周期及vLLM官方形状/scale组合）：
+
+```bash
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-function" \
   test/w8a8/run_w8a8_tests.sh ops-functional
 ```
 
-算子性能：
+其中SM120生命周期包含三条故障示例：首次GEMM故障后固定为`Rejected`且
+不再重试；已固定为`Cutlass`后的运行故障必须抛错而不能fallback；权重
+`Data`析构后必须删除以其地址为键的后端状态，防止新对象继承陈旧记录。
+故障通过测试专用环境变量注入，但调用的仍是正式W8A8 CUTLASS入口和状态机。
+
+算子性能（直接生成FastLLM/vLLM Markdown、CSV和JSON对比）：
 
 ```bash
-W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-perf" \
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-perf" \
   test/w8a8/run_w8a8_tests.sh ops-performance
 ```
 
 forward_check：
 
 ```bash
-W8A8_MODEL=/models/Qwen2.5-0.5B-Instruct-quantized.w8a8 \
-W8A8_LOG_DIR="$PWD/test/w8a8/logs/int8-forward" \
+W8A8_MODEL=/root/autodl-tmp/neuralmagic/Qwen2___5-7B-FP8-dynamic \
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-forward" \
   test/w8a8/run_w8a8_tests.sh forward
 ```
 
-整体 prefill/decode：
+整体模型性能（相同HTTP接口、相同Token ID，生成FastLLM/vLLM对比表）：
 
 ```bash
-W8A8_MODEL=/models/Qwen3-30B-A3B-FP8 \
-W8A8_LOG_DIR="$PWD/test/w8a8/logs/fp8-e2e" \
+W8A8_MODEL=/root/autodl-tmp/neuralmagic/Qwen2___5-7B-FP8-dynamic \
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-model" \
   test/w8a8/run_w8a8_tests.sh model-performance
 ```
 

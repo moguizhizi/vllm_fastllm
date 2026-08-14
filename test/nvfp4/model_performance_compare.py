@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--startup-timeout", type=int, default=1200)
     parser.add_argument("--request-timeout", type=int, default=3600)
+    parser.add_argument("--quantization", choices=("nvfp4", "w8a8"),
+                        default="nvfp4", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -380,7 +382,7 @@ def run_server(command, env, server_log, backend, base_url, prompts, args, mode)
         log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
         for name in sorted(name for name in env if name.startswith(
                 ("FASTLLM_CUDA_NVFP4", "FASTLLM_CUDA_GRAPH",
-                 "VLLM_USE_FLASHINFER"))):
+                 "FASTLLM_CUDA_W8A8", "VLLM_USE_FLASHINFER"))):
             log_handle.write(f"ENV: {name}={env[name]}\n")
         log_handle.write("\n")
         log_handle.flush()
@@ -408,10 +410,18 @@ def run_fastllm(args, prompts, result_dir, mode):
     env = os.environ.copy()
     env.pop("FASTLLM_CUDA_NVFP4_TRACE", None)
     env.pop("FASTLLM_CUDA_GRAPH_TRACE", None)
-    env["FASTLLM_CUDA_NVFP4_W4A4"] = "1"
-    env["FASTLLM_CUDA_NVFP4_W4A4_STRICT"] = "1"
-    env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
-    env["FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT"] = "1"
+    if args.quantization == "nvfp4":
+        env["FASTLLM_CUDA_NVFP4_W4A4"] = "1"
+        env["FASTLLM_CUDA_NVFP4_W4A4_STRICT"] = "1"
+        env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
+        env["FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT"] = "1"
+    else:
+        env.pop("FASTLLM_CUDA_NVFP4_W4A4", None)
+        env.pop("FASTLLM_CUDA_NVFP4_W4A4_STRICT", None)
+        env.pop("FASTLLM_CUDA_MOE_NVFP4_W4A4", None)
+        env.pop("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT", None)
+        env["FASTLLM_CUDA_W8A8"] = "1"
+        env["FASTLLM_CUDA_W8A8_STRICT"] = "1"
     env["FASTLLM_CUDA_GRAPH"] = "0" if mode == "eager" else "1"
     return run_server(
         command, env, result_dir / f"fastllm-{mode}-server.log", "FastLLM",
@@ -479,9 +489,9 @@ def ordered_results(fastllm_results, vllm_results, mode, scenario):
     return rows
 
 
-def make_report(result_dir, fastllm_results, vllm_results):
+def make_report(result_dir, fastllm_results, vllm_results, quantization):
     lines = [
-        "# NVFP4严格整体性能对比", "",
+        f"# {quantization.upper()}严格整体性能对比", "",
         "> 两个后端通过HTTP `/v1/completions`接收同一组Token ID；忽略EOS；",
         "> 每个Case测试5轮并取中位数。Cold与Cache Hit分别统计。", "",
     ]
@@ -573,7 +583,8 @@ def orchestrate(args):
         vllm_results = run_vllm(args, prompts, result_dir, mode)
         write_json(result_dir / f"vllm-{mode}-results.json", vllm_results)
         all_vllm_results.extend(vllm_results)
-    make_report(result_dir, all_fastllm_results, all_vllm_results)
+    make_report(result_dir, all_fastllm_results, all_vllm_results,
+                args.quantization)
 
 
 def main():

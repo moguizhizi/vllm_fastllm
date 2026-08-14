@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--flm-device", default="cuda")
     parser.add_argument("--min-topk-overlap", type=float, default=0.8)
     parser.add_argument("--max-first-logprob-diff", type=float, default=0.1)
+    parser.add_argument("--label", default="NVFP4", help=argparse.SUPPRESS)
     parser.add_argument("--result-dir", default="")
     parser.add_argument(
         "--vllm-python", default=os.environ.get("NVFP4_VLLM_PYTHON", sys.executable))
@@ -190,7 +191,7 @@ def compare_results(args, vllm_result, fastllm_result):
             first_token_logprob_diff = abs(
                 v_probs[first_token] - f_probs[first_token])
 
-    print("\n== NVFP4 vLLM forward check ==")
+    print(f"\n== {args.label} vLLM forward check ==")
     print(f"prompt_token_ids_match: {same_prompt}")
     print(f"generated_token_ids_match: {same_tokens}")
     print(f"vllm_token_ids: {vllm_result['generated_token_ids']}")
@@ -223,6 +224,7 @@ def child_command(args, stage, output, python):
         "--flm-dtype", args.flm_dtype,
         "--flm-atype", args.flm_atype,
         "--flm-device", args.flm_device,
+        "--label", args.label,
     ]
 
 

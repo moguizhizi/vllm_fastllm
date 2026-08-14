@@ -5,6 +5,8 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 log_dir=${W8A8_LOG_DIR:-"${repo_dir}/test/w8a8/logs/$(date -u +%Y%m%dT%H%M%SZ)"}
 optest=${W8A8_OPTEST:-"${repo_dir}/optest"}
 model=${W8A8_MODEL:-}
+vllm_python=${W8A8_VLLM_PYTHON:-python}
+nvcc=${W8A8_NVCC:-/usr/local/cuda/bin/nvcc}
 suite=${1:-ops}
 mkdir -p "${log_dir}"
 
@@ -27,6 +29,22 @@ detect_arch() {
     cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed -n '1p')
     major=${cc%%.*}; minor=${cc#*.}
     printf '%d\n' "$((10#${major} * 10 + 10#${minor}))"
+}
+
+run_build() {
+    run_logged build bash install.sh -DUSE_CUDA=ON \
+        -DCMAKE_CUDA_COMPILER="${nvcc}" -DCUDA_ARCH=120 \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+}
+
+run_sm120_standard_check() {
+    local name=$1 m=$2 n=$3 k=$4 dtype=$5 bias=$6
+    run_logged "${name}_${dtype}_bias${bias}" env \
+        FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+        "${optest}" --op linear_fp8_block128 --device cuda:0 \
+        --param batch="${m}" --param in="${k}" --param out="${n}" \
+        --param weight_layout=perchannel --param input_type="${dtype}" \
+        --param has_bias="${bias}" --param check=7 --warmup 0 --iters 1
 }
 
 run_ops_functional() {
@@ -56,17 +74,79 @@ run_ops_functional() {
             --param scale_layout=perchannel \
             --param path=check_fp8 --warmup 0 --iters 1
     elif [[ "${arch}" == 120 ]]; then
-        run_logged sm120_fp8_standard_function \
+        # 16/32/256是SM120 CUTLASS tile选择的三个边界；两侧值用于确认
+        # 每个条件分支都被执行。check=7才是标准per-channel W8A8检查。
+        for m in 1 16 17 32 33 256 257; do
+            run_sm120_standard_check "sm120_branch_m${m}" \
+                "${m}" 4096 4096 bf16 1
+        done
+        # 输入类型和bias语义分支。
+        for dtype in fp16 bf16; do
+            for bias in 0 1; do
+                run_sm120_standard_check sm120_semantics \
+                    17 4096 4096 "${dtype}" "${bias}"
+            done
+        done
+        run_logged sm120_fixed_backend_lifecycle env \
+            FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
             "${optest}" --op linear_fp8_block128 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param weight_layout=perchannel --param input_type=bf16 \
-            --param check=4 --warmup 0 --iters 1
+            --param has_bias=1 --param check=8 --warmup 0 --iters 1
+        # 后端生命周期故障测试使用正式CUTLASS入口，只通过测试开关注入
+        # GEMM失败；不绕过正式状态机、缓存或同步边界。
+        run_logged sm120_first_gemm_failure_rejected env \
+            FASTLLM_CUDA_W8A8=1 \
+            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            --param batch=17 --param in=4096 --param out=4096 \
+            --param weight_layout=perchannel --param input_type=bf16 \
+            --param has_bias=1 --param check=9 --warmup 0 --iters 1
+        run_logged sm120_fixed_cutlass_failure_no_fallback env \
+            FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            --param batch=17 --param in=4096 --param out=4096 \
+            --param weight_layout=perchannel --param input_type=bf16 \
+            --param has_bias=1 --param check=10 --warmup 0 --iters 1
+        run_logged sm120_destructor_clears_backend_state env \
+            FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            --param batch=17 --param in=4096 --param out=4096 \
+            --param weight_layout=perchannel --param input_type=bf16 \
+            --param has_bias=1 --param check=11 --warmup 0 --iters 1
+        # vLLM test_cutlass_scaled_mm.py中的全部对齐MNK形状。FastLLM只
+        # 比较双方共同支持的per-token A scale和per-channel B scale语义。
+        while read -r m n k; do
+            run_sm120_standard_check "sm120_vllm_m${m}_n${n}_k${k}" \
+                "${m}" "${n}" "${k}" bf16 0
+        done <<'EOF'
+1 256 128
+1 16384 1024
+1 24576 496
+16 256 496
+16 16384 128
+16 24576 4096
+32 8192 4096
+32 16384 4096
+33 1024 1024
+33 8192 128
+64 2048 496
+64 16384 1024
+100 8192 496
+128 32768 4096
+256 4096 4096
+512 256 1024
+512 8192 4096
+512 16384 128
+512 24576 128
+EOF
         run_logged sm120_fp8_blockwise_fallback_guard env \
             FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
             "${optest}" --op linear_fp8_block128 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param block=128 --param weight_layout=separate \
             --param input_type=bf16 --param check=1 --warmup 0 --iters 1
+        run_logged sm120_vllm_official_functional \
+            "${vllm_python}" test/w8a8/operator_functional_vllm.py
     else
         echo "unsupported test GPU: SM${arch}; expected SM90 or SM120" >&2
         exit 2
@@ -112,20 +192,10 @@ run_ops_performance() {
             --param scale_layout=perchannel \
             --param path=operator --warmup 20 --iters 200
     elif [[ "${arch}" == 120 ]]; then
-        for batch in 1 16 64 256 1024; do
-            run_logged "sm120_fp8_standard_m${batch}_perf" \
-                "${optest}" --op linear_fp8_block128 --device cuda:0 \
-                --param batch="${batch}" --param in=4096 --param out=4096 \
-                --param weight_layout=perchannel --param input_type=bf16 \
-                --warmup 20 --iters 200
-            run_logged "sm120_fp8_blockwise_m${batch}_perf" env \
-                FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
-                FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH=1 \
-                "${optest}" --op linear_fp8_block128 --device cuda:0 \
-                --param batch="${batch}" --param in=4096 --param out=4096 \
-                --param block=128 --param weight_layout=separate \
-                --param input_type=bf16 --warmup 20 --iters 200
-        done
+        run_logged sm120_w8a8_operator_compare \
+            "${vllm_python}" test/w8a8/operator_performance_compare.py \
+            --optest "${optest}" --output-dir "${log_dir}/operator-compare" \
+            --warmup 20 --iters 200 --outer-repeats 3
     fi
 }
 
@@ -135,34 +205,40 @@ require_model() {
 
 run_forward() {
     require_model
-    run_logged forward_check env FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
-        FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
-        python test/basic/forward_check.py --model "${model}" --tokens 8 \
-        --hf_device cuda --flm_dtype auto --flm_atype bfloat16 --flm_device cuda
+    run_logged forward_check env FASTLLM_CUDA_W8A8=1 \
+        FASTLLM_CUDA_W8A8_STRICT=1 W8A8_VLLM_PYTHON="${vllm_python}" \
+        "${vllm_python}" test/w8a8/forward_check_vllm.py \
+        --model "${model}" --tokens 8 --top-logprobs 10 \
+        --vllm-python "${vllm_python}" \
+        --max-model-len 512 --gpu-memory-utilization 0.90 \
+        --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+        --result-dir "${log_dir}/forward-results"
 }
 
 run_model_performance() {
     require_model
-    run_logged model_prefill env FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
-        FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
-        python test/benchmark/prefill.py "${model}" --dtype auto \
-        --atype bfloat16 --device cuda --moe_device cuda \
-        --prompt-repeat 256 --max-tokens 16
-    run_logged model_decode env FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
-        FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
-        python test/benchmark/decode.py "${model}" --dtype auto \
-        --atype bfloat16 --device cuda --moe_device cuda \
-        --batch-size 32 --max_batch 32 --prefill-length 512 --max-tokens 64
+    run_logged model_performance_compare env FASTLLM_CUDA_W8A8=1 \
+        FASTLLM_CUDA_W8A8_STRICT=1 \
+        "${vllm_python}" test/w8a8/model_performance_compare.py \
+        --model "${model}" --result-dir "${log_dir}/model-compare" \
+        --vllm-python "${vllm_python}" --fastllm-python "${vllm_python}" \
+        --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+        --prefill-input-tokens 4096 --prefill-max-tokens 16 \
+        --decode-input-tokens 512 --decode-batch-sizes 1,2,4,8,16,32 \
+        --decode-max-tokens 64 --warmup 1 --repeats 5 \
+        --max-model-len 8192 --gpu-memory-utilization 0.90
 }
 
 case "${suite}" in
+    build) run_build ;;
     ops-functional) run_ops_functional ;;
     ops-performance) run_ops_performance ;;
+    ops-compare) run_ops_performance ;;
     ops) run_ops_functional; run_ops_performance ;;
     forward) run_forward ;;
     model-performance) run_model_performance ;;
     all) run_ops_functional; run_ops_performance; run_forward; run_model_performance ;;
-    *) echo "usage: $0 {ops-functional|ops-performance|ops|forward|model-performance|all}" >&2; exit 2 ;;
+    *) echo "usage: $0 {build|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2; exit 2 ;;
 esac
 
 printf 'Logs: %s\n' "${log_dir}"
