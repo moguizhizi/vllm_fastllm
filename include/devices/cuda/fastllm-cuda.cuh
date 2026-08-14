@@ -1511,6 +1511,16 @@ bool FastllmCudaCutlassLinearFP8E4M3PerChannel(const fastllm::Data &input, fastl
 bool FastllmCudaCutlassLinearFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearInt8W8A8Sm90(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFp8W8A8Sm120(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+enum class FastllmCudaFp8W8A8BackendState : uint8_t {
+    Uninitialized,
+    Prepared,
+    Cutlass,
+    Rejected,
+};
+bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight);
+FastllmCudaFp8W8A8BackendState FastllmCudaGetFp8W8A8BackendState(
+    const fastllm::Data &weight, int device);
+void FastllmCudaReleaseFp8W8A8BackendState(const fastllm::Data *weight);
 bool FastllmCudaCutlassLinearFP8E4M3Block128Add(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNorm(const fastllm::Data &input, fastllm::Data &normWeight, float eps, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNormMaterialize(

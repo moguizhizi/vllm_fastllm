@@ -943,6 +943,7 @@ namespace fastllm {
     void Data::FakeFrom(const Data &ori, size_t offset) {
 #ifdef USE_CUDA
         FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
@@ -968,6 +969,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (this != &ori) {
             FastllmCudaReleaseNvfp4W4A4Cache(this);
+            FastllmCudaReleaseFp8W8A8BackendState(this);
             FastllmCudaReleaseNvfp4MarlinCache(this);
         }
         if (this != &ori && !this->w4a8CudaCaches.empty()) {
@@ -2079,6 +2081,7 @@ namespace fastllm {
     void Data::FreeSpace() {
 #ifdef USE_CUDA
         FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
@@ -2329,6 +2332,7 @@ namespace fastllm {
     Data::~Data() {
 #ifdef USE_CUDA
         FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
@@ -2734,6 +2738,7 @@ namespace fastllm {
                 // host/mmap源直接上传到目标GPU；首次Linear会在目标GPU完成
                 // warmup、重排并重新释放这份临时原始权重。
                 FastllmCudaReleaseNvfp4W4A4Cache(this);
+                FastllmCudaReleaseFp8W8A8BackendState(this);
                 FastllmCudaReleaseNvfp4MarlinCache(this);
                 if (!this->RestoreCudaDataForRepackedWeight(destDevice)) {
                     ErrorInFastLLM(
@@ -2757,6 +2762,7 @@ namespace fastllm {
                 "after releasing its repacked CUDA source.\n");
         }
         FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
@@ -2898,6 +2904,14 @@ namespace fastllm {
             // 因此显存峰值只包含当前权重的双份表示，而不是整模型的
             // 原始权重与全部CUTLASS权重同时驻留。
             FastllmCudaTryPrepackNvfp4W4A4Weight(*this);
+        }
+        if (device == DataDevice::CUDA && copyData &&
+            this->dataType == DataType::FP8_E4M3 &&
+            this->weightType == WeightType::LINEAR &&
+            this->cudaData != nullptr) {
+            // 标准FP8已经是CUTLASS权重格式，不创建第二份权重；上传阶段
+            // 只记录Prepared，首次真实GEMM验证后再固定最终后端。
+            FastllmCudaTryPrepareFp8W8A8Weight(*this);
         }
 #endif
     }
