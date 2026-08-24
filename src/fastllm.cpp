@@ -950,6 +950,7 @@ namespace fastllm {
         }
 #endif
         this->dataType = ori.dataType;
+        this->linearQuantScheme = ori.linearQuantScheme;
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
@@ -978,6 +979,7 @@ namespace fastllm {
 #endif
         this->ToDevice(ori.dataDevice);
         this->name = ori.name;
+        this->linearQuantScheme = ori.linearQuantScheme;
         this->isKVCache = ori.isKVCache;
         this->isLinearAttention = ori.isLinearAttention;
         this->isLinearAttentionTransposed = ori.isLinearAttentionTransposed;
@@ -2728,6 +2730,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
             this->dataType == DataType::NVFP4_BLOCK_16 &&
+            (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
             device == DataDevice::CUDA && copyData) {
             const int sourceDevice = this->dataDeviceIds.empty()
                 ? FastllmCudaGetDevice() : this->dataDeviceIds[0];
@@ -2756,6 +2760,8 @@ namespace fastllm {
         }
         if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
             this->dataType == DataType::NVFP4_BLOCK_16 &&
+            (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
             !this->RestoreCudaDataForRepackedWeight()) {
             ErrorInFastLLM(
                 "ToDevice Error: cannot restore the original NVFP4 weight "
@@ -2899,6 +2905,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (device == DataDevice::CUDA && copyData &&
             this->dataType == DataType::NVFP4_BLOCK_16 &&
+            (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
             this->cudaData != nullptr) {
             // NVFP4权重逐个上传、逐个重排、逐个释放原始CUDA表示。
             // 因此显存峰值只包含当前权重的双份表示，而不是整模型的
@@ -2907,6 +2915,8 @@ namespace fastllm {
         }
         if (device == DataDevice::CUDA && copyData &&
             this->dataType == DataType::FP8_E4M3 &&
+            (this->linearQuantScheme == LinearQuantScheme::FP8_W8A8 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
             this->weightType == WeightType::LINEAR &&
             this->cudaData != nullptr) {
             // 标准FP8已经是CUTLASS权重格式，不创建第二份权重；上传阶段

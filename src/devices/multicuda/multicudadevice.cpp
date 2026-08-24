@@ -1583,6 +1583,8 @@ namespace fastllm {
             local->dataDevice = DataDevice::CUDA;
             local->dataDeviceIds = {device};
             local->name = data.name;
+            local->weightType = data.weightType;
+            local->linearQuantScheme = data.linearQuantScheme;
             local->tpLinearType = data.tpLinearType;
             local->tpPackType = data.tpPackType;
             local->tpQHeads = data.tpQHeads;

@@ -340,6 +340,23 @@ namespace fastllm {
         DATA_AUTO_SOURCE // auto keeps scaled FP8 source weights, otherwise uses FLOAT16
     };
 
+    /**
+     * 描述Linear权重在模型配置中声明的量化计算方案。
+     *
+     * 该枚举只回答“本层采用哪种权重/激活量化语义”，不指定CUTLASS、
+     * Triton或Legacy等硬件后端。HF compressed-tensors模型在加载阶段根据
+     * quantization_config为每个Linear固定方案；LEGACY_AUTO仅用于没有可用
+     * 配置元数据的旧模型和手工构造权重，保留原有运行时兼容探测。
+     */
+    enum class LinearQuantScheme {
+        NONE = 0,
+        LEGACY_AUTO,
+        FP8_W8A8,
+        INT8_W8A8,
+        INT4_W4A8,
+        NVFP4_W4A4,
+    };
+
     enum class W4A8WeightEncoding {
         NONE = 0,
         COMPRESSED_TENSORS_UINT4B8 = 1
@@ -494,6 +511,8 @@ namespace fastllm {
 
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
+        // 模型配置确定的Linear量化语义；硬件后端生命周期由CUDA侧独立管理。
+        LinearQuantScheme linearQuantScheme = LinearQuantScheme::LEGACY_AUTO;
 
         DataType dataType = DataType::FLOAT32; // 数据类型
         int unitSize, unitSizeDiv = 1; // 单个元素的字节数 = unitSIze / unitSizeDiv

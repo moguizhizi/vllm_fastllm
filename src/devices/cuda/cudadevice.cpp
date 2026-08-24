@@ -5005,25 +5005,36 @@ namespace fastllm {
         if (!IsCudaLinearDataTypeSupported(input.dataType, weight.dataType, bias.dataType)) {
             ErrorInFastLLM("Linear error: unsupported dataType combination." + dataTypeInfo);
         }
-        if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) {
-            return;
-        }
-        if (FastllmCudaCutlassLinearInt8W8A8Sm90(input, weight, bias, output, n, m, k) ||
-            FastllmCudaCutlassLinearFp8W8A8Sm120(input, weight, bias, output, n, m, k)) {
-            return;
+        // HF compressed-tensors模型在加载阶段已经为每个Linear固定量化
+        // 方案。正式推理只进入对应量化族；LEGACY_AUTO仅为旧模型保留原有
+        // 探测顺序，避免W4A8、W8A8和W4A4在每个token上互相试探。
+        const LinearQuantScheme quantScheme = weight.linearQuantScheme;
+        if (quantScheme == LinearQuantScheme::INT4_W4A8) {
+            if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) return;
+        } else if (quantScheme == LinearQuantScheme::INT8_W8A8) {
+            if (FastllmCudaCutlassLinearInt8W8A8Sm90(
+                    input, weight, bias, output, n, m, k)) return;
+        } else if (quantScheme == LinearQuantScheme::FP8_W8A8) {
+            if (FastllmCudaCutlassLinearFp8W8A8Sm120(
+                    input, weight, bias, output, n, m, k)) return;
+        } else if (quantScheme == LinearQuantScheme::NVFP4_W4A4) {
+            if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m) ||
+                FastllmCudaTryMarlinHalfMatMulNVFP4(
+                    input, weight, bias, output, n, m, k)) return;
+        } else if (quantScheme == LinearQuantScheme::LEGACY_AUTO) {
+            if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) return;
+            if (FastllmCudaCutlassLinearInt8W8A8Sm90(
+                    input, weight, bias, output, n, m, k) ||
+                FastllmCudaCutlassLinearFp8W8A8Sm120(
+                    input, weight, bias, output, n, m, k)) return;
+            if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m) ||
+                FastllmCudaTryMarlinHalfMatMulNVFP4(
+                    input, weight, bias, output, n, m, k)) return;
         }
         if (weight.dataType == DataType::INT8_W8A8) {
             ErrorInFastLLM(
                 "Linear error: symmetric INT8 W8A8 requires an SM90 CUTLASS build, "
                 "signed I8 [N,K] weights, FP32 per-channel scales, K%16=0 and N%8=0.\n");
-        }
-        // CUTLASS入口使用标准GEMM维度：M=token数，N=输出特征，K=输入特征。
-        if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m)) {
-            return;
-        }
-        if (FastllmCudaTryMarlinHalfMatMulNVFP4(
-                input, weight, bias, output, n, m, k)) {
-            return;
         }
         if (weight.dataType == DataType::INT4_W4A8) {
             int runtimeArch = FastllmCudaRuntimeArch();

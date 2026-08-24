@@ -486,6 +486,7 @@ namespace fastllm {
         view.isModelWeight = source.isModelWeight;
         view.lockInCPU = source.lockInCPU;
         view.weightType = source.weightType;
+        view.linearQuantScheme = source.linearQuantScheme;
 
         if (source.dataType == DataType::DATA_GGUF_FORMAT) {
             const uint64_t sourceBytes = source.GetBytes();

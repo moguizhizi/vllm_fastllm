@@ -669,6 +669,8 @@ static void SetLocalQKVPackMeta(fastllm::Data *local, const fastllm::Data &weigh
 static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data &dst) {
     dst.name = src.name;
     dst.isModelWeight = src.isModelWeight;
+    dst.weightType = src.weightType;
+    dst.linearQuantScheme = src.linearQuantScheme;
     dst.directMemory = src.directMemory;
     dst.group = src.group;
     dst.groupCnt = src.groupCnt;

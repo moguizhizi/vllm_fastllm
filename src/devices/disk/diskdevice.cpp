@@ -435,6 +435,7 @@ namespace fastllm {
         loaded->name = weight->name;
         loaded->isModelWeight = false;
         loaded->weightType = weight->weightType;
+        loaded->linearQuantScheme = weight->linearQuantScheme;
         loaded->tpLinearType = weight->tpLinearType;
         loaded->tpPackType = weight->tpPackType;
         loaded->perChannelAxis = weight->perChannelAxis;

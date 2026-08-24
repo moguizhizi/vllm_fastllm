@@ -2668,6 +2668,7 @@ namespace fastllm {
                 local->name = data.name;
                 local->isModelWeight = data.isModelWeight;
                 local->weightType = data.weightType;
+                local->linearQuantScheme = data.linearQuantScheme;
                 local->dataDevice = DataDevice::CUDA;
                 local->dataDeviceIds = {device};
                 if (local->Count(0) > 0) {
@@ -2742,6 +2743,7 @@ namespace fastllm {
                 local->name = weight.name;
                 local->isModelWeight = weight.isModelWeight;
                 local->weightType = weight.weightType;
+                local->linearQuantScheme = weight.linearQuantScheme;
                 local->dataDevice = DataDevice::CUDA;
                 local->dataDeviceIds = {device};
                 if (local->Count(0) > 0) {
