@@ -2731,6 +2731,7 @@ namespace fastllm {
         if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
             this->dataType == DataType::NVFP4_BLOCK_16 &&
             (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A16 ||
              this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
             device == DataDevice::CUDA && copyData) {
             const int sourceDevice = this->dataDeviceIds.empty()
@@ -2752,15 +2753,18 @@ namespace fastllm {
                 this->dataDeviceIds = deviceIds.empty()
                     ? std::vector<int>({destDevice}) : deviceIds;
                 this->dataDevice = device;
-                // 目标GPU只短暂接收原始格式；立即在目标卡上构建最终
-                // CUTLASS表示并释放临时原始权重，避免经过GPU0中转。
-                FastllmCudaTryPrepackNvfp4W4A4Weight(*this);
+                // W4A4立即构建目标GPU的CUTLASS表示；W4A16保留这份临时
+                // 原始权重，首次Linear由Marlin完成重排并随即释放。
+                if (this->linearQuantScheme != LinearQuantScheme::NVFP4_W4A16) {
+                    FastllmCudaTryPrepackNvfp4W4A4Weight(*this);
+                }
                 return;
             }
         }
         if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
             this->dataType == DataType::NVFP4_BLOCK_16 &&
             (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A16 ||
              this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
             !this->RestoreCudaDataForRepackedWeight()) {
             ErrorInFastLLM(

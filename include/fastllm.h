@@ -355,6 +355,7 @@ namespace fastllm {
         INT8_W8A8,
         INT4_W4A8,
         NVFP4_W4A4,
+        NVFP4_W4A16,
     };
 
     enum class W4A8WeightEncoding {

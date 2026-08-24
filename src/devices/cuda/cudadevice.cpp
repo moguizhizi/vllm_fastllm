@@ -5018,8 +5018,14 @@ namespace fastllm {
             if (FastllmCudaCutlassLinearFp8W8A8Sm120(
                     input, weight, bias, output, n, m, k)) return;
         } else if (quantScheme == LinearQuantScheme::NVFP4_W4A4) {
+            // 与vLLM auto选择一致：原生W4A4 CUTLASS优先；没有原生FP4
+            // 能力的旧GPU允许在首次选择阶段固定为weight-only Marlin。
             if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m) ||
                 FastllmCudaTryMarlinHalfMatMulNVFP4(
+                    input, weight, bias, output, n, m, k)) return;
+        } else if (quantScheme == LinearQuantScheme::NVFP4_W4A16) {
+            // 显式W4A16不量化激活，也不尝试W4A4 CUTLASS。
+            if (FastllmCudaTryMarlinHalfMatMulNVFP4(
                     input, weight, bias, output, n, m, k)) return;
         } else if (quantScheme == LinearQuantScheme::LEGACY_AUTO) {
             if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) return;

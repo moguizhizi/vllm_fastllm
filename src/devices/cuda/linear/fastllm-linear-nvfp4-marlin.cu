@@ -205,7 +205,7 @@ bool FastllmCudaTryMarlinHalfMatMulNVFP4(
     if (state == BackendState::Legacy) return false;
     const bool warmup = state == BackendState::Uninitialized;
     const int arch = RuntimeArch();
-    const bool canRun = arch >= 75 && arch < 100 &&
+    const bool canRun = arch >= 75 &&
         input.dataType == fastllm::DataType::FLOAT16 &&
         output.dataType == fastllm::DataType::FLOAT16 &&
         weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&

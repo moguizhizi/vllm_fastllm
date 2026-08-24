@@ -1664,9 +1664,15 @@ namespace fastllm {
         const std::string inputStrategy = input["strategy"].string_value();
 
         if (weightType == "float" && weightBits == 4 &&
-            inputType == "float" && inputBits == 4 &&
             format.find("nvfp4") != std::string::npos) {
-            return LinearQuantScheme::NVFP4_W4A4;
+            // 与vLLM的compressed-tensors分派保持一致：存在NVFP4激活
+            // 配置表示W4A4；没有input_activations表示weight-only W4A16。
+            if (input.is_null()) {
+                return LinearQuantScheme::NVFP4_W4A16;
+            }
+            if (inputType == "float" && inputBits == 4) {
+                return LinearQuantScheme::NVFP4_W4A4;
+            }
         }
         if (weightType == "float" && weightBits == 8 &&
             inputType == "float" && inputBits == 8 &&
@@ -1764,11 +1770,12 @@ namespace fastllm {
                 break;
             }
             case LinearQuantScheme::NVFP4_W4A4:
+            case LinearQuantScheme::NVFP4_W4A16:
                 if (weight.dataType != DataType::NVFP4 &&
                     weight.dataType != DataType::NVFP4_BLOCK_16 &&
                     weight.dataType != DataType::NVFP4_BLOCK_16_E8M0 &&
                     weight.dataType != DataType::NVFP4_BLOCK_32_E8M0) {
-                    fail("NVFP4 W4A4 requires an NVFP4 weight");
+                    fail("NVFP4 W4A4/W4A16 requires an NVFP4 weight");
                 }
                 break;
             case LinearQuantScheme::NONE:
