@@ -3122,6 +3122,7 @@ namespace {
             weight.weightType = fastllm::WeightType::LINEAR;
             weight.blockK = 1;
             weight.blockM = in;
+            weight.perChannelAxis = 0;
             weight.Allocate(false);
             uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
             for (uint64_t i = 0; i < weight.GetBytes(); ++i) {
@@ -3179,9 +3180,13 @@ namespace {
                 InitSeparateScaleWeight(weight, out, in, block, 0.7f);
             } else if (weightLayout == "perchannel") {
                 InitPerChannelWeight(weight, out, in, 0.7f);
+            } else if (weightLayout == "tensorwise") {
+                InitPerChannelWeight(weight, out, in, 0.7f);
+                weight.scales.assign(1, 0.0075f);
+                weight.perChannelAxis = -1;
             } else {
                 throw std::runtime_error(
-                    "weight_layout must be packed, separate or perchannel");
+                    "weight_layout must be packed, separate, perchannel or tensorwise");
             }
             weight.ToDevice(fastllm::DataDevice::CUDA);
 
@@ -3371,17 +3376,31 @@ namespace {
     }
 
     static void CheckLinearFp8StandardSm120Cuda(const OpTestParams &params) {
-        if (params.GetString("weight_layout") != "perchannel")
-            throw std::runtime_error("SM120 standard FP8 check requires weight_layout=perchannel");
+        const std::string weightLayout = params.GetString("weight_layout");
+        if (weightLayout != "perchannel" && weightLayout != "tensorwise") {
+            throw std::runtime_error(
+                "SM120 standard FP8 check requires perchannel or tensorwise weight scale");
+        }
         auto state = std::make_shared<LinearFp8Block128BenchState>();
         state->Init(params);
         fastllm::Data reference = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
         fastllm::Data actual = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
+        // 旧参考kernel只实现per-channel scale。tensorwise case仅在参考
+        // 计算期间把同一个标量广播成N份；正式Linear调用前恢复单元素，
+        // 确保被测CUTLASS路径真正执行标量广播分支。
+        const bool tensorwise = weightLayout == "tensorwise";
+        const float tensorScale = tensorwise ? state->weight.scales[0] : 0.0f;
+        if (tensorwise) {
+            state->weight.scales.assign(state->out, tensorScale);
+        }
         bool ok = state->input.dataType == fastllm::DataType::FLOAT16
             ? FastllmCudaHalfMatMulFloatFP8E4M3(state->input, state->weight, state->bias,
                                                 reference, state->batch, state->in, state->out)
             : FastllmCudaBFloat16MatMulFP8E4M3(state->input, state->weight, state->bias,
                                                 reference, state->batch, state->in, state->out);
+        if (tensorwise) {
+            state->weight.scales.assign(1, tensorScale);
+        }
         if (!ok) throw std::runtime_error("standard FP8 reference failed");
         // 正确性case走正式Linear入口；严格模式保证该标准FP8权重必须由
         // SM120 W8A8 CUTLASS完成，避免测试绕过生产后端选择和缓存流程。
@@ -3593,6 +3612,52 @@ namespace {
                 "destroyed W8A8 weight left a stale backend state");
         }
         std::cout << "SM120 W8A8 Data destructor clears backend state: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8DeviceMoveCuda(
+            const OpTestParams &params) {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "SM120 W8A8 GPU migration: SKIP (requires 2 GPUs)\n";
+            return;
+        }
+        LinearFp8Block128BenchState state;
+        state.Init(params);
+        if (!FastllmCudaCutlassLinearFp8W8A8Sm120(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out)) {
+            throw std::runtime_error("W8A8 GPU0 backend selection failed");
+        }
+        ForceDeviceSync();
+        fastllm::Data gpu0 = ConvertToFloat32Data(state.output);
+
+        // Data::ToDevice必须先销毁GPU0的scale/bias cache和后端状态，再从
+        // Data::scales主机源在GPU1创建新cache，不能沿用extraCudaData地址。
+        state.input.ToDevice(fastllm::DataDevice::CUDA, {1});
+        state.weight.ToDevice(fastllm::DataDevice::CUDA, {1});
+        if (!state.bias.dims.empty()) {
+            state.bias.ToDevice(fastllm::DataDevice::CUDA, {1});
+        }
+        state.output.ToDevice(fastllm::DataDevice::CUDA, {1}, false);
+        FastllmCudaSetDevice(1);
+        if (FastllmCudaGetFp8W8A8BackendState(state.weight, 0) !=
+                FastllmCudaFp8W8A8BackendState::Uninitialized ||
+            FastllmCudaGetFp8W8A8BackendState(state.weight, 1) !=
+                FastllmCudaFp8W8A8BackendState::Prepared) {
+            throw std::runtime_error("W8A8 GPU migration retained stale backend state");
+        }
+        if (!FastllmCudaCutlassLinearFp8W8A8Sm120(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out)) {
+            throw std::runtime_error("W8A8 GPU1 backend selection failed");
+        }
+        ForceDeviceSync();
+        fastllm::Data gpu1 = ConvertToFloat32Data(state.output);
+        ComparisonStats stats = CompareData(gpu0, gpu1, 0.02f, 0.02f);
+        if (!stats.passed) {
+            throw std::runtime_error("W8A8 GPU migration output mismatch");
+        }
+        FastllmCudaSetDevice(0);
+        std::cout << "SM120 W8A8 GPU migration rebuilds cache: PASS\n";
     }
 
     static void CheckLinearFp8PerChannelCuda(const OpTestParams &params) {
@@ -3986,6 +4051,9 @@ namespace {
         } else if (params.GetInt("check") == 11) {
             CheckLinearFp8W8A8DestructorClearsStateCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 12) {
+            CheckLinearFp8W8A8DeviceMoveCuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -4022,9 +4090,12 @@ namespace {
         int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
         BenchmarkResult result;
         result.avgMs = totalMs / std::max(iters, 1);
+        const double weightBytes =
+            (double)state->weight.GetBytes() +
+            (double)state->weight.scales.size() * sizeof(float);
         result.bytesMoved = (double)batch * in * 2.0 +
                             (double)batch * out * 2.0 +
-                            (double)fastllm::GetDataBytes(fastllm::DataType::FP8_E4M3_BLOCK_128, out, in) +
+                            weightBytes +
                             (double)out * sizeof(float);
         result.flops = 2.0 * (double)batch * in * out;
         double seconds = result.avgMs / 1000.0;
@@ -4047,7 +4118,7 @@ namespace {
     static OpCase MakeLinearFp8Block128Case() {
         return {
             "linear_fp8_block128",
-            "benchmark-only dense FP8 block128 linear",
+            "dense FP8 linear functional and performance test",
             []() {
                 OpTestParams params;
                 params.Add("batch", "16", "token batch size");
@@ -4056,7 +4127,8 @@ namespace {
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "bf16", "fp16 or bf16");
                 params.Add("input_pattern", "blocky", "smooth or blocky");
-                params.Add("weight_layout", "packed", "packed, separate or perchannel");
+                params.Add("weight_layout", "packed",
+                           "packed, separate, perchannel or tensorwise");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
                 params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
                 params.Add("check", "0",
@@ -4064,7 +4136,8 @@ namespace {
                            "4 raw batch-one, 5 Marlin/CUTLASS layout safety, "
                            "6 per-channel CUTLASS scaled-mm, 7 SM120 standard FP8, "
                            "8 SM120 fixed backend lifecycle, 9 first failure rejection, "
-                           "10 fixed backend failure, 11 destructor state cleanup");
+                           "10 fixed backend failure, 11 destructor state cleanup, "
+                           "12 GPU migration cache rebuild");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },

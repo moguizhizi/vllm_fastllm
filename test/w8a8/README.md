@@ -6,7 +6,9 @@
 SM120标准FP8 W8A8采用固定后端生命周期：每份权重在每张GPU上只进行
 一次真实CUTLASS GEMM选择。首次同步验证成功后固定为CUTLASS；失败则固定
 交给Legacy，正式推理期间不再混切。FP8权重本身已经是CUTLASS可消费格式，
-不会复制第二份权重；设备scale/bias及量化、累加、workspace临时区会缓存复用。
+不会复制第二份权重；设备scale、类型化bias、量化激活和workspace临时区会
+缓存复用。scale、bias与输出类型转换已融合进CUTLASS epilogue，不再分配
+完整的FP32中间矩阵或额外启动缩放kernel。
 
 ## 严格调用条件
 
@@ -15,7 +17,7 @@ SM120标准FP8 W8A8采用固定后端生命周期：每份权重在每张GPU上�
 | SM90 INT8 dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16 输入输出同 dtype；2D signed-I8 权重；权重 symmetric、无 zero/min；每输出通道一个 FP32 scale；激活动态 per-token symmetric INT8；K%16=0、N%8=0；bias 为空或 FP32[N] |
 | SM90 FP8 blockwise dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16；FP8 E4M3 权重；activation/weight block 都是 128x128；M/N/K 正数，K/N 为 128 倍数；bias 为空或 FP32[N] |
 | SM90 FP8 grouped MoE | 运行时精确 SM90；当前仅 BF16；SwiGLU；无 shared expert；expert 为 standard per-channel FP8 E4M3（不是 blockwise）；合法 route index；默认 batch>=16；hidden/inter 为 16 倍数；不满足直接回现有 MoE 路径 |
-| SM120 standard FP8 dense | 编译含 `120a`/`120f`，CUDA 12.9+；运行时精确 SM120，不含 SM121；FP16/BF16；FP8 E4M3 权重；weight `blockK=1, blockM=K` 且 scale 数=N；激活动态 per-token；K%16=0、N%8=0；bias 为空或 FP32[N] |
+| SM120 standard FP8 dense | 编译含 `120a`/`120f`，CUDA 12.9+；运行时精确 SM120，不含 SM121；FP16/BF16；FP8 E4M3 权重；weight `blockK=1, blockM=K` 且 scale 数为N（per-channel）或1（tensorwise）；激活动态 per-token；K%16=0、N%8=0；bias 为空或 FP32[N] |
 
 ## 命令
 
@@ -35,9 +37,10 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-function" \
   test/w8a8/run_w8a8_tests.sh ops-functional
 ```
 
-其中SM120生命周期包含三条故障示例：首次GEMM故障后固定为`Rejected`且
+其中SM120生命周期包含四类用例：首次GEMM故障后固定为`Rejected`且
 不再重试；已固定为`Cutlass`后的运行故障必须抛错而不能fallback；权重
-`Data`析构后必须删除以其地址为键的后端状态，防止新对象继承陈旧记录。
+`Data`析构后必须删除以其地址为键的后端状态，防止新对象继承陈旧记录；
+权重从GPU0迁移到GPU1时必须清理旧卡状态，并从主机scale源在新卡重建缓存。
 故障通过测试专用环境变量注入，但调用的仍是正式W8A8 CUTLASS入口和状态机。
 
 算子性能（直接生成FastLLM/vLLM Markdown、CSV和JSON对比）：

@@ -87,6 +87,16 @@ run_ops_functional() {
                     17 4096 4096 "${dtype}" "${bias}"
             done
         done
+        # vLLM ScaledEpilogue同时支持B scale为per-channel或tensorwise。
+        # 该case仍走正式Linear入口，覆盖融合epilogue的标量广播分支。
+        for bias in 0 1; do
+            run_logged "sm120_tensorwise_weight_bias${bias}" env \
+                FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+                "${optest}" --op linear_fp8_block128 --device cuda:0 \
+                --param batch=17 --param in=4096 --param out=4096 \
+                --param weight_layout=tensorwise --param input_type=bf16 \
+                --param has_bias="${bias}" --param check=7 --warmup 0 --iters 1
+        done
         run_logged sm120_fixed_backend_lifecycle env \
             FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
             "${optest}" --op linear_fp8_block128 --device cuda:0 \
@@ -113,6 +123,12 @@ run_ops_functional() {
             --param batch=17 --param in=4096 --param out=4096 \
             --param weight_layout=perchannel --param input_type=bf16 \
             --param has_bias=1 --param check=11 --warmup 0 --iters 1
+        run_logged sm120_gpu_migration_rebuilds_cache env \
+            FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            --param batch=17 --param in=4096 --param out=4096 \
+            --param weight_layout=perchannel --param input_type=bf16 \
+            --param has_bias=1 --param check=12 --warmup 0 --iters 1
         # vLLM test_cutlass_scaled_mm.py中的全部对齐MNK形状。FastLLM只
         # 比较双方共同支持的per-token A scale和per-channel B scale语义。
         while read -r m n k; do
