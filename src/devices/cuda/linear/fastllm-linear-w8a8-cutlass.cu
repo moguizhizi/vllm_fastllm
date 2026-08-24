@@ -1,12 +1,13 @@
 // Apache-2.0. Native FastLLM adaptation of vLLM scaled_mm SM90 INT8 and
 // SM120 FP8 kernels.  The public wrappers intentionally reject every layout
-// except dynamic per-token activation scale + symmetric per-output-channel
-// weight scale.
+// except dynamic per-token activation scale + symmetric per-output-channel or
+// tensorwise weight scale.
 #include "fastllm-cuda.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -40,24 +42,58 @@ using BackendState = FastllmCudaFp8W8A8BackendState;
  * SM120 W8A8执行阶段按GPU复用的临时显存。
  *
  * FP8权重已经是CUTLASS直接消费的[N,K]格式，不需要像NVFP4一样保留
- * 第二份重排权重。本结构只缓存动态量化激活、per-token scale、FP32
- * 累加输出和可能存在的CUTLASS workspace；各缓冲区只扩容、不缩小。
+ * 第二份重排权重。本结构只缓存动态量化激活、per-token scale和可能
+ * 存在的CUTLASS workspace；融合epilogue直接写最终输出，各缓冲区只
+ * 扩容、不缩小。
  */
 struct ExecutionScratch {
     void *quantized = nullptr;
     float *tokenScales = nullptr;
-    void *accumulator = nullptr;
     void *workspace = nullptr;
     size_t quantizedBytes = 0;
     size_t tokenScaleBytes = 0;
-    size_t accumulatorBytes = 0;
     size_t workspaceBytes = 0;
 };
+
+/**
+ * 缓存标准FP8权重供CUTLASS epilogue直接消费的稳定设备参数。
+ *
+ * FP8权重本身已经是CUTLASS所需的[N,K]物理布局，因此本缓存不复制权重，
+ * 只记录原权重指针、设备端scale，并保存由FastLLM FP32 bias一次性转换出的
+ * FP16/BF16 bias。缓存按权重、bias、GPU和输出类型隔离，保证CUDA Graph
+ * 重放期间所有地址保持稳定。
+ */
+struct WeightCache {
+    const void *weight = nullptr;
+    const float *scales = nullptr;
+    void *bias = nullptr;
+    const void *biasSource = nullptr;
+    int scaleCount = 0;
+    int n = 0;
+};
+
+/**
+ * 按权重和GPU保存CUTLASS使用的设备端权重scale。
+ *
+ * scale源保留在Data::scales主机数组中；权重迁移GPU时销毁旧设备副本，
+ * 再从主机源直接在目标GPU创建，禁止复用Data::extraCudaData中的旧卡地址。
+ */
+struct ScaleCache {
+    const void *weight = nullptr;
+    float *scales = nullptr;
+    int count = 0;
+};
+
+using WeightCacheKey = std::tuple<const fastllm::Data *, const fastllm::Data *,
+                                  int, fastllm::DataType>;
 
 std::mutex scratchMutex;
 std::map<int, ExecutionScratch> executionScratch;
 std::mutex backendMutex;
 std::map<std::pair<const fastllm::Data *, int>, BackendState> backendStates;
+std::mutex weightCacheMutex;
+std::map<WeightCacheKey, WeightCache> weightCaches;
+std::map<std::pair<const fastllm::Data *, int>, ScaleCache> scaleCaches;
 
 static bool Enabled() {
     const char *value = std::getenv("FASTLLM_CUDA_W8A8");
@@ -108,7 +144,6 @@ static void SetBackendState(const fastllm::Data &weight, int device,
 static void ReleaseScratch(ExecutionScratch &scratch) {
     if (scratch.quantized != nullptr) FastllmCudaFree(scratch.quantized);
     if (scratch.tokenScales != nullptr) FastllmCudaFree(scratch.tokenScales);
-    if (scratch.accumulator != nullptr) FastllmCudaFree(scratch.accumulator);
     if (scratch.workspace != nullptr) FastllmCudaFree(scratch.workspace);
     scratch = ExecutionScratch();
 }
@@ -121,21 +156,17 @@ static void ReleaseScratch(ExecutionScratch &scratch) {
  *
  * @param quantizedBytes   FP8动态量化激活所需字节数。
  * @param tokenScaleBytes  per-token FP32 scale所需字节数。
- * @param accumulatorBytes FP32/INT32累加输出所需字节数。
  * @return 容量足够时返回当前GPU临时区，否则返回nullptr。
  */
 static ExecutionScratch *GetExecutionScratch(size_t quantizedBytes,
-                                             size_t tokenScaleBytes,
-                                             size_t accumulatorBytes) {
+                                             size_t tokenScaleBytes) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
     std::lock_guard<std::mutex> guard(scratchMutex);
     ExecutionScratch &scratch = executionScratch[device];
     if (scratch.quantized != nullptr && scratch.tokenScales != nullptr &&
-        scratch.accumulator != nullptr &&
         scratch.quantizedBytes >= quantizedBytes &&
-        scratch.tokenScaleBytes >= tokenScaleBytes &&
-        scratch.accumulatorBytes >= accumulatorBytes) {
+        scratch.tokenScaleBytes >= tokenScaleBytes) {
         return &scratch;
     }
     if (FastllmCudaGraphIsCapturing()) return nullptr;
@@ -144,15 +175,12 @@ static ExecutionScratch *GetExecutionScratch(size_t quantizedBytes,
     replacement.quantized = FastllmCudaMalloc(quantizedBytes);
     replacement.tokenScales = static_cast<float *>(
         FastllmCudaMalloc(tokenScaleBytes));
-    replacement.accumulator = FastllmCudaMalloc(accumulatorBytes);
-    if (replacement.quantized == nullptr || replacement.tokenScales == nullptr ||
-        replacement.accumulator == nullptr) {
+    if (replacement.quantized == nullptr || replacement.tokenScales == nullptr) {
         ReleaseScratch(replacement);
         return nullptr;
     }
     replacement.quantizedBytes = quantizedBytes;
     replacement.tokenScaleBytes = tokenScaleBytes;
-    replacement.accumulatorBytes = accumulatorBytes;
     ReleaseScratch(scratch);
     scratch = replacement;
     return &scratch;
@@ -176,57 +204,213 @@ template <typename T> __device__ float ToFloat(T value);
 template <> __device__ float ToFloat(half value) { return __half2float(value); }
 template <> __device__ float ToFloat(__nv_bfloat16 value) { return __bfloat162float(value); }
 
+template <typename Quant>
+__device__ __forceinline__ Quant QuantizeValue(float value, float scale) {
+    float scaled = value / scale;
+    if constexpr (std::is_same_v<Quant, int8_t>) {
+        int q = max(-127, min(127, __float2int_rn(scaled)));
+        return static_cast<int8_t>(q);
+    } else {
+        scaled = fmaxf(-448.0f, fminf(scaled, 448.0f));
+        return Quant::bitcast(static_cast<uint8_t>(
+            __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3)));
+    }
+}
+
+struct QuantizeMaxOp {
+    __device__ __forceinline__ float operator()(float lhs, float rhs) const {
+        return fmaxf(lhs, rhs);
+    }
+};
+
 template <typename Input, typename Quant, int MaxValue>
 __global__ void QuantizePerToken(const Input *input, Quant *quant,
                                  float *scales, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
+    static_assert(sizeof(Input) == 2 && sizeof(Quant) == 1);
+    // 与vLLM dynamic_per_token_scaled_fp8_quant保持一致：每次处理16个
+    // 元素。FP16/BF16侧读取32字节，FP8侧写入16字节。
+    constexpr int ValuesPerVector = 16;
+    const int vectors = cols / ValuesPerVector;
+    struct __align__(32) InputVector {
+        Input values[ValuesPerVector];
+    };
+    struct __align__(16) QuantVector {
+        Quant values[ValuesPerVector];
+    };
+    const InputVector *vectorInput = reinterpret_cast<const InputVector *>(
+        input + (size_t)row * cols);
+    QuantVector *vectorOutput = reinterpret_cast<QuantVector *>(
+        quant + (size_t)row * cols);
+
     float local = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x)
-        local = fmaxf(local, fabsf(ToFloat(input[(size_t)row * cols + col])));
-    for (int delta = 16; delta > 0; delta >>= 1)
-        local = fmaxf(local, __shfl_down_sync(0xffffffff, local, delta));
-    __shared__ float warpMax[8];
-    if ((threadIdx.x & 31) == 0) warpMax[threadIdx.x >> 5] = local;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        local = threadIdx.x < 8 ? warpMax[threadIdx.x] : 0.0f;
-        for (int delta = 16; delta > 0; delta >>= 1)
-            local = fmaxf(local, __shfl_down_sync(0xffffffff, local, delta));
-        if (threadIdx.x == 0) warpMax[0] = local;
+    for (int vector = threadIdx.x; vector < vectors;
+         vector += blockDim.x) {
+        const InputVector values = vectorInput[vector];
+#pragma unroll
+        for (int i = 0; i < ValuesPerVector; ++i) {
+            local = fmaxf(local, fabsf(ToFloat(values.values[i])));
+        }
+    }
+    using BlockReduce = cub::BlockReduce<float, 256>;
+    __shared__ typename BlockReduce::TempStorage reductionStorage;
+    float maximum = BlockReduce(reductionStorage).Reduce(
+        local, QuantizeMaxOp{});
+    __shared__ float rowScale;
+    if (threadIdx.x == 0) {
+        const float minScale = std::is_same_v<Quant, int8_t>
+            ? 1.1920928955078125e-7f
+            : 1.0f / ((float)MaxValue * 512.0f);
+        rowScale = fmaxf(maximum / (float)MaxValue, minScale);
+        scales[row] = rowScale;
     }
     __syncthreads();
-    float scale = warpMax[0] == 0.0f ? 1.0f : warpMax[0] / (float)MaxValue;
-    if (threadIdx.x == 0) scales[row] = scale;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        float value = ToFloat(input[(size_t)row * cols + col]) / scale;
-        if constexpr (std::is_same_v<Quant, int8_t>) {
-            int q = max(-MaxValue, min(MaxValue, __float2int_rn(value)));
-            quant[(size_t)row * cols + col] = (int8_t)q;
-        } else {
-            quant[(size_t)row * cols + col] = Quant(value);
+
+    for (int vector = threadIdx.x; vector < vectors;
+         vector += blockDim.x) {
+        const InputVector source = vectorInput[vector];
+        QuantVector target;
+#pragma unroll
+        for (int i = 0; i < ValuesPerVector; ++i) {
+            target.values[i] = QuantizeValue<Quant>(
+                ToFloat(source.values[i]), rowScale);
         }
+        vectorOutput[vector] = target;
     }
 }
 
-template <typename Output, typename Accumulator>
-__global__ void ApplyScales(const Accumulator *accumulator,
-                            const float *tokenScales,
-                            const float *channelScales,
-                            const float *bias, Output *output,
-                            int rows, int cols) {
-    size_t count = (size_t)rows * cols;
-    // 启动端会限制block数量，避免大M/N时产生过大的grid。必须使用
-    // grid-stride循环覆盖剩余元素，否则当rows * cols超过单轮容量时，
-    // 尾部整行会保持未写入状态，例如M=257、N=4096的最后一行。
-    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         index < count; index += (size_t)blockDim.x * gridDim.x) {
-        int row = index / cols, col = index % cols;
-        float value = (float)accumulator[index] * tokenScales[row] *
-                      channelScales[col];
-        if (bias != nullptr) value += bias[col];
-        output[index] = Output(value);
+template <typename Output>
+__global__ void ConvertBias(const float *source, Output *target, int count) {
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < count; index += blockDim.x * gridDim.x) {
+        target[index] = Output(source[index]);
     }
+}
+
+static void ReleaseWeightCache(WeightCache &cache) {
+    if (cache.bias != nullptr) FastllmCudaFree(cache.bias);
+    cache = WeightCache();
+}
+
+static void ReleaseScaleCache(ScaleCache &cache) {
+    if (cache.scales != nullptr) FastllmCudaFree(cache.scales);
+    cache = ScaleCache();
+}
+
+static ScaleCache *GetScaleCache(fastllm::Data &weight, int device) {
+    const std::pair<const fastllm::Data *, int> key{&weight, device};
+    auto found = scaleCaches.find(key);
+    if (found != scaleCaches.end()) {
+        ScaleCache &cache = found->second;
+        if (cache.weight == weight.cudaData &&
+            cache.count == static_cast<int>(weight.scales.size())) {
+            return &cache;
+        }
+        if (FastllmCudaGraphIsCapturing()) return nullptr;
+        ReleaseScaleCache(cache);
+        scaleCaches.erase(found);
+    }
+    if (FastllmCudaGraphIsCapturing() || weight.scales.empty()) return nullptr;
+
+    ScaleCache cache;
+    cache.weight = weight.cudaData;
+    cache.count = static_cast<int>(weight.scales.size());
+    cache.scales = static_cast<float *>(
+        FastllmCudaMalloc((size_t)cache.count * sizeof(float)));
+    if (cache.scales == nullptr) return nullptr;
+    FastllmCudaCopyFromHostToDevice(
+        cache.scales, weight.scales.data(),
+        (size_t)cache.count * sizeof(float));
+    auto inserted = scaleCaches.emplace(key, cache);
+    return &inserted.first->second;
+}
+
+static void ReleaseWeightCacheForDevice(const fastllm::Data *weight,
+                                        int device) {
+    std::lock_guard<std::mutex> guard(weightCacheMutex);
+    int originalDevice = 0;
+    cudaGetDevice(&originalDevice);
+    cudaSetDevice(device);
+    for (auto it = weightCaches.begin(); it != weightCaches.end();) {
+        if (std::get<0>(it->first) == weight &&
+            std::get<2>(it->first) == device) {
+            ReleaseWeightCache(it->second);
+            it = weightCaches.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto scale = scaleCaches.find({weight, device});
+    if (scale != scaleCaches.end()) {
+        ReleaseScaleCache(scale->second);
+        scaleCaches.erase(scale);
+    }
+    cudaSetDevice(originalDevice);
+}
+
+/**
+ * 取得标准FP8权重对应的CUTLASS参数缓存。
+ *
+ * 权重和scale沿用模型上传后的设备表示，不创建第二份权重。FastLLM的
+ * Linear bias固定为FP32，而vLLM SM120 scaled-mm要求bias与输出同类型；
+ * 因此首次调用时将bias转换为FP16/BF16并缓存。CUDA Graph捕获期间不允许
+ * 新建缓存，避免捕获到临时地址或内存分配操作。
+ *
+ * @tparam Output CUTLASS最终输出以及融合bias的数据类型。
+ * @param weight  标准FP8权重，逻辑形状为[N,K]。
+ * @param bias    可选FP32 bias，逻辑形状为[N]。
+ * @param device  当前CUDA设备编号。
+ * @param n       输出特征数。
+ * @return 成功时返回地址稳定的参数缓存；失败时返回nullptr。
+ */
+template <typename Output>
+static WeightCache *GetWeightCache(fastllm::Data &weight,
+                                   const fastllm::Data &bias,
+                                   int device, int n) {
+    const fastllm::DataType outputType =
+        std::is_same_v<Output, cutlass::half_t>
+            ? fastllm::DataType::FLOAT16
+            : fastllm::DataType::BFLOAT16;
+    const WeightCacheKey key{&weight, &bias, device, outputType};
+    std::lock_guard<std::mutex> guard(weightCacheMutex);
+    auto found = weightCaches.find(key);
+    if (found != weightCaches.end()) {
+        WeightCache &cache = found->second;
+        if (cache.weight == weight.cudaData && cache.n == n &&
+            cache.biasSource == bias.cudaData) {
+            return &cache;
+        }
+        if (FastllmCudaGraphIsCapturing()) return nullptr;
+        ReleaseWeightCache(cache);
+        weightCaches.erase(found);
+    }
+    if (FastllmCudaGraphIsCapturing()) return nullptr;
+
+    ScaleCache *scaleCache = GetScaleCache(weight, device);
+    if (scaleCache == nullptr || scaleCache->scales == nullptr) return nullptr;
+
+    WeightCache cache;
+    cache.weight = weight.cudaData;
+    cache.scales = scaleCache->scales;
+    cache.scaleCount = scaleCache->count;
+    cache.n = n;
+    cache.biasSource = bias.cudaData;
+    if (!bias.dims.empty()) {
+        cache.bias = FastllmCudaMalloc((size_t)n * sizeof(Output));
+        if (cache.bias == nullptr) return nullptr;
+        const int threads = 256;
+        const int blocks = std::min(4096, (n + threads - 1) / threads);
+        ConvertBias<<<blocks, threads>>>(
+            static_cast<const float *>(bias.cudaData),
+            static_cast<Output *>(cache.bias), n);
+        if (cudaGetLastError() != cudaSuccess) {
+            ReleaseWeightCache(cache);
+            return nullptr;
+        }
+    }
+    auto inserted = weightCaches.emplace(key, cache);
+    return &inserted.first->second;
 }
 
 template <typename Kernel>
@@ -251,30 +435,91 @@ struct EnableSm120Only : Kernel {
     }
 };
 
-template <typename Element, typename Accumulator, typename Arch,
+/**
+ * 定义与vLLM scaled-mm等价的CUTLASS融合缩放epilogue。
+ *
+ * 累加器先乘权重scale[N]或标量，再乘激活scale[M]或标量；有bias版本
+ * 随后叠加与输出同类型的bias[N]，并直接转换为FP16/BF16输出。动态stride
+ * 使同一内核同时支持per-token/per-channel和tensorwise广播语义。
+ */
+template <typename ElementAcc, typename ElementD, typename TileShape,
+          bool HasBias>
+struct FusedScaledEpilogue {
+    using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+    using ScaleAStride = Stride<bool, _0, _0>;
+    using ScaleBStride = Stride<_0, bool, _0>;
+    using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+        0, TileShape, float, float, ScaleAStride, 4, false>;
+    using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, float, float, ScaleBStride, 4, false>;
+    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, ElementD, ElementD, Stride<_0, _1, _0>,
+        128 / sizeof_bits_v<ElementD>, false>;
+    using MultiplyB = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::multiplies, float, float,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+    using ScaledB = cutlass::epilogue::fusion::Sm90EVT<
+        MultiplyB, ScaleB, Accum>;
+    using FinalCompute = std::conditional_t<HasBias,
+        cutlass::epilogue::fusion::Sm90Compute<
+            cutlass::homogeneous_multiply_add, ElementD, float,
+            cutlass::FloatRoundStyle::round_to_nearest>,
+        cutlass::epilogue::fusion::Sm90Compute<
+            cutlass::multiplies, ElementD, float,
+            cutlass::FloatRoundStyle::round_to_nearest>>;
+    using EVTCompute = std::conditional_t<HasBias,
+        cutlass::epilogue::fusion::Sm90EVT<
+            FinalCompute, ScaleA, ScaledB, Bias>,
+        cutlass::epilogue::fusion::Sm90EVT<
+            FinalCompute, ScaleA, ScaledB>>;
+    using Arguments = typename EVTCompute::Arguments;
+
+    static Arguments Prepare(const float *scaleA, bool perToken,
+                             const float *scaleB, bool perChannel,
+                             const ElementD *bias) {
+        typename ScaleA::Arguments aArgs{
+            scaleA, 0.0f, ScaleAStride{perToken, _0{}, _0{}}};
+        typename ScaleB::Arguments bArgs{
+            scaleB, 0.0f, ScaleBStride{_0{}, perChannel, _0{}}};
+        typename ScaledB::Arguments scaledBArgs{bArgs, {}, {}};
+        if constexpr (HasBias) {
+            typename Bias::Arguments biasArgs{bias, ElementD(0), {}};
+            return Arguments{aArgs, scaledBArgs, biasArgs, {}};
+        } else {
+            return Arguments{aArgs, scaledBArgs, {}};
+        }
+    }
+};
+
+template <typename Element, typename Output, typename Arch,
           typename Tile, typename Cluster, typename MainloopSchedule,
           typename EpilogueSchedule,
+          bool HasBias,
           typename EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto>
 struct DenseKernel {
     using ElementA = Element;
     using ElementB = Element;
-    using ElementD = Accumulator;
+    using ElementD = Output;
+    using ElementAccumulator = std::conditional_t<
+        std::is_same_v<Element, int8_t>, int32_t, float>;
+    static constexpr bool HasBiasValue = HasBias;
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutD = cutlass::layout::RowMajor;
     static constexpr int Alignment = 128 / cutlass::sizeof_bits<Element>::value;
-    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<Accumulator>::value;
-    using Operation = cutlass::epilogue::fusion::LinearCombination<
-        Accumulator, Accumulator, void, Accumulator>;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<Output>::value;
+    using EpilogueOperation = FusedScaledEpilogue<
+        ElementAccumulator, Output, Tile, HasBias>;
+    using EVTCompute = typename EpilogueOperation::EVTCompute;
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         Arch, cutlass::arch::OpClassTensorOp, Tile, Cluster,
         EpilogueTile,
-        Accumulator, Accumulator, void, LayoutD, AlignmentD,
-        Accumulator, LayoutD, AlignmentD, EpilogueSchedule, Operation>::CollectiveOp;
+        ElementAccumulator, float, void, LayoutD, AlignmentD,
+        Output, LayoutD, AlignmentD, EpilogueSchedule, EVTCompute>::CollectiveOp;
     using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         Arch, cutlass::arch::OpClassTensorOp,
         Element, LayoutA, Alignment, Element, LayoutB, Alignment,
-        Accumulator, Tile, Cluster,
+        ElementAccumulator, Tile, Cluster,
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
         MainloopSchedule>::CollectiveOp;
@@ -289,6 +534,9 @@ template <typename Definition>
 bool Run(typename Definition::ElementA const *a,
          typename Definition::ElementB const *b,
          typename Definition::ElementD *d,
+         const float *scaleA, bool perToken,
+         const float *scaleB, bool perChannel,
+         const typename Definition::ElementD *bias,
          int m, int n, int k, cudaStream_t stream,
          ExecutionScratch &scratch) {
     using Kernel = typename Definition::GemmKernel;
@@ -300,7 +548,10 @@ bool Run(typename Definition::ElementA const *a,
     StrideB strideB = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
     StrideD strideD = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
     typename Kernel::MainloopArguments mainloop{a, strideA, b, strideB};
-    typename Kernel::EpilogueArguments epilogue{{}, d, strideD, d, strideD};
+    auto callbackArgs = Definition::EpilogueOperation::Prepare(
+        scaleA, perToken, scaleB, perChannel, bias);
+    typename Kernel::EpilogueArguments epilogue{
+        callbackArgs, d, strideD, d, strideD};
     cutlass::KernelHardwareInfo hw;
     hw.device_id = FastllmCudaGetDevice();
     hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw.device_id);
@@ -315,79 +566,95 @@ bool Run(typename Definition::ElementA const *a,
     return status == cutlass::Status::kSuccess && cudaGetLastError() == cudaSuccess;
 }
 
-template <typename Element, typename Accumulator>
-bool Dispatch(int arch, Element const *a, Element const *b, Accumulator *d,
+template <typename Element, typename Output, bool HasBias>
+bool Dispatch(int arch, Element const *a, Element const *b, Output *d,
+              const float *scaleA, bool perToken,
+              const float *scaleB, bool perChannel,
+              const Output *bias,
               int m, int n, int k, cudaStream_t stream,
               ExecutionScratch &scratch) {
 #if defined(FASTLLM_CUTLASS_W8A8_SM90)
     if constexpr (std::is_same_v<Element, int8_t>) {
         if (arch != 90) return false;
         if (m <= 32 && n < 8192) {
-            using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm90,
+            using D = DenseKernel<Element, Output, cutlass::arch::Sm90,
                 Shape<_64,_64,_256>, Shape<_1,_8,_1>,
                 cutlass::gemm::KernelTmaWarpSpecialized,
-                cutlass::epilogue::TmaWarpSpecialized>;
-            return Run<D>(a, b, d, m, n, k, stream, scratch);
+                cutlass::epilogue::TmaWarpSpecialized, HasBias>;
+            return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                          bias, m, n, k, stream, scratch);
         }
         if (m <= 32) {
-            using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm90,
+            using D = DenseKernel<Element, Output, cutlass::arch::Sm90,
                 Shape<_64,_128,_256>, Shape<_1,_4,_1>,
                 cutlass::gemm::KernelTmaWarpSpecialized,
-                cutlass::epilogue::TmaWarpSpecialized>;
-            return Run<D>(a, b, d, m, n, k, stream, scratch);
+                cutlass::epilogue::TmaWarpSpecialized, HasBias>;
+            return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                          bias, m, n, k, stream, scratch);
         }
         if (m <= 64) {
-            using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm90,
+            using D = DenseKernel<Element, Output, cutlass::arch::Sm90,
                 Shape<_64,_64,_256>, Shape<_1,_1,_1>,
                 cutlass::gemm::KernelTmaWarpSpecialized,
-                cutlass::epilogue::TmaWarpSpecialized>;
-            return Run<D>(a, b, d, m, n, k, stream, scratch);
+                cutlass::epilogue::TmaWarpSpecialized, HasBias>;
+            return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                          bias, m, n, k, stream, scratch);
         }
         if (m <= 128) {
-            using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm90,
+            using D = DenseKernel<Element, Output, cutlass::arch::Sm90,
                 Shape<_64,_128,_128>, Shape<_2,_1,_1>,
                 cutlass::gemm::KernelTmaWarpSpecializedPingpong,
-                cutlass::epilogue::TmaWarpSpecialized>;
-            return Run<D>(a, b, d, m, n, k, stream, scratch);
+                cutlass::epilogue::TmaWarpSpecialized, HasBias>;
+            return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                          bias, m, n, k, stream, scratch);
         }
-        using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm90,
+        using D = DenseKernel<Element, Output, cutlass::arch::Sm90,
             Shape<_128,_128,_128>, Shape<_2,_1,_1>,
             cutlass::gemm::KernelTmaWarpSpecializedPingpong,
-            cutlass::epilogue::TmaWarpSpecialized>;
-        return Run<D>(a, b, d, m, n, k, stream, scratch);
+            cutlass::epilogue::TmaWarpSpecialized, HasBias>;
+        return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                      bias, m, n, k, stream, scratch);
     }
 #endif
 #if defined(FASTLLM_CUTLASS_W8A8_SM120)
     if constexpr (std::is_same_v<Element, cutlass::float_e4m3_t>) {
         if (arch != 120) return false;
         if (m <= 16) {
-            using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm120,
+            using D = DenseKernel<Element, Output, cutlass::arch::Sm120,
                 Shape<_16,_64,_128>, Shape<_1,_1,_1>,
                 cutlass::gemm::KernelTmaWarpSpecializedPingpong,
                 cutlass::epilogue::collective::EpilogueScheduleAuto,
+                HasBias,
                 Shape<_16,_32>>;
-            return Run<D>(a, b, d, m, n, k, stream, scratch);
+            return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                          bias, m, n, k, stream, scratch);
         }
         if (m <= 32) {
-            using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm120,
+            using D = DenseKernel<Element, Output, cutlass::arch::Sm120,
                 Shape<_32,_64,_128>, Shape<_1,_1,_1>,
                 cutlass::gemm::KernelTmaWarpSpecializedPingpong,
                 cutlass::epilogue::collective::EpilogueScheduleAuto,
+                HasBias,
                 Shape<_32,_32>>;
-            return Run<D>(a, b, d, m, n, k, stream, scratch);
+            return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                          bias, m, n, k, stream, scratch);
         }
         if (m <= 256) {
-            using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm120,
+            using D = DenseKernel<Element, Output, cutlass::arch::Sm120,
                 Shape<_64,_64,_128>, Shape<_1,_1,_1>,
                 cutlass::gemm::KernelTmaWarpSpecializedPingpong,
-                cutlass::epilogue::collective::EpilogueScheduleAuto>;
-            return Run<D>(a, b, d, m, n, k, stream, scratch);
+                cutlass::epilogue::collective::EpilogueScheduleAuto,
+                HasBias>;
+            return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                          bias, m, n, k, stream, scratch);
         }
-        using D = DenseKernel<Element, Accumulator, cutlass::arch::Sm120,
+        using D = DenseKernel<Element, Output, cutlass::arch::Sm120,
             Shape<_128,_128,_128>, Shape<_1,_1,_1>,
             cutlass::gemm::collective::KernelScheduleAuto,
-            cutlass::epilogue::collective::EpilogueScheduleAuto>;
-        return Run<D>(a, b, d, m, n, k, stream, scratch);
+            cutlass::epilogue::collective::EpilogueScheduleAuto,
+            HasBias>;
+        return Run<D>(a, b, d, scaleA, perToken, scaleB, perChannel,
+                      bias, m, n, k, stream, scratch);
     }
 #endif
     return false;
@@ -398,21 +665,23 @@ bool Dispatch(int arch, Element const *a, Element const *b, Accumulator *d,
  *
  * 本函数只负责单次计算，不决定固定后端的生命周期，也不主动同步CUDA
  * Stream。执行流程为：取得当前GPU可复用的临时区，准备权重的per-channel
- * scale与可选bias，将输入逐token动态量化为Quant，调用对应架构的CUTLASS
- * GEMM生成Accumulator结果，最后乘回输入和权重scale、叠加bias并写入输出。
- * kernel提交后的异步错误由外层首次后端选择同步检查。
+ * scale与可选bias，将输入逐token动态量化为Quant，再调用对应架构的
+ * CUTLASS GEMM。scale乘法、bias和FP16/BF16转换全部在CUTLASS epilogue
+ * 内完成，不产生完整的FP32中间矩阵，也不启动独立缩放kernel。kernel
+ * 提交后的异步错误由外层首次后端选择同步检查。
  *
  * 数学语义为output[M,N] = input[M,K] * weight[N,K]^T + bias[N]。
  * input和output为FP16或BF16；weight为CUTLASS直接消费的行主序量化权重；
- * 激活scale采用per-token布局[M]，权重scale采用per-channel布局[N]。
+ * 激活scale采用per-token布局[M]，权重scale采用per-channel布局[N]或
+ * tensorwise标量布局[1]。
  *
  * @tparam Input       输入和最终输出对应的CUDA标量类型。
  * @tparam Quant       激活及权重参与GEMM时使用的量化标量类型。
- * @tparam Accumulator CUTLASS GEMM累加结果类型。
+ * @tparam Output      CUTLASS融合epilogue直接写出的FP16/BF16标量类型。
  * @tparam MaxValue    动态量化计算scale时采用的Quant最大有限值。
  * @param input        CUDA输入张量，逻辑形状为[m, k]。
- * @param weight       CUDA量化权重，逻辑形状为[n, k]；其附加显存保存
- *                     per-channel scale和bias。
+ * @param weight       CUDA量化权重，逻辑形状为[n, k]；CUTLASS cache保存
+ *                     当前GPU的scale和类型化bias，不复制权重数据。
  * @param bias         可选偏置，逻辑形状为[n]；为空时不执行偏置加法。
  * @param output       CUDA输出张量，逻辑形状为[m, n]。
  * @param m            GEMM的M维，通常为本次处理的token数。
@@ -422,42 +691,36 @@ bool Dispatch(int arch, Element const *a, Element const *b, Accumulator *d,
  * @return true表示量化、GEMM和缩放写回均已成功提交；false表示临时区、
  *         scale/bias准备、CUTLASS分派或CUDA kernel启动失败。
  */
-template <typename Input, typename Quant, typename Accumulator, int MaxValue>
+template <typename Input, typename Quant, typename Output, int MaxValue>
 bool Execute(const fastllm::Data &input, fastllm::Data &weight,
              const fastllm::Data &bias, fastllm::Data &output,
              int m, int k, int n, int arch) {
     ExecutionScratch *scratch = GetExecutionScratch(
-        (size_t)m * k * sizeof(Quant), (size_t)m * sizeof(float),
-        (size_t)m * n * sizeof(Accumulator));
-    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, n);
-    if (scratch == nullptr || weight.extraCudaData.size() < 2 ||
-        weight.extraCudaData[0] == nullptr || weight.extraCudaData[1] == nullptr) {
-        return false;
-    }
+        (size_t)m * k * sizeof(Quant), (size_t)m * sizeof(float));
+    const int device = FastllmCudaGetDevice();
+    WeightCache *cache = GetWeightCache<Output>(weight, bias, device, n);
+    if (scratch == nullptr || cache == nullptr || cache->weight == nullptr ||
+        cache->scales == nullptr) return false;
     Quant *quant = static_cast<Quant *>(scratch->quantized);
     float *tokenScales = scratch->tokenScales;
-    Accumulator *accumulator = static_cast<Accumulator *>(scratch->accumulator);
-    const float *channelScales = (const float*)weight.extraCudaData[0];
-    const float *biasData = (const float*)weight.extraCudaData[1];
+    const float *channelScales = cache->scales;
+    const Output *biasData = static_cast<const Output *>(cache->bias);
     cudaStream_t stream = 0;
     QuantizePerToken<Input, Quant, MaxValue><<<m, 256, 0, stream>>>(
         (const Input*)input.cudaData, quant, tokenScales, m, k);
-    bool ok = cudaGetLastError() == cudaSuccess &&
-              Dispatch<Quant, Accumulator>(arch, quant,
-                  (const Quant*)weight.cudaData, accumulator, m, n, k, stream,
-                  *scratch);
-    if (ok) {
-        int threads = 256;
-        int blocks = std::min<size_t>(4096, ((size_t)m * n + threads - 1) / threads);
-        if (input.dataType == fastllm::DataType::FLOAT16)
-            ApplyScales<<<blocks, threads, 0, stream>>>(accumulator, tokenScales,
-                channelScales, biasData, (half*)output.cudaData, m, n);
-        else
-            ApplyScales<<<blocks, threads, 0, stream>>>(accumulator, tokenScales,
-                channelScales, biasData, (__nv_bfloat16*)output.cudaData, m, n);
-        ok = cudaGetLastError() == cudaSuccess;
-    }
-    return ok;
+    if (cudaGetLastError() != cudaSuccess) return false;
+    Output *outputData = static_cast<Output *>(output.cudaData);
+    const Quant *weightData = static_cast<const Quant *>(cache->weight);
+    const bool perChannel = cache->scaleCount != 1;
+    return biasData == nullptr
+        ? Dispatch<Quant, Output, false>(
+              arch, quant, weightData, outputData,
+              tokenScales, true, channelScales, perChannel, nullptr,
+              m, n, k, stream, *scratch)
+        : Dispatch<Quant, Output, true>(
+              arch, quant, weightData, outputData,
+              tokenScales, true, channelScales, perChannel, biasData,
+              m, n, k, stream, *scratch);
 }
 } // namespace fastllm_w8a8_dense_detail
 #endif
@@ -465,9 +728,9 @@ bool Execute(const fastllm::Data &input, fastllm::Data &weight,
 /**
  * 清除指定FP8权重记录的W8A8固定后端状态。
  *
- * FP8权重本身不需要额外的CUTLASS重排副本，但后端选择状态以Data地址和
- * GPU编号为键缓存。张量销毁、覆盖或迁移设备前必须删除全部对应记录，
- * 防止后续复用同一Data地址时继承旧权重的Cutlass或Rejected状态。
+ * FP8权重本身不需要额外的CUTLASS重排副本，但设备scale、类型化bias和
+ * 后端选择状态均按Data地址与GPU缓存。张量销毁、覆盖或迁移设备前必须
+ * 删除全部对应记录，防止目标GPU复用旧卡地址或继承旧后端状态。
  *
  * @param weight 即将销毁、覆盖或迁移的权重；nullptr表示无需处理。
  */
@@ -475,13 +738,39 @@ void FastllmCudaReleaseFp8W8A8BackendState(const fastllm::Data *weight) {
 #if defined(FASTLLM_ENABLE_CUTLASS_W8A8)
     using namespace fastllm_w8a8_dense_detail;
     if (weight == nullptr) return;
-    std::lock_guard<std::mutex> guard(backendMutex);
-    for (auto it = backendStates.begin(); it != backendStates.end();) {
-        if (it->first.first == weight) {
-            it = backendStates.erase(it);
-        } else {
-            ++it;
+    {
+        std::lock_guard<std::mutex> guard(backendMutex);
+        for (auto it = backendStates.begin(); it != backendStates.end();) {
+            if (it->first.first == weight) {
+                it = backendStates.erase(it);
+            } else {
+                ++it;
+            }
         }
+    }
+    {
+        std::lock_guard<std::mutex> guard(weightCacheMutex);
+        int originalDevice = 0;
+        cudaGetDevice(&originalDevice);
+        for (auto it = weightCaches.begin(); it != weightCaches.end();) {
+            if (std::get<0>(it->first) == weight) {
+                cudaSetDevice(std::get<2>(it->first));
+                ReleaseWeightCache(it->second);
+                it = weightCaches.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = scaleCaches.begin(); it != scaleCaches.end();) {
+            if (it->first.first == weight) {
+                cudaSetDevice(it->first.second);
+                ReleaseScaleCache(it->second);
+                it = scaleCaches.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        cudaSetDevice(originalDevice);
     }
 #else
     (void)weight;
@@ -504,8 +793,9 @@ FastllmCudaFp8W8A8BackendState FastllmCudaGetFp8W8A8BackendState(
  *
  * 标准FP8权重已经是CUTLASS直接消费的[N,K]布局，因此本阶段不复制或
  * 重排权重，也不释放原始CUDA表示；这里只检查与M无关的GPU、权重形状
- * 和per-channel scale条件并记录Prepared。首次真实GEMM负责分配执行
- * scratch、同步验证内核，随后固定为Cutlass或Rejected。
+ * 和per-channel/tensorwise scale条件，预建稳定的设备scale缓存并记录
+ * Prepared。首次真实GEMM负责补齐类型化bias缓存、分配执行scratch、同步
+ * 验证内核，随后固定为Cutlass或Rejected。
  *
  * @param weight 已上传CUDA的标准FP8_E4M3二维线性权重[N,K]。
  * @return true表示权重已处于Prepared/Cutlass；false表示不是目标格式或
@@ -525,13 +815,28 @@ bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight) {
     const bool supported = Enabled() && FastllmCudaRuntimeArch() == 120 &&
         n > 0 && k > 0 && n % 8 == 0 && k % 16 == 0 &&
         weight.blockK == 1 && weight.blockM == k &&
-        weight.scales.size() == (size_t)n && weight.cudaData != nullptr;
+        (weight.scales.size() == 1 || weight.scales.size() == (size_t)n) &&
+        weight.cudaData != nullptr;
     if (!supported) {
         SetBackendState(weight, device, BackendState::Rejected);
         Trace("fallback", "weight-load backend selection rejected", 1, n, k);
         if (StrictEnabled()) {
             throw std::runtime_error(
                 "strict SM120 FP8 W8A8 weight-load selection failed");
+        }
+        return false;
+    }
+    ScaleCache *scaleCache = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(weightCacheMutex);
+        scaleCache = GetScaleCache(weight, device);
+    }
+    if (scaleCache == nullptr || scaleCache->scales == nullptr) {
+        SetBackendState(weight, device, BackendState::Rejected);
+        Trace("fallback", "weight scale cache creation failed", 1, n, k);
+        if (StrictEnabled()) {
+            throw std::runtime_error(
+                "strict SM120 FP8 W8A8 scale cache creation failed");
         }
         return false;
     }
@@ -560,8 +865,10 @@ bool FastllmCudaCutlassLinearInt8W8A8Sm90(
         (!bias.dims.empty() && (bias.dataType != fastllm::DataType::FLOAT32 ||
                                bias.cudaData == nullptr || bias.Count(0) != n))) return false;
     if (input.dataType == fastllm::DataType::FLOAT16)
-        return Execute<half, int8_t, int32_t, 127>(input, weight, bias, output, m, k, n, 90);
-    return Execute<__nv_bfloat16, int8_t, int32_t, 127>(input, weight, bias, output, m, k, n, 90);
+        return Execute<half, int8_t, cutlass::half_t, 127>(
+            input, weight, bias, output, m, k, n, 90);
+    return Execute<__nv_bfloat16, int8_t, cutlass::bfloat16_t, 127>(
+        input, weight, bias, output, m, k, n, 90);
 #else
     (void)input; (void)weight; (void)bias; (void)output; (void)m; (void)k; (void)n;
     return false;
@@ -573,7 +880,8 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
     const fastllm::Data &bias, fastllm::Data &output, int m, int k, int n) {
 #if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && defined(FASTLLM_CUTLASS_W8A8_SM120)
     using namespace fastllm_w8a8_dense_detail;
-    // 本入口只接管标准per-channel FP8权重，其他FP8布局继续交给原有后端。
+    // 本入口只接管标准FP8权重及per-channel/tensorwise scale；blockwise
+    // 等其他布局继续交给原有后端。
     if (weight.dataType != fastllm::DataType::FP8_E4M3) return false;
 
     const int device = FastllmCudaGetDevice();
@@ -599,7 +907,10 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
              output.cudaData == nullptr) failure = "CUDA tensor pointer is null";
     else if (weight.dims != std::vector<int>({n, k})) failure = "weight shape mismatch";
     else if (weight.blockK != 1 || weight.blockM != k ||
-             weight.scales.size() != (size_t)n) failure = "weight scale layout mismatch";
+             (weight.scales.size() != 1 &&
+              weight.scales.size() != (size_t)n)) {
+        failure = "weight scale layout mismatch";
+    }
     else if (input.dataType != fastllm::DataType::FLOAT16 &&
              input.dataType != fastllm::DataType::BFLOAT16) failure = "input is not FP16/BF16";
     else if (output.dataType != input.dataType) failure = "output dtype differs from input";
@@ -612,6 +923,7 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
     if (failure != nullptr) {
         Trace("fallback", failure, m, n, k);
         if (selecting) {
+            ReleaseWeightCacheForDevice(&weight, device);
             SetBackendState(weight, device, BackendState::Rejected);
             if (StrictEnabled()) {
                 throw std::runtime_error(
@@ -623,9 +935,10 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
     }
 
     const bool ok = input.dataType == fastllm::DataType::FLOAT16
-        ? Execute<half, cutlass::float_e4m3_t, float, 448>(
+        ? Execute<half, cutlass::float_e4m3_t, cutlass::half_t, 448>(
               input, weight, bias, output, m, k, n, 120)
-        : Execute<__nv_bfloat16, cutlass::float_e4m3_t, float, 448>(
+        : Execute<__nv_bfloat16, cutlass::float_e4m3_t,
+                  cutlass::bfloat16_t, 448>(
               input, weight, bias, output, m, k, n, 120);
 
     // CUDA调用异步返回。后端只在首次真实GEMM同步验证成功后固定，避免
@@ -645,6 +958,7 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
              "injected CUTLASS GEMM failure");
         Trace("fallback", reason, m, n, k);
         if (selecting) {
+            ReleaseWeightCacheForDevice(&weight, device);
             SetBackendState(weight, device, BackendState::Rejected);
             if (StrictEnabled()) {
                 throw std::runtime_error(
