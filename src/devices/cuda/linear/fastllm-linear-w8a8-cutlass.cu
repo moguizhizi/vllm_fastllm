@@ -215,13 +215,18 @@ __global__ void ApplyScales(const Accumulator *accumulator,
                             const float *channelScales,
                             const float *bias, Output *output,
                             int rows, int cols) {
-    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t count = (size_t)rows * cols;
-    if (index >= count) return;
-    int row = index / cols, col = index % cols;
-    float value = (float)accumulator[index] * tokenScales[row] * channelScales[col];
-    if (bias != nullptr) value += bias[col];
-    output[index] = Output(value);
+    // 启动端会限制block数量，避免大M/N时产生过大的grid。必须使用
+    // grid-stride循环覆盖剩余元素，否则当rows * cols超过单轮容量时，
+    // 尾部整行会保持未写入状态，例如M=257、N=4096的最后一行。
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < count; index += (size_t)blockDim.x * gridDim.x) {
+        int row = index / cols, col = index % cols;
+        float value = (float)accumulator[index] * tokenScales[row] *
+                      channelScales[col];
+        if (bias != nullptr) value += bias[col];
+        output[index] = Output(value);
+    }
 }
 
 template <typename Kernel>
