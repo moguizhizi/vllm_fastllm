@@ -155,8 +155,11 @@ NVFP4_GPU_PROFILE=preblackwell test/nvfp4/run_nvfp4_tests.sh ops
 ```
 
 forward_check 只使用 vLLM 作为参考实现。vLLM 和 FastLLM 在两个独立进程中依次
-加载同一个 NVFP4 模型，避免两份模型同时占用显存；检查输入 token、贪心生成 token、
-首 token 以及 top-k logprob。运行环境必须能 `import vllm`。若 vLLM 安装在另一个
+加载同一个 NVFP4 模型，避免两份模型同时占用显存。默认功能模式要求输入
+token、首个生成 token 一致且 top-k 重合率达标；首 token logprob 差仍会输出，
+但超阈值只记录 `WARN`。显式传入 `--strict-alignment` 时，才要求首 token
+logprob 差不超过 `--max-first-logprob-diff`（默认 0.1）。运行环境必须能
+`import vllm`。若 vLLM 安装在另一个
 Python 环境，用 `NVFP4_VLLM_PYTHON` 指定：
 
 ```bash

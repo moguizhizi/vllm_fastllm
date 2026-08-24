@@ -53,12 +53,18 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-perf" \
 
 forward_check：
 
+默认执行功能判定：输入Prompt和首Token必须一致，Top10重合率必须不低于
+0.8。首Token logprob差仍会打印，但超过0.1时只警告，不会使功能测试失败。
+
 ```bash
 W8A8_MODEL=/root/autodl-tmp/neuralmagic/Qwen2___5-7B-FP8-dynamic \
 W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
 W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-forward" \
   test/w8a8/run_w8a8_tests.sh forward
 ```
+
+需要严格数值对齐时，直接执行共享入口并增加
+`--strict-alignment`；此时首Token logprob差超过0.1会使测试失败。
 
 整体模型性能（相同HTTP接口、相同Token ID，生成FastLLM/vLLM对比表）：
 

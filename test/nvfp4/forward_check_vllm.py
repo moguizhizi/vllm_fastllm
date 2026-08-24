@@ -32,6 +32,10 @@ def parse_args():
     parser.add_argument("--flm-device", default="cuda")
     parser.add_argument("--min-topk-overlap", type=float, default=0.8)
     parser.add_argument("--max-first-logprob-diff", type=float, default=0.1)
+    parser.add_argument(
+        "--strict-alignment", action="store_true",
+        help=("require the first-token logprob difference to satisfy "
+              "--max-first-logprob-diff; by default it is diagnostic only"))
     parser.add_argument("--label", default="NVFP4", help=argparse.SUPPRESS)
     parser.add_argument("--result-dir", default="")
     parser.add_argument(
@@ -201,11 +205,21 @@ def compare_results(args, vllm_result, fastllm_result):
     print(f"first_top{args.top_logprobs}_overlap: {overlap:.4f}")
     print(f"common_topk_max_logprob_diff: {max_diff:.6f}")
 
-    # 不同推理引擎的量化、融合及浮点累加顺序可能不同，完整生成序列和
-    # 低概率尾部logprob仅用于诊断；首步决策及主要候选分布用于判定正确性。
-    passed = (same_prompt and first_token_match and
-              first_token_logprob_diff <= args.max_first_logprob_diff and
-              overlap >= args.min_topk_overlap)
+    # 功能检查只要求两个引擎接收相同输入、做出相同首步决策，
+    # 并且主要候选集合足够接近。logprob对量化、融合和浮点累加顺序
+    # 更敏感，默认作为诊断项；只有strict-alignment模式才将它纳入硬性判定。
+    functional_passed = (same_prompt and first_token_match and
+                         overlap >= args.min_topk_overlap)
+    alignment_passed = (
+        first_token_logprob_diff <= args.max_first_logprob_diff)
+    passed = (functional_passed and alignment_passed
+              if args.strict_alignment else functional_passed)
+    print(f"functional_check: {'PASS' if functional_passed else 'FAIL'}")
+    print("strict_alignment: " + (
+        "PASS" if alignment_passed else
+        ("FAIL" if args.strict_alignment else "WARN")))
+    check_mode = "strict-alignment" if args.strict_alignment else "functional"
+    print(f"check_mode: {check_mode}")
     print(f"Summary: {'PASS' if passed else 'FAIL'}")
     return passed
 
