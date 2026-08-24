@@ -2210,6 +2210,8 @@ namespace {
         bool checkWarmupFallback = false;
         bool checkDeviceMove = false;
         bool checkFusionSeparation = false;
+        fastllm::LinearQuantScheme quantScheme =
+            fastllm::LinearQuantScheme::LEGACY_AUTO;
         fastllm::DataType inputType = fastllm::DataType::FLOAT16;
         std::vector<float> inputValues;
         std::vector<float> biasValues;
@@ -2229,6 +2231,15 @@ namespace {
             checkWarmupFallback = params.GetInt("check_warmup_fallback") != 0;
             checkDeviceMove = params.GetInt("check_device_move") != 0;
             checkFusionSeparation = params.GetInt("check_fusion_separation") != 0;
+            const std::string scheme = params.GetString("quant_scheme");
+            if (scheme == "w4a4") {
+                quantScheme = fastllm::LinearQuantScheme::NVFP4_W4A4;
+            } else if (scheme == "w4a16") {
+                quantScheme = fastllm::LinearQuantScheme::NVFP4_W4A16;
+            } else if (scheme != "auto") {
+                throw std::runtime_error(
+                    "linear_nvfp4 quant_scheme must be auto, w4a4 or w4a16");
+            }
             const std::string dtype = params.GetString("input_type");
             inputType = dtype == "bf16" ? fastllm::DataType::BFLOAT16
                                          : fastllm::DataType::FLOAT16;
@@ -2280,6 +2291,7 @@ namespace {
             weight.blockM = 16;
             weight.blockK = 1;
             weight.weightType = fastllm::WeightType::LINEAR;
+            weight.linearQuantScheme = quantScheme;
             weight.UpdateUnitSize();
             weight.Resize({out, in});
             weight.Allocate(true);
@@ -2505,7 +2517,7 @@ namespace {
     static OpCase MakeLinearNvfp4Case() {
         OpCase result{
             "linear_nvfp4",
-            "NVFP4 dense: native W4A4 on SM100+, Marlin W4A16 on SM75-SM99",
+            "NVFP4 dense: native W4A4 CUTLASS or weight-only Marlin W4A16",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "rows; W4A4 and Marlin support decode M=1");
@@ -2513,6 +2525,7 @@ namespace {
                 params.Add("out", "1000", "output features; CUTLASS pads to 32 and slices");
                 params.Add("bias", "1", "add FP32 bias after W4A4 GEMM");
                 params.Add("input_type", "fp16", "fp16 or bf16; Marlin accepts fp16 only");
+                params.Add("quant_scheme", "auto", "auto, w4a4 or w4a16");
                 params.Add("check_release", "0", "require W4A4 to release the original CUDA weight");
                 params.Add("check_fixed_backend", "0", "verify inference cannot switch a warmed CUTLASS backend");
                 params.Add("check_warmup_fallback", "0", "force first GEMM validation failure and verify legacy remains fixed");

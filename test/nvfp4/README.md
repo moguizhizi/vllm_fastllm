@@ -12,7 +12,7 @@
 | 动态激活 FP4 | SM100 或 SM120-SM129；FP16/BF16 输入；列数为 16 的倍数；dense 正式入口还受上述 K/N、M 条件约束 |
 | SwiGLU+FP4 融合 | SM100 或 SM120-SM129；FP16/BF16 gate/up；hidden 为 16 的倍数；已接入 Dense `SwigluLinearAdd` 和 grouped MoE |
 | grouped MoE W4A4 | CUDA 12.8+；SM100-SM119支持FP16/BF16，SM120-SM129支持BF16；SwiGLU/GeGLU；仅 `NVFP4_BLOCK_16` routed experts；hidden/inter 为32的倍数；expert数1-256；batch>=1默认优先使用grouped路径；shared expert由正式Dense Linear路径单独计算后累加；不支持EP |
-| dense Marlin W4A16 | SM75-SM99；FP16 输入/输出；权重 `NVFP4_BLOCK_16`、blockM=16；无 bias；M>=1；K/N 为 64 的倍数 |
+| dense Marlin W4A16 | SM75+；FP16 输入/输出；权重 `NVFP4_BLOCK_16`、blockM=16；无 bias；M>=1；K/N 为 64 的倍数 |
 
 环境变量：
 
@@ -112,7 +112,7 @@ NVFP4_LOG_DIR="$PWD/test/nvfp4/logs/swiglu-versions-$(date -u +%Y%m%dT%H%M%SZ)" 
 - grouped MoE W4A4：`RedHatAI/Qwen3-30B-A3B-NVFP4`；模型卡明确给出vLLM
   离线用法，Qwen3-MoE也由FastLLM支持。单卡约18GB权重，优先在RTX 5090
   （SM120）验证，再在B200/B300（SM100）做架构交叉验证。
-- Marlin W4A16：`nm-testing/fp4_nvfp4a16-e2e`；A100、H100、RTX 4090 等 SM75-SM99 GPU。
+- Marlin W4A16：`nm-testing/fp4_nvfp4a16-e2e`；SM75及以上GPU。
 
 先由有对应 GPU 的机器完成构建。本次代码迁移按要求不在本机编译。
 

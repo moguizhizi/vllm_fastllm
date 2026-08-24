@@ -68,6 +68,13 @@ run_build() {
 
 run_ops_functional() {
     if [[ "${gpu_profile}" == sm100 || "${gpu_profile}" == sm120 ]]; then
+        run_logged op_dense_marlin_w4a16_explicit env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=8 --param in=1024 --param out=1024 \
+            --param bias=0 --param input_type=fp16 \
+            --param quant_scheme=w4a16 \
+            --warmup 0 --iters 1 --atol 0.05 --rtol 0.05
         run_logged op_dense_w4a4_decode_padding_bias env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             FASTLLM_CUDA_NVFP4_W4A4=1 \
@@ -181,13 +188,15 @@ run_ops_functional() {
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=8 --param in=1024 --param out=1024 \
-            --param bias=0 --param input_type=fp16 --warmup 0 --iters 1 \
+            --param bias=0 --param input_type=fp16 \
+            --param quant_scheme=w4a16 --warmup 0 --iters 1 \
             --atol 0.05 --rtol 0.05
         run_logged op_dense_marlin_w4a16_decode env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=1 --param in=1024 --param out=1024 \
-            --param bias=0 --param input_type=fp16 --warmup 0 --iters 1 \
+            --param bias=0 --param input_type=fp16 \
+            --param quant_scheme=w4a16 --warmup 0 --iters 1 \
             --atol 0.05 --rtol 0.05
     fi
 }
@@ -250,7 +259,8 @@ run_ops_performance() {
         run_logged op_dense_marlin_w4a16_perf env \
             "${optest}" --op linear_nvfp4 --device cuda:0 \
             --param batch=8 --param in=1024 --param out=1024 \
-            --param bias=0 --param input_type=fp16 --warmup 20 --iters 200 \
+            --param bias=0 --param input_type=fp16 \
+            --param quant_scheme=w4a16 --warmup 20 --iters 200 \
             --atol 0.05 --rtol 0.05
     fi
     run_logged ops_performance_report python test/nvfp4/performance_report.py \
