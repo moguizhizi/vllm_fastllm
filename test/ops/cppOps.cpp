@@ -3180,10 +3180,12 @@ namespace {
                 InitSeparateScaleWeight(weight, out, in, block, 0.7f);
             } else if (weightLayout == "perchannel") {
                 InitPerChannelWeight(weight, out, in, 0.7f);
+                weight.linearQuantScheme = fastllm::LinearQuantScheme::FP8_W8A8;
             } else if (weightLayout == "tensorwise") {
                 InitPerChannelWeight(weight, out, in, 0.7f);
                 weight.scales.assign(1, 0.0075f);
                 weight.perChannelAxis = -1;
+                weight.linearQuantScheme = fastllm::LinearQuantScheme::FP8_W8A8;
             } else {
                 throw std::runtime_error(
                     "weight_layout must be packed, separate, perchannel or tensorwise");
