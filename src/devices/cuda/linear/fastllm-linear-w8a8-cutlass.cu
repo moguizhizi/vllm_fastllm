@@ -393,6 +393,35 @@ bool Dispatch(int arch, Element const *a, Element const *b, Accumulator *d,
     return false;
 }
 
+/**
+ * 执行一次动态量化W8A8线性计算。
+ *
+ * 本函数只负责单次计算，不决定固定后端的生命周期，也不主动同步CUDA
+ * Stream。执行流程为：取得当前GPU可复用的临时区，准备权重的per-channel
+ * scale与可选bias，将输入逐token动态量化为Quant，调用对应架构的CUTLASS
+ * GEMM生成Accumulator结果，最后乘回输入和权重scale、叠加bias并写入输出。
+ * kernel提交后的异步错误由外层首次后端选择同步检查。
+ *
+ * 数学语义为output[M,N] = input[M,K] * weight[N,K]^T + bias[N]。
+ * input和output为FP16或BF16；weight为CUTLASS直接消费的行主序量化权重；
+ * 激活scale采用per-token布局[M]，权重scale采用per-channel布局[N]。
+ *
+ * @tparam Input       输入和最终输出对应的CUDA标量类型。
+ * @tparam Quant       激活及权重参与GEMM时使用的量化标量类型。
+ * @tparam Accumulator CUTLASS GEMM累加结果类型。
+ * @tparam MaxValue    动态量化计算scale时采用的Quant最大有限值。
+ * @param input        CUDA输入张量，逻辑形状为[m, k]。
+ * @param weight       CUDA量化权重，逻辑形状为[n, k]；其附加显存保存
+ *                     per-channel scale和bias。
+ * @param bias         可选偏置，逻辑形状为[n]；为空时不执行偏置加法。
+ * @param output       CUDA输出张量，逻辑形状为[m, n]。
+ * @param m            GEMM的M维，通常为本次处理的token数。
+ * @param k            GEMM的K维，即输入特征数。
+ * @param n            GEMM的N维，即输出特征数。
+ * @param arch         当前GPU计算能力，例如SM120传120。
+ * @return true表示量化、GEMM和缩放写回均已成功提交；false表示临时区、
+ *         scale/bias准备、CUTLASS分派或CUDA kernel启动失败。
+ */
 template <typename Input, typename Quant, typename Accumulator, int MaxValue>
 bool Execute(const fastllm::Data &input, fastllm::Data &weight,
              const fastllm::Data &bias, fastllm::Data &output,
