@@ -191,7 +191,9 @@ NVFP4_MODEL=/models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
 需要定位Decode差距来自GPU算子还是引擎调度时，使用独立的Nsight Systems
 入口。每个Batch先完成相同Prompt的warmup和Prefix Cache填充，再采集一轮
 BEST模式请求；模型加载和Cold Prefill不进入报告。默认输出各Batch的TPOT、
-GPU kernel总时间与数量、显存操作、算子类别和Top Kernel：
+请求P50/P95、Batch吞吐、按Decode步归一化的GPU kernel时间与数量、GPU时间线
+内部空隙、显存操作、算子类别和Top Kernel。未返回缓存统计的后端会标为
+“未报告”，不会误写成缓存未命中：
 
 ```bash
 python test/nvfp4/decode_nsys_compare.py \

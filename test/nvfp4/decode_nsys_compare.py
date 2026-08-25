@@ -22,14 +22,6 @@ import model_performance_compare as model_compare  # noqa: E402
 
 
 BACKENDS = ("fastllm", "vllm")
-KERNEL_CATEGORIES = (
-    ("GEMM/Linear", ("gemm", "cutlass", "scaled_mm", "marlin", "matmul")),
-    ("Attention", ("attention", "flash", "fmha", "fused_attn", "mla")),
-    ("Sampling", ("sampling", "sample", "topk", "top_k", "topp", "top_p")),
-    ("Quantize", ("quant", "fp8", "nvfp4", "float4")),
-    ("Norm", ("rmsnorm", "rms_norm", "layernorm", "layer_norm")),
-    ("KV Cache", ("kv_cache", "paged", "reshape_and_cache", "cache_kernel")),
-)
 
 
 def parse_args():
@@ -298,6 +290,19 @@ def numeric(row, names):
     return 0.0
 
 
+def percentile(values, percent):
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * percent / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
 def text_value(row, names):
     for name in names:
         value = row.get(name)
@@ -331,10 +336,76 @@ def summarize_named_rows(rows):
 
 def kernel_category(name):
     lowered = name.lower()
-    for category, patterns in KERNEL_CATEGORIES:
-        if any(pattern in lowered for pattern in patterns):
-            return category
+    # 分类必须先识别语义明确的kernel，不能看到字符串"cutlass"就认为是
+    # GEMM：FlashAttention模板参数也包含cutlass类型，Triton融合kernel名称
+    # 则可能同时出现scaled_mm、RMSNorm、SwiGLU和量化。
+    if any(pattern in lowered for pattern in (
+            "qkvrmsnormropesplit", "fused_add_rms_norm")):
+        return "Fused"
+    if any(pattern in lowered for pattern in (
+            "reshape_and_cache", "pagedcachecopy", "appendpagedcache",
+            "kv_cache", "cache_kernel", "gather_block_tables")):
+        return "KV Cache"
+    if any(pattern in lowered for pattern in (
+            "flash_fwd", "flashinfer::batchprefill", "attention", "fmha",
+            "fused_attn", "persistentvariablelengthmergestates",
+            "flashmla", "mla::")):
+        return "Attention"
+    if any(pattern in lowered for pattern in (
+            "gumbel", "sampling", "sample_kernel", "topk", "top_k", "topp",
+            "top_p", "argmax", "layernormkerneltop1", "resetlogitsofeos")):
+        return "Sampling"
+    semantic_markers = sum(pattern in lowered for pattern in (
+        "scaled_mm", "rms_norm", "rmsnorm", "silu", "swiglu", "quant",
+        "embedding", "rope"))
+    if "triton" in lowered and semantic_markers >= 2:
+        return "Fused"
+    if any(pattern in lowered for pattern in (
+            "quantize", "scaled_fp8_quant", "nvfp4quant", "float4quant")):
+        return "Quantize"
+    if any(pattern in lowered for pattern in (
+            "rmsnorm", "rms_norm", "layernorm", "layer_norm")):
+        return "Norm"
+    if any(pattern in lowered for pattern in (
+            "swiglu", "silu", "gelu", "activation")):
+        return "Activation"
+    if any(pattern in lowered for pattern in (
+            "gemmkernel", "gemm::kernel", "gemv", "scaled_mm",
+            "matmul", "marlin", "kernel2<cutlass")):
+        return "GEMM/Linear"
     return "Other"
+
+
+def summarize_gpu_timeline(rows):
+    intervals = []
+    for row in rows:
+        start = numeric(row, ("Start (ns)", "Start"))
+        duration = numeric(row, ("Duration (ns)", "Duration"))
+        if duration > 0:
+            intervals.append((start, start + duration))
+    if not intervals:
+        return {
+            "event_count": 0, "span_ms": 0.0, "active_ms": 0.0,
+            "idle_ms": 0.0, "idle_ratio": None,
+        }
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    span_ns = max(end for _, end in intervals) - min(
+        start for start, _ in intervals)
+    active_ns = sum(end - start for start, end in merged)
+    idle_ns = max(0.0, span_ns - active_ns)
+    return {
+        "event_count": len(intervals),
+        "span_ms": span_ns / 1e6,
+        "active_ms": active_ns / 1e6,
+        "idle_ms": idle_ns / 1e6,
+        "idle_ratio": idle_ns / span_ns if span_ns > 0 else 0.0,
+    }
 
 
 def summarize_report(args, report, output_base):
@@ -347,9 +418,13 @@ def summarize_report(args, report, output_base):
     memory_csv = export_stats(
         args, report, "cuda_gpu_mem_time_sum", output_base.with_name(
             output_base.name + "-memory"))
+    timeline_csv = export_stats(
+        args, report, "cuda_gpu_trace", output_base.with_name(
+            output_base.name + "-gpu-trace"))
     kernels = summarize_named_rows(read_stats_csv(kernel_csv))
     apis = summarize_named_rows(read_stats_csv(api_csv))
     memory = summarize_named_rows(read_stats_csv(memory_csv))
+    timeline = summarize_gpu_timeline(read_stats_csv(timeline_csv))
     categories = {}
     for item in kernels:
         category = kernel_category(item["name"])
@@ -362,9 +437,11 @@ def summarize_report(args, report, output_base):
         "kernel_csv": str(kernel_csv),
         "cuda_api_csv": str(api_csv),
         "memory_csv": str(memory_csv),
+        "timeline_csv": str(timeline_csv),
         "kernel_total_ms": sum(item["total_ms"] for item in kernels),
         "kernel_instances": sum(item["instances"] for item in kernels),
         "memory_total_ms": sum(item["total_ms"] for item in memory),
+        "timeline": timeline,
         "categories": categories,
         "top_kernels": kernels[:args.top_kernels],
         "top_cuda_apis": apis[:10],
@@ -394,6 +471,40 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                 "decode")
             report = stop_collection(args, server["session"], output_base)
             summary = summarize_report(args, report, output_base)
+            # 第一个输出Token属于Prefill结束点；之后每个Token才对应一次稳定
+            # Decode迭代。按decode步数归一化后，才能比较不同batch下每步的
+            # kernel数量与GPU时间，而不会把请求长度误认为算子变慢。
+            decode_steps = max(args.output_tokens - 1, 1)
+            request_tpots_ms = []
+            request_e2els_ms = []
+            for request in request_result["requests"]:
+                token_times = request["token_times"]
+                request_e2els_ms.append(
+                    (request["end_time"] - request["start_time"]) * 1000)
+                if len(token_times) > 1:
+                    request_tpots_ms.append(
+                        (request["end_time"] - token_times[0]) * 1000 /
+                        (len(token_times) - 1))
+            summary["decode_steps"] = decode_steps
+            summary["kernel_ms_per_decode_step"] = (
+                summary["kernel_total_ms"] / decode_steps)
+            summary["kernel_instances_per_decode_step"] = (
+                summary["kernel_instances"] / decode_steps)
+            summary["memory_ms_per_decode_step"] = (
+                summary["memory_total_ms"] / decode_steps)
+            for value in summary["categories"].values():
+                value["total_ms_per_decode_step"] = (
+                    value["total_ms"] / decode_steps)
+                value["instances_per_decode_step"] = (
+                    value["instances"] / decode_steps)
+            timeline = summary["timeline"]
+            timeline["span_ms_per_decode_step"] = (
+                timeline["span_ms"] / decode_steps)
+            timeline["active_ms_per_decode_step"] = (
+                timeline["active_ms"] / decode_steps)
+            timeline["idle_ms_per_decode_step"] = (
+                timeline["idle_ms"] / decode_steps)
+            cache_ratio = request_result["cache_hit_ratio"]
             row = {
                 "backend": backend,
                 "batch": batch,
@@ -404,7 +515,14 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                             request_result["tpot_s"] * 1000),
                 "itl_ms": (None if request_result["itl_s"] is None else
                            request_result["itl_s"] * 1000),
-                "cache_hit_ratio": request_result["cache_hit_ratio"],
+                "request_tpot_p50_ms": percentile(request_tpots_ms, 50),
+                "request_tpot_p95_ms": percentile(request_tpots_ms, 95),
+                "request_e2el_p50_ms": percentile(request_e2els_ms, 50),
+                "request_e2el_p95_ms": percentile(request_e2els_ms, 95),
+                "output_tok_s": request_result["output_tok_s"],
+                "cache_hit_ratio": cache_ratio,
+                "cache_status": ("reported" if cache_ratio is not None else
+                                 "unreported"),
                 "nsys": summary,
             }
             (case_dir / "result.json").write_text(
@@ -413,6 +531,7 @@ def profile_backend(args, backend, batches, prompts, result_dir):
             print(json.dumps({
                 "backend": backend, "batch": batch,
                 "tpot_ms": row["tpot_ms"],
+                "output_tok_s": row["output_tok_s"],
                 "kernel_total_ms": summary["kernel_total_ms"],
                 "kernel_instances": summary["kernel_instances"],
             }, ensure_ascii=False), flush=True)
@@ -431,32 +550,98 @@ def make_report(result_dir, rows, top_count):
         "# FastLLM / vLLM Decode Nsight Systems对比", "",
         "> 每个Batch先使用同一Prompt完成warmup及Prefix Cache填充，再采集一次",
         "> BEST模式HTTP请求。报告包含请求调度、缓存命中和稳定Decode；Nsight",
-        "> 会扰动绝对延迟，正式TPOT仍应以非Profiler性能脚本为准。", "",
-        "## 总览", "",
-        "| Batch | 后端 | TPOT(ms) | ITL(ms) | 请求Wall(ms) | GPU Kernel(ms) | "
-        "Kernel数 | MemOp(ms) | Cache命中 |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "> 会扰动绝对延迟，正式TPOT仍应以非Profiler性能脚本为准。",
+        "> GPU时间线空闲只统计首个与最后一个GPU事件之间的内部空隙；",
+        "> 第一个输出Token属于Prefill，逐步指标按`output_tokens - 1`归一化。", "",
+        "## 引擎指标", "",
+        "| Batch | 后端 | 平均TPOT(ms) | 请求TPOT P50(ms) | 请求TPOT P95(ms) | "
+        "ITL(ms) | 请求E2EL P50(ms) | 请求E2EL P95(ms) | Batch Wall(ms) | "
+        "Output(tok/s) | Cache命中 |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "---: | --- |",
     ]
     for row in rows:
-        nsys = row["nsys"]
         cache = row["cache_hit_ratio"]
+        cache_text = ("未报告" if row["cache_status"] == "unreported" else
+                      f"{cache * 100:.1f}%")
         lines.append(
             f"| {row['batch']} | {row['backend']} | {fmt(row['tpot_ms'])} | "
-            f"{fmt(row['itl_ms'])} | {fmt(row['request_wall_ms'])} | "
-            f"{fmt(nsys['kernel_total_ms'])} | {nsys['kernel_instances']} | "
-            f"{fmt(nsys['memory_total_ms'])} | "
-            f"{'n/a' if cache is None else f'{cache * 100:.1f}%'} |")
+            f"{fmt(row['request_tpot_p50_ms'])} | "
+            f"{fmt(row['request_tpot_p95_ms'])} | {fmt(row['itl_ms'])} | "
+            f"{fmt(row['request_e2el_p50_ms'])} | "
+            f"{fmt(row['request_e2el_p95_ms'])} | "
+            f"{fmt(row['request_wall_ms'])} | {fmt(row['output_tok_s'], 2)} | "
+            f"{cache_text} |")
+
+    lines.extend([
+        "", "## GPU时间线", "",
+        "| Batch | 后端 | Decode步数 | Kernel(ms/步) | Kernel数/步 | "
+        "MemOp(ms/步) | GPU跨度(ms/步) | GPU活跃(ms/步) | "
+        "GPU内部空闲(ms/步) | 空闲占比 |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in rows:
+        nsys = row["nsys"]
+        timeline = nsys["timeline"]
+        idle_ratio = timeline["idle_ratio"]
+        lines.append(
+            f"| {row['batch']} | {row['backend']} | {nsys['decode_steps']} | "
+            f"{fmt(nsys['kernel_ms_per_decode_step'])} | "
+            f"{fmt(nsys['kernel_instances_per_decode_step'], 2)} | "
+            f"{fmt(nsys['memory_ms_per_decode_step'])} | "
+            f"{fmt(timeline['span_ms_per_decode_step'])} | "
+            f"{fmt(timeline['active_ms_per_decode_step'])} | "
+            f"{fmt(timeline['idle_ms_per_decode_step'])} | "
+            f"{'n/a' if idle_ratio is None else f'{idle_ratio * 100:.1f}%'} |")
+
+    by_case = {(row["batch"], row["backend"]): row for row in rows}
+    paired_batches = sorted({
+        row["batch"] for row in rows
+        if (row["batch"], "fastllm") in by_case and
+        (row["batch"], "vllm") in by_case
+    })
+    if paired_batches:
+        lines.extend([
+            "", "## FastLLM / vLLM比值", "",
+            "> 延迟比小于1表示FastLLM更快；吞吐比大于1表示FastLLM更快。", "",
+            "| Batch | TPOT比 | Batch Wall比 | Output吞吐比 | "
+            "Kernel时间/步比 | GPU内部空闲/步比 |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for batch in paired_batches:
+            fast = by_case[(batch, "fastllm")]
+            vllm = by_case[(batch, "vllm")]
+
+            def ratio(left, right):
+                if left is None or right is None or right == 0:
+                    return None
+                return left / right
+
+            def ratio_text(left, right):
+                value = ratio(left, right)
+                return "n/a" if value is None else f"{value:.3f}x"
+
+            lines.append(
+                f"| {batch} | {ratio_text(fast['tpot_ms'], vllm['tpot_ms'])} | "
+                f"{ratio_text(fast['request_wall_ms'], vllm['request_wall_ms'])} | "
+                f"{ratio_text(fast['output_tok_s'], vllm['output_tok_s'])} | "
+                f"{ratio_text(fast['nsys']['kernel_ms_per_decode_step'], vllm['nsys']['kernel_ms_per_decode_step'])} | "
+                f"{ratio_text(fast['nsys']['timeline']['idle_ms_per_decode_step'], vllm['nsys']['timeline']['idle_ms_per_decode_step'])} |")
 
     lines.extend(["", "## 算子类别", "",
-                  "| Batch | 后端 | 类别 | GPU时间(ms) | Kernel数 |",
-                  "| ---: | --- | --- | ---: | ---: |"])
+                  "| Batch | 后端 | 类别 | GPU总时间(ms) | GPU时间(ms/步) | "
+                  "Kernel总数 | Kernel数/步 |",
+                  "| ---: | --- | --- | ---: | ---: | ---: | ---: |"])
     for row in rows:
         for category, value in sorted(
                 row["nsys"]["categories"].items(),
                 key=lambda item: item[1]["total_ms"], reverse=True):
             lines.append(
                 f"| {row['batch']} | {row['backend']} | {category} | "
-                f"{value['total_ms']:.3f} | {value['instances']} |")
+                f"{value['total_ms']:.3f} | "
+                f"{value['total_ms_per_decode_step']:.3f} | "
+                f"{value['instances']} | "
+                f"{value['instances_per_decode_step']:.2f} |")
 
     for row in rows:
         lines.extend([

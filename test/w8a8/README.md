@@ -79,8 +79,10 @@ Decode性能归因使用独立的`decode_nsys_compare.py`。它让两个后端�
 同一模型；每个Batch先用同一Prompt完成CUDA Graph、shape和Prefix Cache
 warmup，再由Nsight Systems只采集一轮BEST模式HTTP请求。默认覆盖
 batch=1/2/4/8/16/32，并输出GPU kernel、CUDA API、显存操作、按名称推断的
-算子类别以及Top Kernel表。Nsight会扰动绝对延迟，因此报告用于解释时间
-构成，正式TPOT仍以`model-performance`结果为准。
+算子类别以及Top Kernel表。报告同时提供请求P50/P95、Batch吞吐、按稳定
+Decode步归一化的GPU时间和kernel数，以及GPU事件跨度内的空闲时间；未返回
+缓存统计时明确标记为“未报告”。Nsight会扰动绝对延迟，因此报告用于解释
+时间构成，正式TPOT仍以`model-performance`结果为准。
 
 ```bash
 python test/w8a8/decode_nsys_compare.py \
