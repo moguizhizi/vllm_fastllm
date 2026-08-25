@@ -37,6 +37,15 @@ def parse_args():
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--output-tokens", type=int, default=64)
     parser.add_argument("--warmup-output-tokens", type=int, default=8)
+    parser.add_argument(
+        "--prefix-cache-padding-tokens", type=int, default=128,
+        help="Warmup Prompt在正式Prompt之后追加的Token数，用于缓存正式Prompt的最后一页")
+    parser.add_argument(
+        "--collection-ready-timeout", type=float, default=30.0,
+        help="等待Nsight会话进入Collection状态的超时时间（秒）")
+    parser.add_argument(
+        "--collection-ready-delay", type=float, default=1.0,
+        help="Nsight进入Collection状态后、发送正式请求前额外等待的时间（秒）")
     parser.add_argument("--vllm-python", default=os.environ.get(
         "NVFP4_VLLM_PYTHON", sys.executable))
     parser.add_argument("--fastllm-python", default=sys.executable)
@@ -239,6 +248,27 @@ def start_collection(args, session, output_base):
         raise RuntimeError(f"nsys start失败：\n{result.stdout}")
 
 
+def wait_collection_ready(args, session):
+    """等待Nsight真正进入采集状态，避免遗漏短暂的Prefill开头。"""
+    deadline = time.time() + args.collection_ready_timeout
+    last_output = ""
+    while time.time() < deadline:
+        result = subprocess.run(
+            [str(args.nsys), "sessions", "list"], cwd=REPO_DIR,
+            env=nsys_control_env(), check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        last_output = result.stdout or ""
+        if (result.returncode == 0 and session in last_output and
+                re.search(r"\bCollection\b", last_output)):
+            # Collection状态表示控制面已切换；再留出少量时间，让目标进程的
+            # CUDA追踪完成挂接，然后才发送本次需要统计的HTTP请求。
+            time.sleep(args.collection_ready_delay)
+            return
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"等待Nsight会话{session}进入Collection状态超时：\n{last_output}")
+
+
 def stop_collection(args, session, output_base):
     result = run_command(
         [args.nsys, "stop", f"--session={session}"],
@@ -256,6 +286,18 @@ def run_decode_batch(server, prompt, output_tokens, batch, args, workload):
         server["base_url"], server["served_name"], server["backend"],
         "best", "cache_hit", workload, prompt, output_tokens, batch,
         args.request_timeout)
+
+
+def make_cache_warmup_prompt(prompt, padding_tokens):
+    """构造以正式Prompt为完整前缀的加长Prompt，使最后一个Prefix页可缓存。"""
+    if not prompt:
+        raise ValueError("Decode Nsight Prompt不能为空")
+    if padding_tokens <= 0:
+        return list(prompt)
+    # 复用Prompt中已有的有效Token ID，避免依赖不同Tokenizer的特殊Token。
+    padding_source = prompt[-min(len(prompt), padding_tokens):]
+    repeats = (padding_tokens + len(padding_source) - 1) // len(padding_source)
+    return list(prompt) + (padding_source * repeats)[:padding_tokens]
 
 
 def export_stats(args, report, report_name, output_base):
@@ -459,17 +501,35 @@ def profile_backend(args, backend, batches, prompts, result_dir):
             case_dir = backend_dir / f"batch-{batch}"
             case_dir.mkdir(parents=True, exist_ok=True)
             prompt = prompts[batch]
-            # 使用同一批请求完成CUDA Graph/shape warmup并建立Prefix Cache；采集
-            # 窗口中的请求因此以稳定Decode为主，而不是模型加载或Cold Prefill。
+            cache_warmup_prompt = make_cache_warmup_prompt(
+                prompt, args.prefix_cache_padding_tokens)
+            if (len(cache_warmup_prompt) + args.warmup_output_tokens >
+                    args.max_model_len):
+                raise ValueError(
+                    "加长后的Prefix Cache Warmup超过max-model-len："
+                    f"{len(cache_warmup_prompt)} + "
+                    f"{args.warmup_output_tokens} > {args.max_model_len}")
+            # Warmup Prompt把正式Prompt作为完整前缀，并在末尾追加一个Cache
+            # 页。这样正式Prompt的最后一页也能复用，避免Decode报告混入
+            # 一个未命中的Prefill尾块。
             run_decode_batch(
-                server, prompt, args.warmup_output_tokens, batch, args,
+                server, cache_warmup_prompt,
+                args.warmup_output_tokens, batch, args,
                 "warmup")
             output_base = case_dir / "decode"
             start_collection(args, server["session"], output_base)
+            wait_collection_ready(args, server["session"])
             request_result = run_decode_batch(
                 server, prompt, args.output_tokens, batch, args,
                 "decode")
             report = stop_collection(args, server["session"], output_base)
+            cache_ratio = request_result["cache_hit_ratio"]
+            if (backend == "fastllm" and
+                    (cache_ratio is None or cache_ratio < 0.999)):
+                actual = "未报告" if cache_ratio is None else f"{cache_ratio:.1%}"
+                raise RuntimeError(
+                    "FastLLM Decode Nsight采集要求Prefix Cache完全命中，"
+                    f"实际为{actual}；请检查Cache页大小和Warmup Prompt。")
             summary = summarize_report(args, report, output_base)
             # 第一个输出Token属于Prefill结束点；之后每个Token才对应一次稳定
             # Decode迭代。按decode步数归一化后，才能比较不同batch下每步的
@@ -504,11 +564,11 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                 timeline["active_ms"] / decode_steps)
             timeline["idle_ms_per_decode_step"] = (
                 timeline["idle_ms"] / decode_steps)
-            cache_ratio = request_result["cache_hit_ratio"]
             row = {
                 "backend": backend,
                 "batch": batch,
                 "prompt_tokens": len(prompt),
+                "warmup_prompt_tokens": len(cache_warmup_prompt),
                 "output_tokens_per_request": args.output_tokens,
                 "request_wall_ms": request_result["wall_s"] * 1000,
                 "tpot_ms": (None if request_result["tpot_s"] is None else
@@ -548,8 +608,9 @@ def fmt(value, digits=3):
 def make_report(result_dir, rows, top_count):
     lines = [
         "# FastLLM / vLLM Decode Nsight Systems对比", "",
-        "> 每个Batch先使用同一Prompt完成warmup及Prefix Cache填充，再采集一次",
-        "> BEST模式HTTP请求。报告包含请求调度、缓存命中和稳定Decode；Nsight",
+        "> 每个Batch先使用加长Prompt完成warmup，使正式Prompt成为完整缓存前缀；",
+        "> Nsight进入Collection状态并稳定后才发送BEST模式HTTP请求。FastLLM",
+        "> 要求正式请求Prefix Cache命中率为100%，避免报告混入Prefill尾块；Nsight",
         "> 会扰动绝对延迟，正式TPOT仍应以非Profiler性能脚本为准。",
         "> GPU时间线空闲只统计首个与最后一个GPU事件之间的内部空隙；",
         "> 第一个输出Token属于Prefill，逐步指标按`output_tokens - 1`归一化。", "",
@@ -671,6 +732,12 @@ def main():
                  "max_model_len", "startup_timeout", "request_timeout"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')}必须大于0")
+    if args.prefix_cache_padding_tokens <= 0:
+        raise ValueError("prefix-cache-padding-tokens必须大于0")
+    if args.collection_ready_timeout <= 0:
+        raise ValueError("collection-ready-timeout必须大于0")
+    if args.collection_ready_delay < 0:
+        raise ValueError("collection-ready-delay不能小于0")
     result_dir = Path(args.result_dir).resolve()
     result_dir.mkdir(parents=True, exist_ok=True)
     from transformers import AutoTokenizer
