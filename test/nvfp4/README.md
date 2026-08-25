@@ -188,6 +188,25 @@ NVFP4_MODEL=/models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
   test/nvfp4/run_nvfp4_tests.sh model-performance
 ```
 
+需要定位Decode差距来自GPU算子还是引擎调度时，使用独立的Nsight Systems
+入口。每个Batch先完成相同Prompt的warmup和Prefix Cache填充，再采集一轮
+BEST模式请求；模型加载和Cold Prefill不进入报告。默认输出各Batch的TPOT、
+GPU kernel总时间与数量、显存操作、算子类别和Top Kernel：
+
+```bash
+python test/nvfp4/decode_nsys_compare.py \
+  --model /models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
+  --quantization nvfp4 \
+  --result-dir test/nvfp4/logs/decode-nsys \
+  --vllm-python /root/miniconda3/bin/python \
+  --fastllm-python /root/miniconda3/bin/python \
+  --batch-sizes 1,2,4,8,16,32
+```
+
+Nsight结果用于性能归因，不替代未启用Profiler时的正式TPOT结果。脚本会
+隔离Nsight importer与目标服务的`LD_PRELOAD`，避免只产生无法解析的
+`.qdstrm`文件。
+
 一次执行全部：
 
 ```bash

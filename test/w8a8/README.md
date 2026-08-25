@@ -75,6 +75,29 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-model" \
   test/w8a8/run_w8a8_tests.sh model-performance
 ```
 
+Decode性能归因使用独立的`decode_nsys_compare.py`。它让两个后端分时加载
+同一模型；每个Batch先用同一Prompt完成CUDA Graph、shape和Prefix Cache
+warmup，再由Nsight Systems只采集一轮BEST模式HTTP请求。默认覆盖
+batch=1/2/4/8/16/32，并输出GPU kernel、CUDA API、显存操作、按名称推断的
+算子类别以及Top Kernel表。Nsight会扰动绝对延迟，因此报告用于解释时间
+构成，正式TPOT仍以`model-performance`结果为准。
+
+```bash
+python test/w8a8/decode_nsys_compare.py \
+  --model /root/autodl-tmp/neuralmagic/Qwen2___5-7B-FP8-dynamic \
+  --result-dir test/w8a8/logs/decode-nsys \
+  --vllm-python /root/miniconda3/bin/python \
+  --fastllm-python /root/miniconda3/bin/python \
+  --batch-sizes 1,2,4,8,16,32 \
+  --prompt-tokens 512 \
+  --output-tokens 64
+```
+
+为避免Nsight importer被FastLLM使用的系统`libstdc++`干扰，脚本不会把
+`LD_PRELOAD`传给Nsight控制进程，只会把它传给被采集的模型服务。如果某个
+Nsight安装仍只生成`.qdstrm`而没有`.nsys-rep`，脚本会停止并给出明确错误，
+不会用不完整数据生成对比表。
+
 ## 模型（魔塔优先）
 
 | 用途 | ModelScope 模型 |
