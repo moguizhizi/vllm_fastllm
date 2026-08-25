@@ -816,11 +816,15 @@ static bool PrepareRoutedWeights(fastllm::Data **weights, int weightsBatch,
                                  int device) {
     for (int i = 2; i < weightsBatch; ++i) {
         fastllm::Data *weight = weights[i];
+        const FastllmCudaNvfp4BackendState state = weight == nullptr
+            ? FastllmCudaNvfp4BackendState::Rejected
+            : FastllmCudaGetNvfp4W4A4BackendState(*weight, device);
         if (weight == nullptr ||
             weight->dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
             weight->dims.size() != 2 ||
-            FastllmCudaGetNvfp4W4A4BackendState(*weight, device) ==
-                FastllmCudaNvfp4BackendState::Rejected) {
+            (state != FastllmCudaNvfp4BackendState::Uninitialized &&
+             state != FastllmCudaNvfp4BackendState::Prepared &&
+             state != FastllmCudaNvfp4BackendState::CutlassW4A4)) {
             return false;
         }
         const uint8_t *packed = nullptr, *scales = nullptr;
@@ -856,7 +860,7 @@ static void CommitRoutedWeights(fastllm::Data **weights, int weightsBatch,
         if (weight != nullptr &&
             weight->dataType == fastllm::DataType::NVFP4_BLOCK_16) {
             FastllmCudaSetNvfp4W4A4BackendState(
-                *weight, device, FastllmCudaNvfp4BackendState::Cutlass);
+                *weight, device, FastllmCudaNvfp4BackendState::CutlassW4A4);
         }
     }
 }
@@ -963,7 +967,9 @@ bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
 
     const FastllmCudaNvfp4BackendState state =
         FastllmCudaGetNvfp4W4A4BackendState(*anchor, device);
-    if (state == FastllmCudaNvfp4BackendState::Rejected) {
+    if (state == FastllmCudaNvfp4BackendState::Rejected ||
+        state == FastllmCudaNvfp4BackendState::MarlinW4A16Fallback ||
+        state == FastllmCudaNvfp4BackendState::NativeW4A16Fallback) {
         if (StrictEnabled()) {
             throw std::runtime_error(
                 "strict NVFP4 grouped MoE backend was already rejected");

@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -47,6 +48,11 @@ std::map<std::pair<const fastllm::Data *, int>, BackendState> backendStates;
 
 static bool TraceEnabled() {
     const char *value = std::getenv("FASTLLM_CUDA_NVFP4_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool StrictW4A4Enabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_NVFP4_W4A4_STRICT");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
@@ -264,6 +270,113 @@ bool FastllmCudaTryMarlinHalfMatMulNVFP4(
             "NVFP4 Marlin backend failed after warmup; runtime fallback is disabled");
     }
     return ok;
+}
+
+namespace {
+
+using Nvfp4BackendState = FastllmCudaNvfp4BackendState;
+
+struct Nvfp4BackendCandidate {
+    Nvfp4BackendState backend;
+    bool changesActivationSemantics;
+    const char *name;
+};
+
+constexpr std::array<Nvfp4BackendCandidate, 3> nvfp4W4A4Candidates = {{
+    {Nvfp4BackendState::CutlassW4A4, false, "cutlass-w4a4"},
+    {Nvfp4BackendState::MarlinW4A16Fallback, true, "marlin-w4a16-fallback"},
+    {Nvfp4BackendState::NativeW4A16Fallback, true, "native-w4a16-fallback"},
+}};
+
+static void TraceSelectedBackend(const fastllm::Data &weight, int device,
+                                 const Nvfp4BackendCandidate &candidate) {
+    if (!TraceEnabled()) return;
+    std::fprintf(stderr,
+        "[fastllm][nvfp4] backend=%s state=fixed device=%d "
+        "activation_semantics=%s name=%s\n",
+        candidate.name, device,
+        candidate.changesActivationSemantics ? "w4a16" : "w4a4",
+        weight.name.c_str());
+}
+
+} // namespace
+
+/**
+ * 为NVFP4 W4A4 Linear选择并执行固定后端。
+ *
+ * 首次调用按CUTLASS W4A4、Marlin W4A16兼容路径、原生W4A16兼容路径
+ * 的顺序选择。CUTLASS保持W4A4激活语义；后两者不量化激活，因此只在
+ * 非STRICT模式下作为兼容降级。选择结果按“权重对象 + GPU”写入统一状态，
+ * 后续调用只执行已固定的后端，不再逐个探测。固定后端运行失败时由对应
+ * 执行函数直接抛错，不允许在正式推理期间再次切换。
+ *
+ * 参数沿用FastLLM Linear语义：output[n,k] = input[n,m] * weight[k,m]^T。
+ *
+ * @param input  FP16或BF16输入，逻辑形状为[n,m]。
+ * @param weight NVFP4_BLOCK_16权重，逻辑形状为[k,m]。
+ * @param bias   可选FP32偏置，长度为k。
+ * @param output 输出张量，逻辑形状为[n,k]。
+ * @param n      输入行数，通常为token数。
+ * @param m      输入特征数。
+ * @param k      输出特征数。
+ * @return true表示CUTLASS或Marlin已完成计算；false表示已固定使用原生
+ *         W4A16兼容路径，调用方应进入普通NVFP4_BLOCK_16 Linear。
+ */
+bool FastllmCudaTryNvfp4W4A4Linear(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+        weight.blockM != 16) return false;
+
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    Nvfp4BackendState state =
+        FastllmCudaGetNvfp4W4A4BackendState(weight, device);
+
+    if (state == Nvfp4BackendState::CutlassW4A4) {
+        return TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m);
+    }
+    if (state == Nvfp4BackendState::MarlinW4A16Fallback) {
+        return FastllmCudaTryMarlinHalfMatMulNVFP4(
+            input, weight, bias, output, n, m, k);
+    }
+    if (state == Nvfp4BackendState::NativeW4A16Fallback) return false;
+
+    // Prepared和Uninitialized都属于首次选择；CUTLASS内部负责真实GEMM
+    // 验证，并在失败时恢复原始权重、把CUTLASS候选标记为Rejected。
+    if (state == Nvfp4BackendState::Prepared ||
+        state == Nvfp4BackendState::Uninitialized) {
+        if (TryCudaCutlassNvfp4W4A4(
+                input, weight, bias, output, n, k, m)) {
+            return true;
+        }
+        state = FastllmCudaGetNvfp4W4A4BackendState(weight, device);
+    }
+
+    if (state != Nvfp4BackendState::Rejected) {
+        throw std::runtime_error(
+            "NVFP4 W4A4 backend selection entered an invalid state");
+    }
+    if (StrictW4A4Enabled()) {
+        throw std::runtime_error(
+            "strict NVFP4 W4A4 requires the native CUTLASS backend");
+    }
+
+    // CUTLASS被拒绝后才允许尝试改变激活语义的兼容后端。Marlin函数
+    // 自己完成首次同步验证；失败后保留原始CUDA权重供原生W4A16使用。
+    const Nvfp4BackendCandidate &marlin = nvfp4W4A4Candidates[1];
+    if (FastllmCudaTryMarlinHalfMatMulNVFP4(
+            input, weight, bias, output, n, m, k)) {
+        FastllmCudaSetNvfp4W4A4BackendState(weight, device, marlin.backend);
+        TraceSelectedBackend(weight, device, marlin);
+        return true;
+    }
+
+    const Nvfp4BackendCandidate &native = nvfp4W4A4Candidates[2];
+    FastllmCudaSetNvfp4W4A4BackendState(weight, device, native.backend);
+    TraceSelectedBackend(weight, device, native);
+    return false;
 }
 
 void FastllmCudaReleaseNvfp4MarlinCache(const fastllm::Data *weight) {

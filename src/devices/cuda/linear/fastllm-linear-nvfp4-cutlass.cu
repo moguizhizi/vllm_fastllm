@@ -171,7 +171,8 @@ static int CurrentDevice() {
  *
  * @param weight 用于标识模型权重对象。
  * @param device CUDA设备号。
- * @return 当前后端状态：Uninitialized、Prepared、Cutlass或Rejected。
+ * @return 当前后端状态；除CUTLASS生命周期外，也可能是统一选择器固定的
+ *         MarlinW4A16Fallback或NativeW4A16Fallback。
  */
 static BackendState GetBackendState(const fastllm::Data &weight, int device) {
     std::lock_guard<std::mutex> guard(stateMutex);
@@ -560,8 +561,12 @@ bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight) {
     }
 
     const BackendState state = GetBackendState(weight, device);
-    if (state == BackendState::Prepared || state == BackendState::Cutlass) {
+    if (state == BackendState::Prepared || state == BackendState::CutlassW4A4) {
         return true;
+    }
+    if (state == BackendState::MarlinW4A16Fallback ||
+        state == BackendState::NativeW4A16Fallback) {
+        return false;
     }
     if (state == BackendState::Rejected) {
         if (StrictEnabled()) ThrowStrict("backend was already rejected");
@@ -736,8 +741,8 @@ static bool RunCutlassNvfp4W4A4(
  *
  * 该函数同时负责当前权重在当前GPU上的后端生命周期管理：第一次调用
  * 会执行带同步验证的warmup；成功后固定使用CUTLASS并释放原始CUDA
- * 权重，失败后固定拒绝CUTLASS，由上层改走Legacy后端。后端一旦固定为
- * CUTLASS，正式推理期间发生的执行错误将直接抛出，不再动态切换后端。
+ * 权重，失败后固定拒绝CUTLASS，由统一选择器继续选择兼容后端。后端一旦
+ * 固定为CUTLASS，正式推理期间发生的执行错误将直接抛出，不再动态切换。
  *
  * 参数采用标准GEMM语义：output[M,N] = input[M,K] * weight[N,K]^T。
  *
@@ -768,8 +773,12 @@ bool TryCudaCutlassNvfp4W4A4(
     // 后端状态按“权重对象 + GPU”保存。同一份权重换到另一张GPU后，
     // 需要在目标GPU上重新完成一次后端选择和权重重排。
     const BackendState state = GetBackendState(weight, device);
+    if (state == BackendState::MarlinW4A16Fallback ||
+        state == BackendState::NativeW4A16Fallback) {
+        return false;
+    }
     if (state == BackendState::Rejected) {
-        // 首次warmup已经确认CUTLASS不可用，后续固定交给Legacy路径，
+        // 首次warmup已经确认CUTLASS不可用，交给统一选择器决定兼容后端，
         // 避免每次Linear都重复创建cache并再次尝试失败。
         Trace("fallback", "CUTLASS backend rejected during warmup", m, k, n,
               RuntimeArch());
@@ -794,7 +803,7 @@ bool TryCudaCutlassNvfp4W4A4(
             if (StrictEnabled()) ThrowStrict("original CUDA weight release failed");
             return false;
         }
-        SetBackendState(weight, device, BackendState::Cutlass);
+        SetBackendState(weight, device, BackendState::CutlassW4A4);
         if (TraceEnabled()) {
             std::fprintf(stderr,
                 "[fastllm][nvfp4] backend=cutlass state=fixed device=%d name=%s\n",
@@ -828,6 +837,10 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
     }
     const BackendState backend = GetBackendState(weight, device);
     const FusionState fusion = GetFusionState(weight, device);
+    if (backend == BackendState::MarlinW4A16Fallback ||
+        backend == BackendState::NativeW4A16Fallback) {
+        return false;
+    }
     if (backend == BackendState::Rejected) {
         if (StrictEnabled()) ThrowStrict("backend rejected before fused SwiGLU");
         return false;
@@ -854,7 +867,7 @@ bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
                 if (StrictEnabled()) ThrowStrict("original CUDA weight release failed");
                 return false;
             }
-            SetBackendState(weight, device, BackendState::Cutlass);
+            SetBackendState(weight, device, BackendState::CutlassW4A4);
         }
         if (fusionWarmup) SetFusionState(weight, device, FusionState::Enabled);
     } else if (fusionWarmup) {

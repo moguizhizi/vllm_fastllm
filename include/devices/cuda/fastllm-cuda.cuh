@@ -287,6 +287,10 @@ bool FastllmCudaTryMarlinHalfMatMulNVFP4(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output,
     int n, int m, int k);
+bool FastllmCudaTryNvfp4W4A4Linear(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
 void FastllmCudaReleaseNvfp4MarlinCache(const fastllm::Data *weight);
 // SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
 // two-stage Turing specialization; SM80+ selects the four-stage kernel.
@@ -907,11 +911,14 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
                            const fastllm::Data &bias, fastllm::Data &output,
                            int numTokens, int inChannels, int outChannels);
 
-/** NVFP4 W4A4权重在指定GPU上的固定后端状态。 */
+/** NVFP4权重在指定GPU上的W4A4后端选择与兼容降级状态。 */
 enum class FastllmCudaNvfp4BackendState : uint8_t {
     Uninitialized,
     Prepared,
-    Cutlass,
+    CutlassW4A4,
+    Cutlass = CutlassW4A4,
+    MarlinW4A16Fallback,
+    NativeW4A16Fallback,
     Rejected,
 };
 

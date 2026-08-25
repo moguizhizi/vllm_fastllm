@@ -2189,13 +2189,20 @@ namespace fastllm {
                         // W4A4正式表示是CUTLASS cache。这里在图捕获之前验证
                         // cache；cache缺失时允许从host/mmap补建，不能依赖已释放
                         // 的原始cudaData。
-                        if (FastllmCudaGetNvfp4W4A4BackendState(*gateup, device) ==
-                                FastllmCudaNvfp4BackendState::Rejected ||
-                            FastllmCudaGetNvfp4W4A4BackendState(*down, device) ==
-                                FastllmCudaNvfp4BackendState::Rejected) {
+                        const auto gateupBackend =
+                            FastllmCudaGetNvfp4W4A4BackendState(*gateup, device);
+                        const auto downBackend =
+                            FastllmCudaGetNvfp4W4A4BackendState(*down, device);
+                        const auto mayUseCutlass = [](FastllmCudaNvfp4BackendState state) {
+                            return state == FastllmCudaNvfp4BackendState::Uninitialized ||
+                                   state == FastllmCudaNvfp4BackendState::Prepared ||
+                                   state == FastllmCudaNvfp4BackendState::CutlassW4A4;
+                        };
+                        if (!mayUseCutlass(gateupBackend) ||
+                            !mayUseCutlass(downBackend)) {
                             return reject("layer " + std::to_string(i) + " expert " +
                                           std::to_string((j - 2) / 2) +
-                                          " has a rejected CUTLASS backend");
+                                          " does not use the CUTLASS W4A4 backend");
                         }
                         const uint8_t *gateupPacked = nullptr;
                         const uint8_t *gateupScales = nullptr;

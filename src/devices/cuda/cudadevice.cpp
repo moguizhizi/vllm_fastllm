@@ -5018,10 +5018,9 @@ namespace fastllm {
             if (FastllmCudaCutlassLinearFp8W8A8Sm120(
                     input, weight, bias, output, n, m, k)) return;
         } else if (quantScheme == LinearQuantScheme::NVFP4_W4A4) {
-            // 与vLLM auto选择一致：原生W4A4 CUTLASS优先；没有原生FP4
-            // 能力的旧GPU允许在首次选择阶段固定为weight-only Marlin。
-            if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m) ||
-                FastllmCudaTryMarlinHalfMatMulNVFP4(
+            // 首次调用统一选择并固定CUTLASS W4A4、Marlin W4A16兼容路径
+            // 或原生W4A16兼容路径；正式推理不再用短路表达式反复探测。
+            if (FastllmCudaTryNvfp4W4A4Linear(
                     input, weight, bias, output, n, m, k)) return;
         } else if (quantScheme == LinearQuantScheme::NVFP4_W4A16) {
             // 显式W4A16不量化激活，也不尝试W4A4 CUTLASS。
@@ -5033,10 +5032,11 @@ namespace fastllm {
                     input, weight, bias, output, n, m, k) ||
                 FastllmCudaCutlassLinearFp8W8A8Sm120(
                     input, weight, bias, output, n, m, k)) return;
-            if (TryCudaCutlassNvfp4W4A4(input, weight, bias, output, n, k, m) ||
-                FastllmCudaTryMarlinHalfMatMulNVFP4(
+            if (FastllmCudaTryNvfp4W4A4Linear(
                     input, weight, bias, output, n, m, k)) return;
         }
+        // 专用CUTLASS后端未成功接管时，FastLLM不支持继续执行这两类量化，
+        // 直接报错，禁止错误地落入普通Linear路径。
         if (weight.dataType == DataType::INT8_W8A8) {
             ErrorInFastLLM(
                 "Linear error: symmetric INT8 W8A8 requires an SM90 CUTLASS build, "
@@ -8296,7 +8296,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         const bool fixedCutlass = backendAnchor != nullptr &&
             FastllmCudaGetNvfp4W4A4BackendState(
                 *backendAnchor, FastllmCudaGetDevice()) ==
-                FastllmCudaNvfp4BackendState::Cutlass;
+                FastllmCudaNvfp4BackendState::CutlassW4A4;
         auto rejectCall = [fixedCutlass]() -> bool {
             // 后端固定后，路由或张量语义异常属于正式推理错误，不能静默
             // 切到Legacy形成同一层前后混推。
@@ -8624,6 +8624,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             // 即使首次策略开关关闭，Prepared权重也进入一次生命周期入口，
             // 由入口清理重排cache并固定Rejected；Cutlass固定后继续走grouped，
             // Rejected固定后直接进入Legacy，不在正式推理期间反复探测或切换。
+            const bool nvfp4BackendMayUseCutlass =
+                nvfp4Backend == FastllmCudaNvfp4BackendState::Uninitialized ||
+                nvfp4Backend == FastllmCudaNvfp4BackendState::Prepared ||
+                nvfp4Backend == FastllmCudaNvfp4BackendState::CutlassW4A4;
             const bool preferNvfp4W4A4 =
                 batch > 0 &&
                 (gateType == MoeGateSwiglu || gateType == MoeGateGeglu) &&
@@ -8631,7 +8635,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 firstGate->dataType == DataType::NVFP4_BLOCK_16 &&
                 runtimeArch >= 100 && runtimeArch < 130 &&
                 (runtimeArch < 120 || input.dataType == DataType::BFLOAT16) &&
-                nvfp4Backend != FastllmCudaNvfp4BackendState::Rejected;
+                nvfp4BackendMayUseCutlass;
 
             // 只有未选择NVFP4 W4A4时才探测旧后端，避免small-batch INT4或
             // large-batch Triton FP8在未来扩展格式后意外截获NVFP4请求。
