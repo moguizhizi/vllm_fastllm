@@ -75,6 +75,14 @@ run_ops_functional() {
             --param bias=0 --param input_type=fp16 \
             --param quant_scheme=w4a16 \
             --warmup 0 --iters 1 --atol 0.05 --rtol 0.05
+        run_logged op_dense_w4a4_marlin_fallback env \
+            FASTLLM_CUDA_NVFP4_TRACE=1 \
+            FASTLLM_CUDA_NVFP4_W4A4=0 \
+            "${optest}" --op linear_nvfp4 --device cuda:0 \
+            --param batch=8 --param in=1024 --param out=1024 \
+            --param bias=0 --param input_type=fp16 \
+            --param quant_scheme=w4a4 --param check_marlin_fallback=1 \
+            --warmup 0 --iters 1 --atol 0.05 --rtol 0.05
         run_logged op_dense_w4a4_decode_padding_bias env \
             FASTLLM_CUDA_NVFP4_TRACE=1 \
             FASTLLM_CUDA_NVFP4_W4A4=1 \

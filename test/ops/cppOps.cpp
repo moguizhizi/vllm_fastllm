@@ -2208,6 +2208,7 @@ namespace {
         bool checkRelease = false;
         bool checkFixedBackend = false;
         bool checkWarmupFallback = false;
+        bool checkMarlinFallback = false;
         bool checkDeviceMove = false;
         bool checkFusionSeparation = false;
         fastllm::LinearQuantScheme quantScheme =
@@ -2229,6 +2230,7 @@ namespace {
             checkRelease = params.GetInt("check_release") != 0;
             checkFixedBackend = params.GetInt("check_fixed_backend") != 0;
             checkWarmupFallback = params.GetInt("check_warmup_fallback") != 0;
+            checkMarlinFallback = params.GetInt("check_marlin_fallback") != 0;
             checkDeviceMove = params.GetInt("check_device_move") != 0;
             checkFusionSeparation = params.GetInt("check_fusion_separation") != 0;
             const std::string scheme = params.GetString("quant_scheme");
@@ -2379,6 +2381,13 @@ namespace {
                 }
             }
             fastllm::Linear(input, weight, bias, output);
+            if (checkMarlinFallback &&
+                FastllmCudaGetNvfp4W4A4BackendState(
+                    weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaNvfp4BackendState::MarlinW4A16Fallback) {
+                throw std::runtime_error(
+                    "NVFP4 W4A4 selector did not fix the Marlin W4A16 fallback");
+            }
             if (checkRelease && FastllmCudaRuntimeArch() >= 100 &&
                 FastllmCudaRuntimeArch() < 130 && weight.cudaData != nullptr) {
                 throw std::runtime_error(
@@ -2406,7 +2415,13 @@ namespace {
                 fastllm::Linear(input, weight, bias, fixedLegacyOutput);
                 if (weight.cudaData == nullptr) {
                     throw std::runtime_error(
-                        "NVFP4 warmup fallback was not fixed to the legacy backend");
+                        "NVFP4 warmup fallback did not retain its original CUDA weight");
+                }
+                if (FastllmCudaGetNvfp4W4A4BackendState(
+                        weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaNvfp4BackendState::NativeW4A16Fallback) {
+                    throw std::runtime_error(
+                        "NVFP4 W4A4 selector did not fix the native W4A16 fallback");
                 }
             }
             if (checkDeviceMove) {
@@ -2528,7 +2543,8 @@ namespace {
                 params.Add("quant_scheme", "auto", "auto, w4a4 or w4a16");
                 params.Add("check_release", "0", "require W4A4 to release the original CUDA weight");
                 params.Add("check_fixed_backend", "0", "verify inference cannot switch a warmed CUTLASS backend");
-                params.Add("check_warmup_fallback", "0", "force first GEMM validation failure and verify legacy remains fixed");
+                params.Add("check_warmup_fallback", "0", "force first GEMM failure and verify native W4A16 fallback remains fixed");
+                params.Add("check_marlin_fallback", "0", "disable CUTLASS and verify Marlin W4A16 fallback remains fixed");
                 params.Add("check_device_move", "0", "on 2+ GPUs, rebuild the fixed backend on GPU 1");
                 params.Add("check_fusion_separation", "0", "verify fused SwiGLU rejection does not reject Linear CUTLASS");
                 params.Add("performance_only", "0", "skip the O(MNK) CPU reference for large benchmark shapes");
