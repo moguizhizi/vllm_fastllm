@@ -23,6 +23,26 @@ import model_performance_compare as model_compare  # noqa: E402
 
 BACKENDS = ("fastllm", "vllm")
 
+# 报告中的类别顺序按一次Transformer Decode的主要数据流排列。这里描述的
+# 是Kernel语义，而不是模型源码中的精确调用栈；同名GEMM无法仅凭Nsight
+# 符号区分o_proj和MLP，融合Kernel也只归到可确认的最小语义范围。
+KERNEL_CATEGORY_ORDER = (
+    "Embedding",
+    "Type Conversion",
+    "Quantize",
+    "GEMM/Linear",
+    "QKV Postprocess",
+    "KV Cache",
+    "Attention",
+    "Norm",
+    "Activation",
+    "Residual/Elementwise",
+    "Layout/Index",
+    "Sampling",
+    "Fused/Unresolved",
+    "Other",
+)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -382,14 +402,16 @@ def kernel_category(name):
     # GEMM：FlashAttention模板参数也包含cutlass类型，Triton融合kernel名称
     # 则可能同时出现scaled_mm、RMSNorm、SwiGLU和量化。
     if any(pattern in lowered for pattern in (
-            "qkvrmsnormropesplit", "fused_add_rms_norm")):
-        return "Fused"
+            "qkvrmsnormropesplit", "ropeencoding", "rotary_embedding",
+            "rotaryembedding", "apply_rotary", "fused_rope")):
+        return "QKV Postprocess"
     if any(pattern in lowered for pattern in (
             "reshape_and_cache", "pagedcachecopy", "appendpagedcache",
             "kv_cache", "cache_kernel", "gather_block_tables")):
         return "KV Cache"
     if any(pattern in lowered for pattern in (
-            "flash_fwd", "flashinfer::batchprefill", "attention", "fmha",
+            "flash_fwd", "flashinfer::batchprefill",
+            "batchprefillwithpagedkvcache", "attention", "fmha",
             "fused_attn", "persistentvariablelengthmergestates",
             "flashmla", "mla::")):
         return "Attention"
@@ -397,16 +419,32 @@ def kernel_category(name):
             "gumbel", "sampling", "sample_kernel", "topk", "top_k", "topp",
             "top_p", "argmax", "layernormkerneltop1", "resetlogitsofeos")):
         return "Sampling"
+    if "embedding" in lowered:
+        return "Embedding"
+    if any(pattern in lowered for pattern in (
+            "float2bf16", "bf162float", "half2float", "float2half",
+            "bf16tofloat", "floattobf16", "cast_kernel", "typeconvert",
+            "convert_kernel")):
+        return "Type Conversion"
+    if any(pattern in lowered for pattern in (
+            "transpos", "permute", "reorder", "indexselect", "index_select",
+            "gatherkernel", "scatterkernel")):
+        return "Layout/Index"
+    if any(pattern in lowered for pattern in (
+            "addtokernel", "residual", "elementwise", "pointwise",
+            "add_kernel", "addkernel")):
+        return "Residual/Elementwise"
     semantic_markers = sum(pattern in lowered for pattern in (
         "scaled_mm", "rms_norm", "rmsnorm", "silu", "swiglu", "quant",
         "embedding", "rope"))
     if "triton" in lowered and semantic_markers >= 2:
-        return "Fused"
+        return "Fused/Unresolved"
     if any(pattern in lowered for pattern in (
             "quantize", "scaled_fp8_quant", "nvfp4quant", "float4quant")):
         return "Quantize"
     if any(pattern in lowered for pattern in (
-            "rmsnorm", "rms_norm", "layernorm", "layer_norm")):
+            "fused_add_rms_norm", "rmsnorm", "rms_norm", "layernorm",
+            "layer_norm")):
         return "Norm"
     if any(pattern in lowered for pattern in (
             "swiglu", "silu", "gelu", "activation")):
@@ -416,6 +454,12 @@ def kernel_category(name):
             "matmul", "marlin", "kernel2<cutlass")):
         return "GEMM/Linear"
     return "Other"
+
+
+def ordered_categories(categories):
+    """按模型数据流排序算子类别，并在末尾保留未知扩展类别。"""
+    known = [name for name in KERNEL_CATEGORY_ORDER if name in categories]
+    return known + sorted(set(categories) - set(KERNEL_CATEGORY_ORDER))
 
 
 def summarize_gpu_timeline(rows):
@@ -690,6 +734,9 @@ def make_report(result_dir, rows, top_count):
                 f"{ratio_text(fast['nsys']['timeline']['idle_ms_per_decode_step'], vllm['nsys']['timeline']['idle_ms_per_decode_step'])} |")
 
     lines.extend(["", "## 算子类别", "",
+                  "> 类别根据Nsight Kernel符号归纳；同名GEMM不能仅凭符号可靠区分",
+                  "> Attention `o_proj`与MLP Linear，无法确认的融合Kernel归入",
+                  "> `Fused/Unresolved`，不把推测结果伪装成精确模型阶段。", "",
                   "| Batch | 后端 | 类别 | GPU总时间(ms) | GPU时间(ms/步) | "
                   "Kernel总数 | Kernel数/步 |",
                   "| ---: | --- | --- | ---: | ---: | ---: | ---: |"])
@@ -703,6 +750,52 @@ def make_report(result_dir, rows, top_count):
                 f"{value['total_ms_per_decode_step']:.3f} | "
                 f"{value['instances']} | "
                 f"{value['instances_per_decode_step']:.2f} |")
+
+    if paired_batches:
+        lines.extend([
+            "", "## 算子类别并排对比", "",
+            "> 时间差=`FastLLM-vLLM`，负数表示FastLLM在该类别耗时更少；",
+            "> GPU内部空闲不是Kernel，启动次数以`—`表示。绝对热点看总时间，",
+            "> 引擎差异来源看时间差，二者不能混为一谈。", "",
+            "| Batch | 类别 | FastLLM总耗时(ms) | vLLM总耗时(ms) | "
+            "时间差(ms) | FastLLM(ms/步) | vLLM(ms/步) | "
+            "FastLLM启动数 | vLLM启动数 | 启动数差 |",
+            "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for batch in paired_batches:
+            fast = by_case[(batch, "fastllm")]
+            vllm = by_case[(batch, "vllm")]
+            fast_categories = fast["nsys"]["categories"]
+            vllm_categories = vllm["nsys"]["categories"]
+            categories = ordered_categories(
+                set(fast_categories) | set(vllm_categories))
+            for category in categories:
+                fast_value = fast_categories.get(
+                    category, {"total_ms": 0.0, "instances": 0,
+                               "total_ms_per_decode_step": 0.0})
+                vllm_value = vllm_categories.get(
+                    category, {"total_ms": 0.0, "instances": 0,
+                               "total_ms_per_decode_step": 0.0})
+                lines.append(
+                    f"| {batch} | {category} | "
+                    f"{fast_value['total_ms']:.3f} | "
+                    f"{vllm_value['total_ms']:.3f} | "
+                    f"{fast_value['total_ms'] - vllm_value['total_ms']:+.3f} | "
+                    f"{fast_value['total_ms_per_decode_step']:.3f} | "
+                    f"{vllm_value['total_ms_per_decode_step']:.3f} | "
+                    f"{fast_value['instances']} | {vllm_value['instances']} | "
+                    f"{fast_value['instances'] - vllm_value['instances']:+d} |")
+
+            fast_idle = fast["nsys"]["timeline"]["idle_ms"]
+            vllm_idle = vllm["nsys"]["timeline"]["idle_ms"]
+            fast_idle_step = fast["nsys"]["timeline"][
+                "idle_ms_per_decode_step"]
+            vllm_idle_step = vllm["nsys"]["timeline"][
+                "idle_ms_per_decode_step"]
+            lines.append(
+                f"| {batch} | GPU Internal Idle | {fast_idle:.3f} | "
+                f"{vllm_idle:.3f} | {fast_idle - vllm_idle:+.3f} | "
+                f"{fast_idle_step:.3f} | {vllm_idle_step:.3f} | — | — | — |")
 
     for row in rows:
         lines.extend([
