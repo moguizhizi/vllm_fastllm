@@ -396,6 +396,46 @@ def summarize_named_rows(rows):
     return result
 
 
+def trace_name(row):
+    return text_value(row, ("Name", "Kernel Name", "Operation"))
+
+
+def is_memory_trace_row(row):
+    name = trace_name(row).lower()
+    if any(row.get(key) for key in (
+            "SrcMemKind", "DstMemKind", "Source Memory Kind",
+            "Destination Memory Kind")):
+        return True
+    return "memcpy" in name or "memset" in name or "memory operation" in name
+
+
+def summarize_trace_kernels(rows):
+    """从逐事件GPU Trace汇总Kernel，保留裁剪稳定Decode区间的能力。"""
+    grouped = {}
+    for row in rows:
+        if is_memory_trace_row(row):
+            continue
+        duration_ns = numeric(row, ("Duration (ns)", "Duration"))
+        if duration_ns <= 0:
+            continue
+        name = trace_name(row)
+        entry = grouped.setdefault(name, {"total_ns": 0.0, "instances": 0})
+        entry["total_ns"] += duration_ns
+        entry["instances"] += 1
+    result = []
+    for name, value in grouped.items():
+        total_ns = value["total_ns"]
+        instances = value["instances"]
+        result.append({
+            "name": name,
+            "total_ms": total_ns / 1e6,
+            "instances": instances,
+            "average_us": total_ns / instances / 1e3,
+        })
+    result.sort(key=lambda item: item["total_ms"], reverse=True)
+    return result
+
+
 def kernel_category(name):
     lowered = name.lower()
     # 分类必须先识别语义明确的kernel，不能看到字符串"cutlass"就认为是
@@ -419,7 +459,9 @@ def kernel_category(name):
             "gumbel", "sampling", "sample_kernel", "topk", "top_k", "topp",
             "top_p", "argmax", "layernormkerneltop1", "resetlogitsofeos")):
         return "Sampling"
-    if "embedding" in lowered:
+    if any(pattern in lowered for pattern in (
+            "embedding", "indexselectlargeindex",
+            "indexselectsmallindex", "embedding_lookup")):
         return "Embedding"
     if any(pattern in lowered for pattern in (
             "float2bf16", "bf162float", "half2float", "float2half",
@@ -460,6 +502,58 @@ def ordered_categories(categories):
     """按模型数据流排序算子类别，并在末尾保留未知扩展类别。"""
     known = [name for name in KERNEL_CATEGORY_ORDER if name in categories]
     return known + sorted(set(categories) - set(KERNEL_CATEGORY_ORDER))
+
+
+def stable_decode_trace(rows):
+    """裁掉首Token以前的Prefill与采样，只保留后续稳定Decode GPU事件。"""
+    events = []
+    for row in rows:
+        start = numeric(row, ("Start (ns)", "Start"))
+        duration = numeric(row, ("Duration (ns)", "Duration"))
+        if duration > 0:
+            events.append((start, start + duration, row))
+    events.sort(key=lambda item: (item[0], item[1]))
+
+    first_sampling = None
+    for index, (_, _, row) in enumerate(events):
+        if (not is_memory_trace_row(row) and
+                kernel_category(trace_name(row)) == "Sampling"):
+            first_sampling = index
+            break
+    if first_sampling is None:
+        raise RuntimeError(
+            "Nsight GPU Trace中未找到首Token采样Kernel，无法排除Prefill。"
+            "请检查Sampling分类规则或确认请求确实生成了Token。")
+
+    # FastLLM与vLLM的Sampling可能分别由一个或多个Kernel组成。首个采样
+    # Kernel之后，遇到下一轮Embedding/Norm/量化/GEMM/Attention中的任一
+    # 模型计算，即认为稳定Decode开始；采样内部的数据转换不会误作边界。
+    model_categories = {
+        "Embedding", "Quantize", "GEMM/Linear", "QKV Postprocess",
+        "KV Cache", "Attention", "Norm", "Activation",
+        "Residual/Elementwise",
+    }
+    boundary_index = None
+    for index in range(first_sampling + 1, len(events)):
+        row = events[index][2]
+        if is_memory_trace_row(row):
+            continue
+        if kernel_category(trace_name(row)) in model_categories:
+            boundary_index = index
+            break
+    if boundary_index is None:
+        raise RuntimeError(
+            "首Token采样后未找到稳定Decode模型Kernel，无法确定采集边界。")
+
+    boundary_ns = events[boundary_index][0]
+    stable_rows = [row for start, _, row in events if start >= boundary_ns]
+    return stable_rows, {
+        "boundary_ns": boundary_ns,
+        "excluded_event_count": boundary_index,
+        "stable_event_count": len(stable_rows),
+        "first_sampling_kernel": trace_name(events[first_sampling][2]),
+        "first_stable_kernel": trace_name(events[boundary_index][2]),
+    }
 
 
 def summarize_gpu_timeline(rows):
@@ -507,10 +601,18 @@ def summarize_report(args, report, output_base):
     timeline_csv = export_stats(
         args, report, "cuda_gpu_trace", output_base.with_name(
             output_base.name + "-gpu-trace"))
-    kernels = summarize_named_rows(read_stats_csv(kernel_csv))
+    # cuda_gpu_kern_sum保留完整请求，便于人工核对；正式Decode汇总必须从
+    # 逐事件Trace裁掉首Token以前的Prefill与采样，避免Cache最后一页重算
+    # 污染M形状、Kernel次数和GPU总时间。
+    trace_rows, decode_filter = stable_decode_trace(
+        read_stats_csv(timeline_csv))
+    kernels = summarize_trace_kernels(trace_rows)
     apis = summarize_named_rows(read_stats_csv(api_csv))
     memory = summarize_named_rows(read_stats_csv(memory_csv))
-    timeline = summarize_gpu_timeline(read_stats_csv(timeline_csv))
+    timeline = summarize_gpu_timeline(trace_rows)
+    stable_memory_total_ms = sum(
+        numeric(row, ("Duration (ns)", "Duration"))
+        for row in trace_rows if is_memory_trace_row(row)) / 1e6
     categories = {}
     for item in kernels:
         category = kernel_category(item["name"])
@@ -526,8 +628,9 @@ def summarize_report(args, report, output_base):
         "timeline_csv": str(timeline_csv),
         "kernel_total_ms": sum(item["total_ms"] for item in kernels),
         "kernel_instances": sum(item["instances"] for item in kernels),
-        "memory_total_ms": sum(item["total_ms"] for item in memory),
+        "memory_total_ms": stable_memory_total_ms,
         "timeline": timeline,
+        "stable_decode_filter": decode_filter,
         "categories": categories,
         "top_kernels": kernels[:args.top_kernels],
         "top_cuda_apis": apis[:10],
@@ -554,8 +657,8 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                     f"{len(cache_warmup_prompt)} + "
                     f"{args.warmup_output_tokens} > {args.max_model_len}")
             # Warmup Prompt把正式Prompt作为完整前缀，并在末尾追加一个Cache
-            # 页。这样正式Prompt的最后一页也能复用，避免Decode报告混入
-            # 一个未命中的Prefill尾块。
+            # 页。FastLLM为了重新产生首Token logits，会按主流程主动退掉正式
+            # Prompt的最后一个Cache页；该Prefill尾部随后由GPU Trace边界裁掉。
             run_decode_batch(
                 server, cache_warmup_prompt,
                 args.warmup_output_tokens, batch, args,
@@ -568,12 +671,18 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                 "decode")
             report = stop_collection(args, server["session"], output_base)
             cache_ratio = request_result["cache_hit_ratio"]
-            if (backend == "fastllm" and
-                    (cache_ratio is None or cache_ratio < 0.999)):
+            minimum_cache_ratio = max(
+                0.0, (len(prompt) - args.prefix_cache_padding_tokens) /
+                len(prompt))
+            if (backend == "fastllm" and (
+                    cache_ratio is None or
+                    cache_ratio + 1e-9 < minimum_cache_ratio)):
                 actual = "未报告" if cache_ratio is None else f"{cache_ratio:.1%}"
                 raise RuntimeError(
-                    "FastLLM Decode Nsight采集要求Prefix Cache完全命中，"
-                    f"实际为{actual}；请检查Cache页大小和Warmup Prompt。")
+                    "FastLLM Decode Nsight采集的Prefix Cache命中不足一个"
+                    "预期尾页，实际为"
+                    f"{actual}，最低要求{minimum_cache_ratio:.1%}；"
+                    "请检查Cache页大小和Warmup Prompt。")
             summary = summarize_report(args, report, output_base)
             # 第一个输出Token属于Prefill结束点；之后每个Token才对应一次稳定
             # Decode迭代。按decode步数归一化后，才能比较不同batch下每步的
@@ -625,6 +734,7 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                 "request_e2el_p95_ms": percentile(request_e2els_ms, 95),
                 "output_tok_s": request_result["output_tok_s"],
                 "cache_hit_ratio": cache_ratio,
+                "minimum_cache_hit_ratio": minimum_cache_ratio,
                 "cache_status": ("reported" if cache_ratio is not None else
                                  "unreported"),
                 "nsys": summary,
@@ -653,8 +763,9 @@ def make_report(result_dir, rows, top_count):
     lines = [
         "# FastLLM / vLLM Decode Nsight Systems对比", "",
         "> 每个Batch先使用加长Prompt完成warmup，使正式Prompt成为完整缓存前缀；",
-        "> Nsight进入Collection状态并稳定后才发送BEST模式HTTP请求。FastLLM",
-        "> 要求正式请求Prefix Cache命中率为100%，避免报告混入Prefill尾块；Nsight",
+        "> Nsight进入Collection状态并稳定后才发送BEST模式HTTP请求。FastLLM会",
+        "> 按主流程退掉最后一个Cache页以重新产生首Token logits；报告依据GPU Trace",
+        "> 裁掉首Token以前的Prefill及采样，仅汇总后续稳定Decode事件。Nsight",
         "> 会扰动绝对延迟，正式TPOT仍应以非Profiler性能脚本为准。",
         "> GPU时间线空闲只统计首个与最后一个GPU事件之间的内部空隙；",
         "> 第一个输出Token属于Prefill，逐步指标按`output_tokens - 1`归一化。", "",
@@ -680,10 +791,10 @@ def make_report(result_dir, rows, top_count):
 
     lines.extend([
         "", "## GPU时间线", "",
-        "| Batch | 后端 | Decode步数 | Kernel(ms/步) | Kernel数/步 | "
+        "| Batch | 后端 | Decode步数 | 边界前排除事件 | Kernel(ms/步) | Kernel数/步 | "
         "MemOp(ms/步) | GPU跨度(ms/步) | GPU活跃(ms/步) | "
         "GPU内部空闲(ms/步) | 空闲占比 |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     for row in rows:
         nsys = row["nsys"]
@@ -691,6 +802,7 @@ def make_report(result_dir, rows, top_count):
         idle_ratio = timeline["idle_ratio"]
         lines.append(
             f"| {row['batch']} | {row['backend']} | {nsys['decode_steps']} | "
+            f"{nsys['stable_decode_filter']['excluded_event_count']} | "
             f"{fmt(nsys['kernel_ms_per_decode_step'])} | "
             f"{fmt(nsys['kernel_instances_per_decode_step'], 2)} | "
             f"{fmt(nsys['memory_ms_per_decode_step'])} | "
