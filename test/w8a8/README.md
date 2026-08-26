@@ -95,6 +95,13 @@ python test/w8a8/decode_nsys_compare.py \
   --output-tokens 64
 ```
 
+需要进一步区分GPU执行和CPU提交/调度影响时，在同一命令末尾增加
+`--cpu-trace`。脚本会在同一次采集中增加OS Runtime、逐次CUDA API和
+Kernel提交/排队数据，并在Markdown与XLSX中新增`CPU调度汇总`、
+`CPU-GPU联合分析`、`CUDA API分类`和`Top CUDA APIs`。其中
+`TPOT-GPU跨度`只是请求排队、CPU调度、同步和响应等未解释时间的综合差值，
+不能当成某个CPU函数的独占耗时。
+
 为避免Nsight importer被FastLLM使用的系统`libstdc++`干扰，脚本不会把
 `LD_PRELOAD`传给Nsight控制进程，只会把它传给被采集的模型服务。如果某个
 Nsight安装仍只生成`.qdstrm`而没有`.nsys-rep`，脚本会停止并给出明确错误，

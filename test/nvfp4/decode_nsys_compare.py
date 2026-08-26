@@ -82,6 +82,10 @@ def parse_args():
     parser.add_argument("--nsys", default="nsys")
     parser.add_argument("--top-kernels", type=int, default=20)
     parser.add_argument(
+        "--cpu-trace", action="store_true",
+        help=("在同一次Nsight采集中增加OS Runtime，并汇总稳定Decode区间的"
+              "CUDA API、Kernel提交、GPU排队及TPOT未解释时间"))
+    parser.add_argument(
         "--vllm-extra-arg", action="append", default=[],
         help="追加一个vLLM服务参数；需要多个参数时重复使用")
     return parser.parse_args()
@@ -197,9 +201,10 @@ def launch_profiled_server(args, backend, max_batch, backend_dir):
     session = re.sub(
         r"[^A-Za-z0-9_-]", "_",
         f"decode_{backend}_{os.getpid()}_{int(time.time())}")
+    trace_targets = "cuda,nvtx,osrt" if args.cpu_trace else "cuda,nvtx"
     launch = [
         args.nsys, "launch", f"--session-new={session}",
-        "--trace=cuda,nvtx", "--cuda-graph-trace=node",
+        f"--trace={trace_targets}", "--cuda-graph-trace=node",
         *target_command(command),
     ]
     log_path = backend_dir / "server.log"
@@ -341,6 +346,16 @@ def export_stats(args, report, report_name, output_base):
     return candidates[-1]
 
 
+def export_optional_stats(args, report, report_name, output_base):
+    """导出可能为空的Nsight报告；无对应事件时返回None。"""
+    try:
+        return export_stats(args, report, report_name, output_base)
+    except RuntimeError as error:
+        print(f"WARNING: 跳过可选Nsight报告{report_name}: {error}",
+              file=sys.stderr, flush=True)
+        return None
+
+
 def numeric(row, names):
     for name in names:
         value = row.get(name)
@@ -367,6 +382,23 @@ def percentile(values, percent):
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
+def summarize_intervals(intervals):
+    """汇总可能来自多个CPU线程的时间区间，分别保留累计与去重墙钟时间。"""
+    intervals = sorted((start, end) for start, end in intervals if end > start)
+    if not intervals:
+        return {"sum_ms": 0.0, "union_ms": 0.0}
+    merged = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return {
+        "sum_ms": sum(end - start for start, end in intervals) / 1e6,
+        "union_ms": sum(end - start for start, end in merged) / 1e6,
+    }
+
+
 def text_value(row, names):
     for name in names:
         value = row.get(name)
@@ -384,7 +416,8 @@ def summarize_named_rows(rows):
     result = []
     for row in rows:
         total_ns = numeric(row, ("Total Time (ns)", "Total Time"))
-        instances = int(numeric(row, ("Instances", "Count", "Calls")))
+        instances = int(numeric(row, (
+            "Instances", "Count", "Calls", "Num Calls")))
         average_ns = numeric(row, ("Avg (ns)", "Average (ns)", "Avg"))
         if not average_ns and instances:
             average_ns = total_ns / instances
@@ -549,8 +582,12 @@ def stable_decode_trace(rows):
 
     boundary_ns = events[boundary_index][0]
     stable_rows = [row for start, _, row in events if start >= boundary_ns]
+    stable_end_ns = max(
+        start + numeric(row, ("Duration (ns)", "Duration"))
+        for start, _, row in events if start >= boundary_ns)
     return stable_rows, {
         "boundary_ns": boundary_ns,
+        "stable_end_ns": stable_end_ns,
         "excluded_event_count": boundary_index,
         "stable_event_count": len(stable_rows),
         "first_sampling_kernel": trace_name(events[first_sampling][2]),
@@ -590,6 +627,119 @@ def summarize_gpu_timeline(rows):
     }
 
 
+def cuda_api_category(name):
+    """把CUDA Runtime/Driver API归并为少量CPU提交阶段。"""
+    lowered = name.lower()
+    if "launch" in lowered:
+        return "Kernel Launch"
+    if "synchronize" in lowered or "eventquery" in lowered:
+        return "Synchronization"
+    if "memcpy" in lowered or "memset" in lowered:
+        return "Memory"
+    if "malloc" in lowered or "free" in lowered or "alloc" in lowered:
+        return "Allocation"
+    return "Other CUDA API"
+
+
+def summarize_cpu_trace(kernel_exec_rows, api_rows, decode_filter):
+    """汇总稳定Decode窗口内CPU侧CUDA提交和GPU排队时间。"""
+    begin_ns = decode_filter["boundary_ns"]
+    end_ns = decode_filter["stable_end_ns"]
+    kernel_executions = []
+    unique_launches = {}
+    launcher_threads = set()
+    for row in kernel_exec_rows:
+        kernel_start = numeric(row, ("Kernel Start (ns)", "Kernel Start"))
+        if kernel_start < begin_ns or kernel_start > end_ns:
+            continue
+        api_start = numeric(row, ("API Start (ns)", "API Start"))
+        api_duration = numeric(row, ("API Dur (ns)", "API Dur"))
+        queue_duration = numeric(row, ("Queue Dur (ns)", "Queue Dur"))
+        thread_id = text_value(row, ("TID", "Tid", "Thread ID"))
+        if thread_id != "unknown":
+            launcher_threads.add(thread_id)
+        api_name = text_value(row, ("API Function", "API Name", "Name"))
+        if api_start > 0:
+            unique_launches.setdefault(
+                (api_start, api_duration, thread_id, api_name), {
+                    "start": api_start, "end": api_start + api_duration,
+                    "api_us": api_duration / 1e3,
+                })
+        kernel_executions.append({
+            "queue_us": queue_duration / 1e3,
+            "launch_to_kernel_us": (
+                max(0.0, kernel_start - api_start) / 1e3
+                if api_start > 0 else 0.0),
+        })
+
+    stable_apis = []
+    api_intervals = []
+    api_groups = {}
+    for row in api_rows:
+        start = numeric(row, ("Start (ns)", "Start"))
+        duration = numeric(row, ("Duration (ns)", "Duration"))
+        finish = start + duration
+        if duration <= 0 or finish < begin_ns or start > end_ns:
+            continue
+        name = text_value(row, ("Name", "API Name"))
+        stable_apis.append((name, duration))
+        api_intervals.append((start, finish))
+        group = api_groups.setdefault(
+            cuda_api_category(name), {"total_ms": 0.0, "calls": 0})
+        group["total_ms"] += duration / 1e6
+        group["calls"] += 1
+
+    named_apis = {}
+    for name, duration in stable_apis:
+        entry = named_apis.setdefault(name, {"total_ns": 0.0, "calls": 0})
+        entry["total_ns"] += duration
+        entry["calls"] += 1
+    top_apis = []
+    for name, value in named_apis.items():
+        top_apis.append({
+            "name": name,
+            "total_ms": value["total_ns"] / 1e6,
+            "calls": value["calls"],
+            "average_us": value["total_ns"] / value["calls"] / 1e3,
+        })
+    top_apis.sort(key=lambda item: item["total_ms"], reverse=True)
+
+    launch_intervals = [
+        (item["start"], item["end"]) for item in unique_launches.values()]
+    api_us = [item["api_us"] for item in unique_launches.values()]
+    queue_us = [item["queue_us"] for item in kernel_executions]
+    launch_to_kernel_us = [
+        item["launch_to_kernel_us"] for item in kernel_executions]
+    return {
+        "scope": "stable_decode_gpu_window",
+        "window_start_ns": begin_ns,
+        "window_end_ns": end_ns,
+        "kernel_execution_count": len(kernel_executions),
+        "launch_api_count": len(unique_launches),
+        "launcher_threads": len(launcher_threads),
+        "launch_api": {
+            **summarize_intervals(launch_intervals),
+            "median_us": percentile(api_us, 50),
+            "p95_us": percentile(api_us, 95),
+        },
+        "gpu_queue": {
+            "sum_ms": sum(queue_us) / 1e3,
+            "median_us": percentile(queue_us, 50),
+            "p95_us": percentile(queue_us, 95),
+        },
+        "launch_to_kernel": {
+            "median_us": percentile(launch_to_kernel_us, 50),
+            "p95_us": percentile(launch_to_kernel_us, 95),
+        },
+        "cuda_api": {
+            **summarize_intervals(api_intervals),
+            "calls": len(stable_apis),
+            "categories": api_groups,
+            "top": top_apis,
+        },
+    }
+
+
 def summarize_report(args, report, output_base):
     kernel_csv = export_stats(
         args, report, "cuda_gpu_kern_sum", output_base.with_name(
@@ -603,6 +753,23 @@ def summarize_report(args, report, output_base):
     timeline_csv = export_stats(
         args, report, "cuda_gpu_trace", output_base.with_name(
             output_base.name + "-gpu-trace"))
+    kernel_exec_csv = None
+    api_trace_csv = None
+    osrt_csv = None
+    nvtx_csv = None
+    if args.cpu_trace:
+        kernel_exec_csv = export_stats(
+            args, report, "cuda_kern_exec_trace", output_base.with_name(
+                output_base.name + "-kernel-exec"))
+        api_trace_csv = export_stats(
+            args, report, "cuda_api_trace", output_base.with_name(
+                output_base.name + "-cuda-api-trace"))
+        osrt_csv = export_optional_stats(
+            args, report, "osrt_sum", output_base.with_name(
+                output_base.name + "-os-runtime"))
+        nvtx_csv = export_optional_stats(
+            args, report, "nvtx_sum", output_base.with_name(
+                output_base.name + "-nvtx"))
     # cuda_gpu_kern_sum保留完整请求，便于人工核对；正式Decode汇总必须从
     # 逐事件Trace裁掉首Token以前的Prefill与采样，避免Cache最后一页重算
     # 污染M形状、Kernel次数和GPU总时间。
@@ -612,6 +779,22 @@ def summarize_report(args, report, output_base):
     apis = summarize_named_rows(read_stats_csv(api_csv))
     memory = summarize_named_rows(read_stats_csv(memory_csv))
     timeline = summarize_gpu_timeline(trace_rows)
+    cpu_trace = None
+    if args.cpu_trace:
+        cpu_trace = summarize_cpu_trace(
+            read_stats_csv(kernel_exec_csv), read_stats_csv(api_trace_csv),
+            decode_filter)
+        cpu_trace["kernel_exec_csv"] = str(kernel_exec_csv)
+        cpu_trace["api_trace_csv"] = str(api_trace_csv)
+        cpu_trace["osrt_csv"] = None if osrt_csv is None else str(osrt_csv)
+        cpu_trace["nvtx_csv"] = None if nvtx_csv is None else str(nvtx_csv)
+        cpu_trace["os_runtime_scope"] = "full_collected_request"
+        cpu_trace["top_os_runtime"] = (
+            [] if osrt_csv is None else
+            summarize_named_rows(read_stats_csv(osrt_csv))[:10])
+        cpu_trace["top_nvtx"] = (
+            [] if nvtx_csv is None else
+            summarize_named_rows(read_stats_csv(nvtx_csv))[:10])
     stable_memory_total_ms = sum(
         numeric(row, ("Duration (ns)", "Duration"))
         for row in trace_rows if is_memory_trace_row(row)) / 1e6
@@ -637,6 +820,7 @@ def summarize_report(args, report, output_base):
         "top_kernels": kernels[:args.top_kernels],
         "top_cuda_apis": apis[:10],
         "memory_operations": memory,
+        "cpu_trace": cpu_trace,
     }
 
 
@@ -741,6 +925,25 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                                  "unreported"),
                 "nsys": summary,
             }
+            cpu_trace = summary["cpu_trace"]
+            if cpu_trace is not None:
+                cpu_trace["launch_api_sum_ms_per_decode_step"] = (
+                    cpu_trace["launch_api"]["sum_ms"] / decode_steps)
+                cpu_trace["launch_api_union_ms_per_decode_step"] = (
+                    cpu_trace["launch_api"]["union_ms"] / decode_steps)
+                cpu_trace["cuda_api_sum_ms_per_decode_step"] = (
+                    cpu_trace["cuda_api"]["sum_ms"] / decode_steps)
+                cpu_trace["cuda_api_union_ms_per_decode_step"] = (
+                    cpu_trace["cuda_api"]["union_ms"] / decode_steps)
+                # 这是端到端TPOT与GPU事件跨度之差，不等同于纯CPU执行时间；
+                # 它还包含请求排队、同步、线程唤醒和HTTP返回等未被GPU覆盖的时间。
+                cpu_trace["tpot_minus_gpu_span_ms_per_step"] = (
+                    None if row["tpot_ms"] is None else
+                    row["tpot_ms"] - timeline["span_ms_per_decode_step"])
+                cpu_trace["non_cuda_host_ms_per_step"] = (
+                    None if cpu_trace["tpot_minus_gpu_span_ms_per_step"] is None
+                    else cpu_trace["tpot_minus_gpu_span_ms_per_step"] -
+                    cpu_trace["cuda_api_union_ms_per_decode_step"])
             (case_dir / "result.json").write_text(
                 json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
             rows.append(row)
@@ -952,6 +1155,80 @@ def make_excel_report(result_dir, rows, top_count):
         ])
     sheets.append(("GPU时间线", timeline_headers, timeline_rows))
 
+    cpu_rows = [row for row in rows if row["nsys"].get("cpu_trace")]
+    if cpu_rows:
+        cpu_headers = [
+            "Batch", "后端", "TPOT(ms)", "GPU跨度(ms/步)",
+            "TPOT-GPU跨度(ms/步)", "CUDA API累计(ms/步)",
+            "CUDA API去重墙钟(ms/步)", "非CUDA主机剩余(ms/步)",
+            "Kernel提交API累计(ms/步)",
+            "Kernel提交API去重墙钟(ms/步)", "Kernel执行数/步",
+            "Kernel提交API数/步", "提交CPU线程数", "提交API P50(us)",
+            "提交API P95(us)",
+            "GPU排队P50(us)", "GPU排队P95(us)",
+            "提交到Kernel P50(us)", "提交到Kernel P95(us)",
+        ]
+        cpu_sheet_rows = []
+        for row in cpu_rows:
+            cpu = row["nsys"]["cpu_trace"]
+            steps = row["nsys"]["decode_steps"]
+            cpu_sheet_rows.append([
+                row["batch"], row["backend"], row["tpot_ms"],
+                row["nsys"]["timeline"]["span_ms_per_decode_step"],
+                cpu["tpot_minus_gpu_span_ms_per_step"],
+                cpu["cuda_api_sum_ms_per_decode_step"],
+                cpu["cuda_api_union_ms_per_decode_step"],
+                cpu["non_cuda_host_ms_per_step"],
+                cpu["launch_api_sum_ms_per_decode_step"],
+                cpu["launch_api_union_ms_per_decode_step"],
+                cpu["kernel_execution_count"] / steps,
+                cpu["launch_api_count"] / steps, cpu["launcher_threads"],
+                cpu["launch_api"]["median_us"],
+                cpu["launch_api"]["p95_us"],
+                cpu["gpu_queue"]["median_us"],
+                cpu["gpu_queue"]["p95_us"],
+                cpu["launch_to_kernel"]["median_us"],
+                cpu["launch_to_kernel"]["p95_us"],
+            ])
+        sheets.append(("CPU调度汇总", cpu_headers, cpu_sheet_rows))
+        api_rows = []
+        for row in cpu_rows:
+            cpu = row["nsys"]["cpu_trace"]
+            steps = row["nsys"]["decode_steps"]
+            for category, value in cpu["cuda_api"]["categories"].items():
+                api_rows.append([
+                    row["batch"], row["backend"], category,
+                    value["total_ms"], value["total_ms"] / steps,
+                    value["calls"], value["calls"] / steps,
+                ])
+        sheets.append(("CUDA API分类", [
+            "Batch", "后端", "类别", "CPU线程累计时间(ms)",
+            "累计时间(ms/步)", "调用数", "调用数/步"], api_rows))
+        top_api_rows = []
+        for row in cpu_rows:
+            for rank, item in enumerate(
+                    row["nsys"]["cpu_trace"]["cuda_api"]["top"][:20], 1):
+                top_api_rows.append([
+                    row["batch"], row["backend"], rank, item["name"],
+                    item["calls"], item["total_ms"], item["average_us"],
+                ])
+        sheets.append(("Top CUDA APIs", [
+            "Batch", "后端", "排名", "CUDA API", "调用数",
+            "CPU线程累计时间(ms)", "平均(us)"], top_api_rows))
+        osrt_rows = []
+        for row in cpu_rows:
+            for rank, item in enumerate(
+                    row["nsys"]["cpu_trace"]["top_os_runtime"], 1):
+                osrt_rows.append([
+                    row["batch"], row["backend"], rank, item["name"],
+                    item["instances"], item["total_ms"], item["average_us"],
+                    "完整采集请求，未裁剪到稳定Decode窗口",
+                ])
+        if osrt_rows:
+            sheets.append(("OS Runtime热点", [
+                "Batch", "后端", "排名", "OS Runtime", "调用数",
+                "CPU线程累计时间(ms)", "平均(us)", "统计范围"], osrt_rows))
+
     by_case = {(row["batch"], row["backend"]): row for row in rows}
     paired_batches = sorted({
         row["batch"] for row in rows
@@ -979,6 +1256,48 @@ def make_excel_report(result_dir, rows, top_count):
         sheets.append(("FastLLM-vLLM比值", [
             "Batch", "TPOT比", "Batch Wall比", "Output吞吐比",
             "Kernel时间/步比", "GPU内部空闲/步比"], ratio_rows))
+
+    cpu_joint_rows = []
+    for batch in paired_batches:
+        fast = by_case[(batch, "fastllm")]
+        vllm = by_case[(batch, "vllm")]
+        fast_cpu = fast["nsys"].get("cpu_trace")
+        vllm_cpu = vllm["nsys"].get("cpu_trace")
+        if fast_cpu is None or vllm_cpu is None:
+            continue
+        fast_gpu = fast["nsys"]["timeline"]["span_ms_per_decode_step"]
+        vllm_gpu = vllm["nsys"]["timeline"]["span_ms_per_decode_step"]
+        cpu_joint_rows.append([
+            batch,
+            fast["tpot_ms"], vllm["tpot_ms"],
+            fast["tpot_ms"] - vllm["tpot_ms"],
+            fast_gpu, vllm_gpu, fast_gpu - vllm_gpu,
+            fast_cpu["tpot_minus_gpu_span_ms_per_step"],
+            vllm_cpu["tpot_minus_gpu_span_ms_per_step"],
+            fast_cpu["tpot_minus_gpu_span_ms_per_step"] -
+            vllm_cpu["tpot_minus_gpu_span_ms_per_step"],
+            fast_cpu["non_cuda_host_ms_per_step"],
+            vllm_cpu["non_cuda_host_ms_per_step"],
+            fast_cpu["non_cuda_host_ms_per_step"] -
+            vllm_cpu["non_cuda_host_ms_per_step"],
+            fast_cpu["launch_api_union_ms_per_decode_step"],
+            vllm_cpu["launch_api_union_ms_per_decode_step"],
+            fast_cpu["launch_api_union_ms_per_decode_step"] -
+            vllm_cpu["launch_api_union_ms_per_decode_step"],
+            fast_cpu["gpu_queue"]["p95_us"],
+            vllm_cpu["gpu_queue"]["p95_us"],
+        ])
+    if cpu_joint_rows:
+        sheets.append(("CPU-GPU联合分析", [
+            "Batch", "FastLLM TPOT(ms)", "vLLM TPOT(ms)", "TPOT差(ms)",
+            "FastLLM GPU跨度(ms/步)", "vLLM GPU跨度(ms/步)",
+            "GPU跨度差(ms/步)", "FastLLM未解释(ms/步)",
+            "vLLM未解释(ms/步)", "未解释时间差(ms/步)",
+            "FastLLM非CUDA主机剩余(ms/步)",
+            "vLLM非CUDA主机剩余(ms/步)", "非CUDA主机剩余差(ms/步)",
+            "FastLLM提交墙钟(ms/步)", "vLLM提交墙钟(ms/步)",
+            "提交墙钟差(ms/步)", "FastLLM GPU排队P95(us)",
+            "vLLM GPU排队P95(us)"], cpu_joint_rows))
 
     category_rows = []
     for row in rows:
@@ -1098,6 +1417,37 @@ def make_report(result_dir, rows, top_count):
             f"{fmt(timeline['idle_ms_per_decode_step'])} | "
             f"{'n/a' if idle_ratio is None else f'{idle_ratio * 100:.1f}%'} |")
 
+    cpu_rows = [row for row in rows if row["nsys"].get("cpu_trace")]
+    if cpu_rows:
+        lines.extend([
+            "", "## CPU调度汇总", "",
+            "> `TPOT-GPU跨度`是CPU调度、同步、请求排队和响应等未被GPU事件",
+            "> 覆盖的综合差值，不等同于纯CPU执行时间。CUDA API累计时间会叠加",
+            "> 多线程重叠，去重墙钟时间才表示时间轴覆盖长度。", "",
+            "| Batch | 后端 | TPOT(ms) | GPU跨度(ms/步) | 未解释(ms/步) | "
+            "CUDA API墙钟(ms/步) | 非CUDA主机剩余(ms/步) | "
+            "提交墙钟(ms/步) | Kernel执行数/步 | "
+            "提交API数/步 | "
+            "提交API P95(us) | GPU排队P95(us) | 提交到Kernel P95(us) |",
+            "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | "
+            "---: | ---: | ---: | ---: | ---: |",
+        ])
+        for row in cpu_rows:
+            cpu = row["nsys"]["cpu_trace"]
+            steps = row["nsys"]["decode_steps"]
+            lines.append(
+                f"| {row['batch']} | {row['backend']} | {fmt(row['tpot_ms'])} | "
+                f"{fmt(row['nsys']['timeline']['span_ms_per_decode_step'])} | "
+                f"{fmt(cpu['tpot_minus_gpu_span_ms_per_step'])} | "
+                f"{fmt(cpu['cuda_api_union_ms_per_decode_step'])} | "
+                f"{fmt(cpu['non_cuda_host_ms_per_step'])} | "
+                f"{fmt(cpu['launch_api_union_ms_per_decode_step'])} | "
+                f"{cpu['kernel_execution_count'] / steps:.2f} | "
+                f"{cpu['launch_api_count'] / steps:.2f} | "
+                f"{fmt(cpu['launch_api']['p95_us'])} | "
+                f"{fmt(cpu['gpu_queue']['p95_us'])} | "
+                f"{fmt(cpu['launch_to_kernel']['p95_us'])} |")
+
     by_case = {(row["batch"], row["backend"]): row for row in rows}
     paired_batches = sorted({
         row["batch"] for row in rows
@@ -1131,6 +1481,28 @@ def make_report(result_dir, rows, top_count):
                 f"{ratio_text(fast['output_tok_s'], vllm['output_tok_s'])} | "
                 f"{ratio_text(fast['nsys']['kernel_ms_per_decode_step'], vllm['nsys']['kernel_ms_per_decode_step'])} | "
                 f"{ratio_text(fast['nsys']['timeline']['idle_ms_per_decode_step'], vllm['nsys']['timeline']['idle_ms_per_decode_step'])} |")
+
+        if all(by_case[(batch, backend)]["nsys"].get("cpu_trace")
+               for batch in paired_batches for backend in BACKENDS):
+            lines.extend([
+                "", "## CPU-GPU联合分析", "",
+                "> 差值均为`FastLLM-vLLM`；负数表示FastLLM耗时更少。", "",
+                "| Batch | TPOT差(ms) | GPU跨度差(ms/步) | "
+                "未解释时间差(ms/步) | 非CUDA主机剩余差(ms/步) | "
+                "提交墙钟差(ms/步) |",
+                "| ---: | ---: | ---: | ---: | ---: | ---: |",
+            ])
+            for batch in paired_batches:
+                fast = by_case[(batch, "fastllm")]
+                vllm = by_case[(batch, "vllm")]
+                fast_cpu = fast["nsys"]["cpu_trace"]
+                vllm_cpu = vllm["nsys"]["cpu_trace"]
+                lines.append(
+                    f"| {batch} | {fast['tpot_ms'] - vllm['tpot_ms']:+.3f} | "
+                    f"{fast['nsys']['timeline']['span_ms_per_decode_step'] - vllm['nsys']['timeline']['span_ms_per_decode_step']:+.3f} | "
+                    f"{fast_cpu['tpot_minus_gpu_span_ms_per_step'] - vllm_cpu['tpot_minus_gpu_span_ms_per_step']:+.3f} | "
+                    f"{fast_cpu['non_cuda_host_ms_per_step'] - vllm_cpu['non_cuda_host_ms_per_step']:+.3f} | "
+                    f"{fast_cpu['launch_api_union_ms_per_decode_step'] - vllm_cpu['launch_api_union_ms_per_decode_step']:+.3f} |")
 
     lines.extend(["", "## 算子类别", "",
                   "> 类别根据Nsight Kernel符号归纳；同名GEMM不能仅凭符号可靠区分",

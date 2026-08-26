@@ -205,6 +205,11 @@ python test/nvfp4/decode_nsys_compare.py \
   --batch-sizes 1,2,4,8,16,32
 ```
 
+在命令末尾增加`--cpu-trace`，可在同一次Nsight采集中补充稳定Decode窗口的
+CUDA API、Kernel提交、GPU排队和`TPOT-GPU跨度`综合差值。Markdown及XLSX
+会新增CPU调度与CPU-GPU联合分析；该综合差值包含排队、同步和响应等时间，
+不是某个CPU函数的独占耗时。
+
 Nsight结果用于性能归因，不替代未启用Profiler时的正式TPOT结果。脚本会
 隔离Nsight importer与目标服务的`LD_PRELOAD`，避免只产生无法解析的
 `.qdstrm`文件。
