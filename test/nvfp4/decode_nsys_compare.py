@@ -11,6 +11,8 @@ import shlex
 import subprocess
 import sys
 import time
+import zipfile
+from xml.sax.saxutils import escape
 
 import requests
 
@@ -759,6 +761,291 @@ def fmt(value, digits=3):
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
+def excel_column_name(index):
+    """把从1开始的列号转换成Excel列名。"""
+    name = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(ord("A") + remainder) + name
+    return name
+
+
+def excel_sheet_name(value, used_names):
+    """生成符合Excel限制且在当前工作簿中唯一的工作表名称。"""
+    value = re.sub(r"[\\/*?:\[\]]", "_", value).strip("'") or "Sheet"
+    value = value[:31]
+    candidate = value
+    suffix = 2
+    while candidate in used_names:
+        marker = f"-{suffix}"
+        candidate = value[:31 - len(marker)] + marker
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def excel_cell_xml(reference, value, style=0):
+    """将一个Python标量编码成OOXML单元格。"""
+    style_attr = f' s="{style}"' if style else ""
+    if value is None:
+        return f'<c r="{reference}"{style_attr} t="inlineStr"><is><t>n/a</t></is></c>'
+    if isinstance(value, bool):
+        return f'<c r="{reference}"{style_attr} t="b"><v>{int(value)}</v></c>'
+    if isinstance(value, (int, float)):
+        return f'<c r="{reference}"{style_attr}><v>{value}</v></c>'
+    text = escape(str(value))
+    preserve = ' xml:space="preserve"' if str(value).strip() != str(value) else ""
+    return (f'<c r="{reference}"{style_attr} t="inlineStr"><is>'
+            f'<t{preserve}>{text}</t></is></c>')
+
+
+def write_xlsx(path, sheets):
+    """仅使用Python标准库写出包含多个表格的标准XLSX工作簿。"""
+    used_names = set()
+    normalized = []
+    for name, headers, rows in sheets:
+        normalized.append((excel_sheet_name(name, used_names), headers, rows))
+
+    content_types = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+        '<Default Extension="xml" ContentType="application/xml"/>',
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+    ]
+    for index in range(1, len(normalized) + 1):
+        content_types.append(
+            f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+    content_types.append('</Types>')
+
+    workbook_sheets = "".join(
+        f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, (name, _, _) in enumerate(normalized, 1))
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets>{workbook_sheets}</sheets></workbook>')
+    workbook_rels = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    ]
+    for index in range(1, len(normalized) + 1):
+        workbook_rels.append(
+            f'<Relationship Id="rId{index}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{index}.xml"/>')
+    workbook_rels.append(
+        f'<Relationship Id="rId{len(normalized) + 1}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>')
+    workbook_rels.append('</Relationships>')
+
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/></Relationships>')
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>'
+        '<fills count="3"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/>'
+        '<bgColor indexed="64"/></patternFill></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/>'
+        '</cellStyles></styleSheet>')
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "".join(content_types))
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", "".join(workbook_rels))
+        archive.writestr("xl/styles.xml", styles)
+        for sheet_index, (_, headers, rows) in enumerate(normalized, 1):
+            all_rows = [headers, *rows]
+            widths = []
+            for column_index, header in enumerate(headers):
+                values = [header] + [
+                    row[column_index] if column_index < len(row) else ""
+                    for row in rows
+                ]
+                widths.append(min(80, max(10, max(len(str(value)) for value in values) + 2)))
+            columns = "".join(
+                f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
+                for index, width in enumerate(widths, 1))
+            row_xml = []
+            for row_index, row in enumerate(all_rows, 1):
+                cells = "".join(
+                    excel_cell_xml(
+                        f"{excel_column_name(column_index)}{row_index}", value,
+                        1 if row_index == 1 else 0)
+                    for column_index, value in enumerate(row, 1))
+                row_xml.append(f'<row r="{row_index}">{cells}</row>')
+            last_cell = f"{excel_column_name(len(headers))}{len(all_rows)}"
+            worksheet = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+                'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                f'<cols>{columns}</cols><sheetData>{"".join(row_xml)}</sheetData>'
+                f'<autoFilter ref="A1:{last_cell}"/></worksheet>')
+            archive.writestr(f"xl/worksheets/sheet{sheet_index}.xml", worksheet)
+
+
+def make_excel_report(result_dir, rows, top_count):
+    """把Decode Nsight结构化结果写入便于筛选分析的Excel工作簿。"""
+    sheets = []
+    sheets.append(("说明", ["项目", "内容"], [
+        ["报告", "FastLLM / vLLM Decode Nsight Systems对比"],
+        ["计时范围", "GPU Trace中首Token之后的稳定Decode阶段"],
+        ["Decode步数", "第一个输出Token属于Prefill，按output_tokens - 1归一化"],
+        ["注意", "Nsight会扰动绝对延迟，正式TPOT以非Profiler性能脚本为准"],
+        ["类别限制", "同名GEMM无法仅凭符号区分o_proj与MLP Linear"],
+    ]))
+
+    engine_headers = [
+        "Batch", "后端", "平均TPOT(ms)", "请求TPOT P50(ms)",
+        "请求TPOT P95(ms)", "ITL(ms)", "请求E2EL P50(ms)",
+        "请求E2EL P95(ms)", "Batch Wall(ms)", "Output(tok/s)",
+        "Cache命中率",
+    ]
+    engine_rows = []
+    for row in rows:
+        engine_rows.append([
+            row["batch"], row["backend"], row["tpot_ms"],
+            row["request_tpot_p50_ms"], row["request_tpot_p95_ms"],
+            row["itl_ms"], row["request_e2el_p50_ms"],
+            row["request_e2el_p95_ms"], row["request_wall_ms"],
+            row["output_tok_s"],
+            None if row["cache_status"] == "unreported" else row["cache_hit_ratio"],
+        ])
+    sheets.append(("引擎指标", engine_headers, engine_rows))
+
+    timeline_headers = [
+        "Batch", "后端", "Decode步数", "边界前排除事件", "Kernel(ms/步)",
+        "Kernel数/步", "MemOp(ms/步)", "GPU跨度(ms/步)",
+        "GPU活跃(ms/步)", "GPU内部空闲(ms/步)", "空闲占比",
+    ]
+    timeline_rows = []
+    for row in rows:
+        nsys = row["nsys"]
+        timeline = nsys["timeline"]
+        timeline_rows.append([
+            row["batch"], row["backend"], nsys["decode_steps"],
+            nsys["stable_decode_filter"]["excluded_event_count"],
+            nsys["kernel_ms_per_decode_step"],
+            nsys["kernel_instances_per_decode_step"],
+            nsys["memory_ms_per_decode_step"],
+            timeline["span_ms_per_decode_step"],
+            timeline["active_ms_per_decode_step"],
+            timeline["idle_ms_per_decode_step"], timeline["idle_ratio"],
+        ])
+    sheets.append(("GPU时间线", timeline_headers, timeline_rows))
+
+    by_case = {(row["batch"], row["backend"]): row for row in rows}
+    paired_batches = sorted({
+        row["batch"] for row in rows
+        if (row["batch"], "fastllm") in by_case and
+        (row["batch"], "vllm") in by_case
+    })
+    ratio_rows = []
+    for batch in paired_batches:
+        fast = by_case[(batch, "fastllm")]
+        vllm = by_case[(batch, "vllm")]
+
+        def ratio(left, right):
+            return None if left is None or right in (None, 0) else left / right
+
+        ratio_rows.append([
+            batch, ratio(fast["tpot_ms"], vllm["tpot_ms"]),
+            ratio(fast["request_wall_ms"], vllm["request_wall_ms"]),
+            ratio(fast["output_tok_s"], vllm["output_tok_s"]),
+            ratio(fast["nsys"]["kernel_ms_per_decode_step"],
+                  vllm["nsys"]["kernel_ms_per_decode_step"]),
+            ratio(fast["nsys"]["timeline"]["idle_ms_per_decode_step"],
+                  vllm["nsys"]["timeline"]["idle_ms_per_decode_step"]),
+        ])
+    if ratio_rows:
+        sheets.append(("FastLLM-vLLM比值", [
+            "Batch", "TPOT比", "Batch Wall比", "Output吞吐比",
+            "Kernel时间/步比", "GPU内部空闲/步比"], ratio_rows))
+
+    category_rows = []
+    for row in rows:
+        for category, value in sorted(
+                row["nsys"]["categories"].items(),
+                key=lambda item: item[1]["total_ms"], reverse=True):
+            category_rows.append([
+                row["batch"], row["backend"], category, value["total_ms"],
+                value["total_ms_per_decode_step"], value["instances"],
+                value["instances_per_decode_step"],
+            ])
+    sheets.append(("算子类别", [
+        "Batch", "后端", "类别", "GPU总时间(ms)", "GPU时间(ms/步)",
+        "Kernel总数", "Kernel数/步"], category_rows))
+
+    compare_rows = []
+    for batch in paired_batches:
+        fast = by_case[(batch, "fastllm")]
+        vllm = by_case[(batch, "vllm")]
+        fast_categories = fast["nsys"]["categories"]
+        vllm_categories = vllm["nsys"]["categories"]
+        for category in ordered_categories(set(fast_categories) | set(vllm_categories)):
+            fast_value = fast_categories.get(
+                category, {"total_ms": 0.0, "instances": 0,
+                           "total_ms_per_decode_step": 0.0})
+            vllm_value = vllm_categories.get(
+                category, {"total_ms": 0.0, "instances": 0,
+                           "total_ms_per_decode_step": 0.0})
+            compare_rows.append([
+                batch, category, fast_value["total_ms"], vllm_value["total_ms"],
+                fast_value["total_ms"] - vllm_value["total_ms"],
+                fast_value["total_ms_per_decode_step"],
+                vllm_value["total_ms_per_decode_step"],
+                fast_value["instances"], vllm_value["instances"],
+                fast_value["instances"] - vllm_value["instances"],
+            ])
+        fast_timeline = fast["nsys"]["timeline"]
+        vllm_timeline = vllm["nsys"]["timeline"]
+        compare_rows.append([
+            batch, "GPU Internal Idle", fast_timeline["idle_ms"],
+            vllm_timeline["idle_ms"],
+            fast_timeline["idle_ms"] - vllm_timeline["idle_ms"],
+            fast_timeline["idle_ms_per_decode_step"],
+            vllm_timeline["idle_ms_per_decode_step"], None, None, None,
+        ])
+    if compare_rows:
+        sheets.append(("算子并排对比", [
+            "Batch", "类别", "FastLLM总耗时(ms)", "vLLM总耗时(ms)",
+            "时间差(ms)", "FastLLM(ms/步)", "vLLM(ms/步)",
+            "FastLLM启动数", "vLLM启动数", "启动数差"], compare_rows))
+
+    top_rows = []
+    for row in rows:
+        for rank, item in enumerate(row["nsys"]["top_kernels"][:top_count], 1):
+            top_rows.append([
+                row["batch"], row["backend"], rank, item["name"],
+                item["instances"], item["total_ms"], item["average_us"],
+            ])
+    sheets.append(("Top Kernels", [
+        "Batch", "后端", "排名", "Kernel", "调用次数", "总时间(ms)",
+        "平均(us)"], top_rows))
+
+    path = result_dir / "decode-nsys-compare.xlsx"
+    write_xlsx(path, sheets)
+    return path
+
+
 def make_report(result_dir, rows, top_count):
     lines = [
         "# FastLLM / vLLM Decode Nsight Systems对比", "",
@@ -925,8 +1212,10 @@ def make_report(result_dir, rows, top_count):
     path.write_text(report, encoding="utf-8")
     (result_dir / "decode-nsys-compare.json").write_text(
         json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    excel_path = make_excel_report(result_dir, rows, top_count)
     print(report)
     print(f"Markdown: {path}")
+    print(f"Excel: {excel_path}")
 
 
 def main():
