@@ -95,6 +95,31 @@ python test/w8a8/decode_nsys_compare.py \
   --output-tokens 64
 ```
 
+若Nsight Systems已经把Attention差距定位到FastLLM的
+`PersistentVariableLengthMergeStatesKernel`和vLLM的
+`flash_fwd_splitkv_combine_kernel`，可再用独立的Nsight Compute入口做
+同Batch、同Prompt的单Kernel对比。脚本读取前一步的稳定Decode边界，自动
+计算`launch-skip`，跳过正式请求的Prefill尾部，只采集首个稳定Decode合并
+Kernel。vLLM的EngineCore是子进程，脚本会把Profiler启停控制同时注入API
+Server及其Python子进程，避免采到错误进程。
+
+```bash
+python test/w8a8/attention_ncu_compare.py \
+  --model /root/autodl-tmp/neuralmagic/Qwen2___5-7B-FP8-dynamic \
+  --nsys-result-dir test/w8a8/logs/decode-nsys \
+  --result-dir test/w8a8/logs/attention-ncu \
+  --vllm-python /root/miniconda3/bin/python \
+  --fastllm-python /root/miniconda3/bin/python \
+  --batch 1 \
+  --prompt-tokens 512 \
+  --output-tokens 64
+```
+
+输出`attention-ncu-compare.{md,json,xlsx}`及双方原始`.ncu-rep`。报告比较
+Duration、DRAM读写、带宽、Occupancy、寄存器、共享内存和Warp Stall。
+NCU不直接提供逻辑Split数量，不能用Grid大小代替Split数量。NCU会重放
+Kernel，因此该结果只用于解释合并Kernel为何有差距，不用于计算TPOT。
+
 需要进一步区分GPU执行和CPU提交/调度影响时，在同一命令末尾增加
 `--cpu-trace`。脚本会在同一次采集中增加OS Runtime、逐次CUDA API和
 Kernel提交/排队数据，并在Markdown与XLSX中新增`CPU调度汇总`、

@@ -214,6 +214,26 @@ Nsight结果用于性能归因，不替代未启用Profiler时的正式TPOT结�
 隔离Nsight importer与目标服务的`LD_PRELOAD`，避免只产生无法解析的
 `.qdstrm`文件。
 
+当Nsight Systems已定位到Attention合并Kernel后，可使用独立的Nsight
+Compute入口对比FastLLM的FlashInfer merge与vLLM的split-KV combine。该
+入口复用前一步的稳定Decode边界，自动跳过Prefill尾部，只采集首个稳定
+Decode目标Kernel：
+
+```bash
+python test/nvfp4/attention_ncu_compare.py \
+  --model /models/TinyLlama-1.1B-Chat-v1.0-NVFP4 \
+  --quantization nvfp4 \
+  --nsys-result-dir test/nvfp4/logs/decode-nsys \
+  --result-dir test/nvfp4/logs/attention-ncu \
+  --vllm-python /root/miniconda3/bin/python \
+  --fastllm-python /root/miniconda3/bin/python \
+  --batch 1
+```
+
+结果包含`.md/.json/.xlsx`和双方原始`.ncu-rep`。NCU会重放Kernel，报告
+只用于分析工作量、内存效率、占用率和Warp Stall，不能替代正式TPOT。
+NCU不直接暴露逻辑Split数量，脚本不会把Grid大小误写成Split数量。
+
 一次执行全部：
 
 ```bash
