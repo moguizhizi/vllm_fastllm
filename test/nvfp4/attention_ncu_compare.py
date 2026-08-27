@@ -67,11 +67,12 @@ def parse_args():
     parser.add_argument("--startup-timeout", type=int, default=1200)
     parser.add_argument("--request-timeout", type=int, default=3600)
     parser.add_argument("--profile-timeout", type=int, default=1800)
+    parser.add_argument("--nsys", default="nsys")
     parser.add_argument("--ncu", default="ncu")
     parser.add_argument("--set", dest="section_set", default="full")
     parser.add_argument(
-        "--profile-cuda-graph", action="store_true",
-        help="实验选项：在CUDA Graph内采集；部分NCU版本无法后挂接节点")
+        "--skip-discovery", action="store_true",
+        help="跳过目标Kernel启动期发现；仅用于已验证环境的重复测试")
     parser.add_argument(
         "--vllm-extra-arg", action="append", default=[],
         help="追加一个vLLM服务参数；需要多个参数时重复使用")
@@ -173,6 +174,33 @@ def signal_target_processes(pid_dir, signum):
     return signaled
 
 
+def prepare_target(args, backend, backend_dir):
+    """准备启用CUDA Graph的服务命令、进程登记目录和隔离后的环境。"""
+    server_command, target_env, served_name = decode_nsys.server_spec(
+        args, backend, args.batch)
+    pid_dir = backend_dir / "target-pids"
+    pid_dir.mkdir(parents=True, exist_ok=True)
+    for stale_pid in pid_dir.glob("*.pid"):
+        stale_pid.unlink()
+    target_env["FASTLLM_NCU_TARGET_PID_DIR"] = str(pid_dir)
+    sitecustomize_dir = str(
+        REPO_DIR / "test" / "nvfp4" / "ncu_sitecustomize")
+    current_pythonpath = target_env.get("PYTHONPATH", "")
+    target_env["PYTHONPATH"] = (
+        sitecustomize_dir if not current_pythonpath else
+        f"{sitecustomize_dir}{os.pathsep}{current_pythonpath}")
+    target = decode_nsys.target_command(server_command)
+    control_env = decode_nsys.nsys_control_env()
+    control_env.update({key: value for key, value in target_env.items()
+                        if key != "LD_PRELOAD"})
+    server = {
+        "base_url": f"http://127.0.0.1:{args.port}",
+        "served_name": served_name,
+        "backend": backend,
+    }
+    return target, control_env, server, pid_dir
+
+
 def find_report(output_base):
     direct = output_base.with_suffix(".ncu-rep")
     if direct.exists():
@@ -196,61 +224,202 @@ def stop_process_group(process):
             pass
 
 
-def run_profile(args, backend, prompt, calibration, backend_dir):
-    """启动关闭默认采集的NCU服务，只剖析首个稳定Decode合并Kernel。"""
-    backend_dir.mkdir(parents=True, exist_ok=True)
-    server_command, target_env, served_name = decode_nsys.server_spec(
-        args, backend, args.batch)
-    if not args.profile_cuda_graph:
-        # NCU在CUDA Graph已经录制后才由cudaProfilerStart挂接时，部分版本
-        # 看不到已有Graph内的独立节点。微观对比只关闭Graph包装，模型、
-        # Prompt、Batch、Kernel和张量形状保持不变；正式TPOT仍以BEST测试为准。
-        if backend == "fastllm":
-            target_env["FASTLLM_CUDA_GRAPH"] = "0"
-        elif "--enforce-eager" not in server_command:
-            server_command.append("--enforce-eager")
-    pid_dir = backend_dir / "target-pids"
-    pid_dir.mkdir(parents=True, exist_ok=True)
-    for stale_pid in pid_dir.glob("*.pid"):
-        stale_pid.unlink()
-    target_env["FASTLLM_NCU_TARGET_PID_DIR"] = str(pid_dir)
-    sitecustomize_dir = str(
-        REPO_DIR / "test" / "nvfp4" / "ncu_sitecustomize")
-    current_pythonpath = target_env.get("PYTHONPATH", "")
-    target_env["PYTHONPATH"] = (
-        sitecustomize_dir if not current_pythonpath else
-        f"{sitecustomize_dir}{os.pathsep}{current_pythonpath}")
-    target = decode_nsys.target_command(server_command)
+def target_match_count(timeline_path, marker):
+    count = 0
+    names = {}
+    for event in decode_nsys.read_stats_csv(timeline_path):
+        name = decode_nsys.trace_name(event)
+        if marker.lower() not in name.lower():
+            continue
+        count += 1
+        names[name] = names.get(name, 0) + 1
+    return count, names
+
+
+def calculate_full_lifecycle_skip(total_matches, request_calibration):
+    """计算从进程启动到首个稳定Decode目标Kernel前的跳过次数。"""
+    formal_total = (request_calibration["launch_skip"] +
+                    request_calibration["stable_matches"])
+    if total_matches < formal_total:
+        raise RuntimeError(
+            f"启动期校准目标调用不足：total={total_matches}, "
+            f"formal={formal_total}")
+    return {
+        "startup_and_warmup_matches": total_matches - formal_total,
+        "launch_skip": total_matches - request_calibration["stable_matches"],
+    }
+
+
+def wait_profile_result(process, output_base, timeout, log_path):
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        stop_process_group(process)
+        raise TimeoutError(f"等待Profiler输出超时：{log_path}") from error
+    return find_report(output_base)
+
+
+def completed_profile_report(process, output_base, timeout, log_path):
+    """等待NCU因命中目标而结束，并返回生成的报告。"""
+    return wait_profile_result(process, output_base, timeout, log_path)
+
+
+def run_discovery(args, backend, prompt, backend_dir):
+    """从进程启动开始验证NCU能够识别目标Kernel及其实际名称。"""
+    discovery_dir = backend_dir / "01-discovery"
+    discovery_dir.mkdir(parents=True, exist_ok=True)
+    target, control_env, server, pid_dir = prepare_target(
+        args, backend, discovery_dir)
     marker = BACKEND_KERNELS[backend]
-    output_base = backend_dir / "attention-merge"
-    ncu_command = [
+    output_base = discovery_dir / "target-kernel"
+    command = [
         args.ncu, "--target-processes", "all",
-        "--profile-from-start", "off", "--kill", "yes",
-        "--replay-mode", "kernel", "--cache-control", "none",
-        "--clock-control", "none", "--kernel-name-base", "demangled",
+        "--profile-from-start", "on", "--kill", "yes",
+        "--graph-profiling", "node", "--replay-mode", "kernel",
+        "--cache-control", "none", "--clock-control", "none",
+        "--kernel-name-base", "demangled",
+        "--kernel-name", f"regex:.*{re.escape(marker)}.*",
+        "--launch-skip", "0", "--launch-count", "1", "--set", "basic",
+        "--export", str(output_base), "--force-overwrite", *target,
+    ]
+    log_path = discovery_dir / "ncu-discovery.log"
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
+        log_handle.flush()
+        process = subprocess.Popen(
+            command, cwd=REPO_DIR, env=control_env, stdout=log_handle,
+            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        try:
+            wait_pid_files(pid_dir, process, args.startup_timeout, log_path)
+            try:
+                decode_nsys.wait_server(
+                    server["base_url"], process, args.startup_timeout,
+                    log_path, backend)
+            except RuntimeError:
+                # 目标也可能在模型启动或CUDA Graph warmup期间出现。此时NCU
+                # 已按launch-count=1结束服务，直接读取报告就是发现成功。
+                if process.poll() is None:
+                    raise
+                report = completed_profile_report(
+                    process, output_base, args.profile_timeout, log_path)
+            else:
+                warmup_prompt = decode_nsys.make_cache_warmup_prompt(
+                    prompt, args.prefix_cache_padding_tokens)
+                try:
+                    decode_nsys.run_decode_batch(
+                        server, warmup_prompt, args.warmup_output_tokens,
+                        args.batch, args, "ncu-discovery")
+                except Exception as error:
+                    log_handle.write(f"EXPECTED DISCOVERY END: {error}\n")
+                    log_handle.flush()
+                report = completed_profile_report(
+                    process, output_base, args.profile_timeout, log_path)
+        except Exception:
+            stop_process_group(process)
+            raise
+        finally:
+            stop_process_group(process)
+    raw_csv = discovery_dir / "target-kernel-raw.csv"
+    rows = parse_ncu_raw(args, report, raw_csv)
+    _, launch = normalize_metrics(rows)
+    return {
+        "report": str(report), "raw_csv": str(raw_csv),
+        "kernel": launch["kernel"], "grid": launch["grid"],
+        "block": launch["block"],
+    }
+
+
+def run_startup_calibration(args, backend, prompt, request_calibration,
+                            backend_dir):
+    """用完整生命周期Nsys统计正式稳定Decode前的全部目标调用。"""
+    calibration_dir = backend_dir / "02-startup-calibration"
+    calibration_dir.mkdir(parents=True, exist_ok=True)
+    target, control_env, server, pid_dir = prepare_target(
+        args, backend, calibration_dir)
+    output_base = calibration_dir / "startup"
+    command = [
+        args.nsys, "profile", "--trace=cuda,nvtx",
+        "--cuda-graph-trace=node", "--sample=none", "--cpuctxsw=none",
+        f"--output={output_base}", "--force-overwrite=true", *target,
+    ]
+    log_path = calibration_dir / "nsys-startup.log"
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
+        log_handle.flush()
+        process = subprocess.Popen(
+            command, cwd=REPO_DIR, env=control_env, stdout=log_handle,
+            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        try:
+            wait_pid_files(pid_dir, process, args.startup_timeout, log_path)
+            decode_nsys.wait_server(
+                server["base_url"], process, args.startup_timeout,
+                log_path, backend)
+            warmup_prompt = decode_nsys.make_cache_warmup_prompt(
+                prompt, args.prefix_cache_padding_tokens)
+            decode_nsys.run_decode_batch(
+                server, warmup_prompt, args.warmup_output_tokens,
+                args.batch, args, "startup-calibration-warmup")
+            decode_nsys.run_decode_batch(
+                server, prompt, args.output_tokens,
+                args.batch, args, "startup-calibration-formal")
+            signal_target_processes(pid_dir, signal.SIGTERM)
+            report = wait_profile_result(
+                process, output_base, args.profile_timeout, log_path)
+        except Exception:
+            stop_process_group(process)
+            raise
+        finally:
+            stop_process_group(process)
+
+    timeline_path = decode_nsys.export_stats(
+        args, report, "cuda_gpu_trace",
+        calibration_dir / "startup-gpu-trace")
+    marker = BACKEND_KERNELS[backend]
+    total_matches, names = target_match_count(timeline_path, marker)
+    skip = calculate_full_lifecycle_skip(total_matches, request_calibration)
+    result = {
+        "report": str(report), "timeline_csv": str(timeline_path),
+        "target_names": names, "total_matches": total_matches,
+        "startup_and_warmup_matches": skip["startup_and_warmup_matches"],
+        "formal_before_stable_matches": request_calibration["launch_skip"],
+        "stable_matches": request_calibration["stable_matches"],
+        "launch_skip": skip["launch_skip"],
+    }
+    (calibration_dir / "startup-calibration.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def run_profile(args, backend, prompt, calibration, backend_dir):
+    """从进程启动观察Graph，并只剖析首个稳定Decode目标Kernel。"""
+    profile_dir = backend_dir / "03-profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    target, control_env, server, pid_dir = prepare_target(
+        args, backend, profile_dir)
+    marker = BACKEND_KERNELS[backend]
+    output_base = profile_dir / "attention-merge"
+    command = [
+        args.ncu, "--target-processes", "all",
+        "--profile-from-start", "on", "--kill", "yes",
+        "--graph-profiling", "node", "--replay-mode", "kernel",
+        "--cache-control", "none", "--clock-control", "none",
+        "--kernel-name-base", "demangled",
         "--kernel-name", f"regex:.*{re.escape(marker)}.*",
         "--launch-skip", str(calibration["launch_skip"]),
         "--launch-count", "1", "--set", args.section_set,
-        "--export", str(output_base), "--force-overwrite",
-        *target,
+        "--export", str(output_base), "--force-overwrite", *target,
     ]
-    log_path = backend_dir / "ncu-run.log"
+    log_path = profile_dir / "ncu-run.log"
     with log_path.open("w", encoding="utf-8") as log_handle:
-        log_handle.write(f"COMMAND: {shlex.join(ncu_command)}\n\n")
+        log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
+        log_handle.write(
+            f"CALIBRATED LAUNCH SKIP: {calibration['launch_skip']}\n\n")
         log_handle.flush()
-        control_env = decode_nsys.nsys_control_env()
-        control_env.update({key: value for key, value in target_env.items()
-                            if key != "LD_PRELOAD"})
         process = subprocess.Popen(
-            ncu_command, cwd=REPO_DIR, env=control_env, stdout=log_handle,
+            command, cwd=REPO_DIR, env=control_env, stdout=log_handle,
             stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
-            wait_pid_files(
-                pid_dir, process, args.startup_timeout, log_path)
-            server = {
-                "base_url": f"http://127.0.0.1:{args.port}",
-                "served_name": served_name, "backend": backend,
-            }
+            wait_pid_files(pid_dir, process, args.startup_timeout, log_path)
             decode_nsys.wait_server(
                 server["base_url"], process, args.startup_timeout,
                 log_path, backend)
@@ -259,13 +428,6 @@ def run_profile(args, backend, prompt, calibration, backend_dir):
             decode_nsys.run_decode_batch(
                 server, warmup_prompt, args.warmup_output_tokens,
                 args.batch, args, "ncu-warmup")
-            # FastLLM通常只有一个Python进程；vLLM还包含真正持有CUDA
-            # Context的EngineCore子进程。只通知API Server会漏采combine。
-            profiled_pids = signal_target_processes(pid_dir, signal.SIGUSR1)
-            log_handle.write(
-                f"PROFILER START PIDS: {','.join(map(str, profiled_pids))}\n")
-            log_handle.flush()
-            time.sleep(0.2)
             request_completed = False
             try:
                 decode_nsys.run_decode_batch(
@@ -273,23 +435,19 @@ def run_profile(args, backend, prompt, calibration, backend_dir):
                     args.batch, args, "ncu-profile")
                 request_completed = True
             except Exception as error:
-                # --kill=yes会在目标Kernel采集完毕后终止服务，因此正式HTTP
-                # 请求通常在完整Token返回前断开；报告存在时这是预期行为。
-                log_handle.write(f"EXPECTED PROFILE REQUEST END: {error}\n")
+                log_handle.write(f"EXPECTED PROFILE END: {error}\n")
                 log_handle.flush()
             if request_completed and process.poll() is None:
-                # --kill=yes应在目标Kernel采集后终止服务。完整请求已经返回却
-                # 仍在运行，说明过滤条件没有命中；立即失败，禁止空等超时。
-                signal_target_processes(pid_dir, signal.SIGUSR2)
                 raise RuntimeError(
-                    f"NCU未命中目标Kernel：{marker}；完整HTTP请求已结束")
-            process.wait(timeout=args.profile_timeout)
+                    f"NCU未命中目标Kernel：{marker}；"
+                    f"calibrated launch-skip={calibration['launch_skip']}")
+            report = wait_profile_result(
+                process, output_base, args.profile_timeout, log_path)
         except Exception:
             stop_process_group(process)
             raise
         finally:
             stop_process_group(process)
-    report = find_report(output_base)
     return report, log_path
 
 
@@ -367,8 +525,8 @@ def duration_ns(metric):
     return metric["value"] * factors.get(unit, 1.0)
 
 
-def summarize_backend(backend, report, raw_csv, calibration, rows,
-                      profiling_mode):
+def summarize_backend(backend, report, raw_csv, request_calibration,
+                      startup_calibration, discovery, rows):
     metrics, launch = normalize_metrics(rows)
     selected = {
         label: select_metric(metrics, candidates)
@@ -383,8 +541,13 @@ def summarize_backend(backend, report, raw_csv, calibration, rows,
         "kernel_marker": BACKEND_KERNELS[backend],
         "report": str(report),
         "raw_csv": str(raw_csv),
-        "launch_skip": calibration["launch_skip"],
-        "stable_matches_in_calibration": calibration["stable_matches"],
+        "launch_skip": startup_calibration["launch_skip"],
+        "request_before_stable_matches": request_calibration["launch_skip"],
+        "startup_and_warmup_matches":
+            startup_calibration["startup_and_warmup_matches"],
+        "stable_matches_in_calibration": request_calibration["stable_matches"],
+        "discovery": discovery,
+        "startup_calibration": startup_calibration,
         "grid": launch["grid"], "block": launch["block"],
         "device": launch["device"], "kernel": launch["kernel"],
         "selected_metrics": selected,
@@ -392,7 +555,7 @@ def summarize_backend(backend, report, raw_csv, calibration, rows,
         "all_metrics": metrics,
         "split_count": None,
         "split_count_note": "NCU不直接暴露逻辑Split数量，不能仅凭Grid臆测",
-        "profiling_mode": profiling_mode,
+        "profiling_mode": "cuda_graph_full_lifecycle_calibrated",
     }
 
 
@@ -405,19 +568,19 @@ def metric_text(metric):
 def make_reports(result_dir, summaries):
     lines = [
         "# FastLLM / vLLM Attention合并Kernel NCU对比", "",
-        "> NCU使用Nsight Systems稳定Decode边界校准`launch-skip`，只采集",
-        "> Batch=1正式Decode中的首个目标合并Kernel。NCU会重放Kernel，",
+        "> 双方保持BEST模式CUDA Graph。脚本先用NCU确认目标Kernel，再用",
+        "> Nsight Systems统计进程启动、Graph warmup和正式请求的完整生命周期，",
+        "> 最后从进程启动采集首个稳定Decode目标Kernel。NCU会重放Kernel，",
         "> 本报告用于微观归因，不能替代未使用Profiler的TPOT。", "",
-        "> 默认关闭双方CUDA Graph，避免NCU后挂接时遗漏已录制Graph节点；",
-        "> Kernel与张量形状不变。正式BEST性能仍使用CUDA Graph。", "",
-        "| 后端 | Kernel | Grid | Block | Duration | DRAM Read | DRAM Write | "
+        "| 后端 | Kernel | 完整跳过数 | 启动/预热调用 | Grid | Block | Duration | DRAM Read | DRAM Write | "
         "DRAM吞吐 | Occupancy | Registers/Thread | Shared Memory/Block |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in summaries:
         selected = item["selected_metrics"]
         lines.append(
             f"| {item['backend']} | `{item['kernel_marker']}` | "
+            f"{item['launch_skip']} | {item['startup_and_warmup_matches']} | "
             f"{item['grid'] or 'n/a'} | {item['block'] or 'n/a'} | "
             f"{metric_text(selected['Duration'])} | "
             f"{metric_text(selected['DRAM Read Bytes'])} | "
@@ -472,7 +635,9 @@ def make_reports(result_dir, summaries):
             metric_text(selected["Achieved Occupancy"]),
             metric_text(selected["Registers/Thread"]),
             metric_text(selected["Shared Memory/Block"]),
-            item["launch_skip"], item["stable_matches_in_calibration"],
+            item["launch_skip"], item["startup_and_warmup_matches"],
+            item["request_before_stable_matches"],
+            item["stable_matches_in_calibration"],
         ])
         for metric in item["all_metrics"]:
             all_metric_rows.append([
@@ -488,7 +653,8 @@ def make_reports(result_dir, summaries):
         ("关键指标", [
             "后端", "Kernel", "Grid", "Block", "Duration", "DRAM Read",
             "DRAM Write", "DRAM吞吐", "Occupancy", "Registers/Thread",
-            "Shared Memory/Block", "launch-skip", "校准区间稳定调用数"],
+            "Shared Memory/Block", "完整launch-skip", "启动及预热调用数",
+            "正式请求稳定边界前调用数", "校准区间稳定调用数"],
          summary_rows),
         ("Warp Stall", ["后端", "Metric", "数值", "原始值", "单位"],
          stall_rows),
@@ -520,21 +686,35 @@ def main():
     summaries = []
     for index, backend in enumerate(backends):
         marker = BACKEND_KERNELS[backend]
-        calibration = read_calibration(
+        request_calibration = read_calibration(
             calibration_dir, backend, args.batch, marker)
         backend_dir = result_dir / backend
         original_port = args.port
         args.port = original_port + index
         try:
+            if args.skip_discovery:
+                discovery = {"skipped": True}
+                print(f"[{backend}] 1/3 跳过目标Kernel发现", flush=True)
+            else:
+                print(f"[{backend}] 1/3 发现目标Kernel", flush=True)
+                discovery = run_discovery(
+                    args, backend, prompt, backend_dir)
+            print(f"[{backend}] 2/3 校准完整生命周期调用数", flush=True)
+            startup_calibration = run_startup_calibration(
+                args, backend, prompt, request_calibration, backend_dir)
+            print(
+                f"[{backend}] launch-skip="
+                f"{startup_calibration['launch_skip']}", flush=True)
+            print(f"[{backend}] 3/3 正式采集稳定Decode Kernel", flush=True)
             report, _ = run_profile(
-                args, backend, prompt, calibration, backend_dir)
+                args, backend, prompt, startup_calibration, backend_dir)
         finally:
             args.port = original_port
-        raw_csv = backend_dir / "attention-merge-raw.csv"
+        raw_csv = backend_dir / "03-profile" / "attention-merge-raw.csv"
         raw_rows = parse_ncu_raw(args, report, raw_csv)
         summaries.append(summarize_backend(
-            backend, report, raw_csv, calibration, raw_rows,
-            "cuda_graph" if args.profile_cuda_graph else "eager"))
+            backend, report, raw_csv, request_calibration,
+            startup_calibration, discovery, raw_rows))
 
     md_path, json_path, xlsx_path = make_reports(result_dir, summaries)
     print(f"Markdown: {md_path}")

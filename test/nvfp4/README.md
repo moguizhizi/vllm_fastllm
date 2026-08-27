@@ -216,8 +216,8 @@ Nsight结果用于性能归因，不替代未启用Profiler时的正式TPOT结�
 
 当Nsight Systems已定位到Attention合并Kernel后，可使用独立的Nsight
 Compute入口对比FastLLM的FlashInfer merge与vLLM的split-KV combine。该
-入口复用前一步的稳定Decode边界，自动跳过Prefill尾部，只采集首个稳定
-Decode目标Kernel：
+入口保持双方BEST模式CUDA Graph，并分三阶段执行：轻量NCU发现目标、完整
+生命周期Nsys校准、正式NCU采集。最终只剖析首个稳定Decode目标Kernel：
 
 ```bash
 python test/nvfp4/attention_ncu_compare.py \
@@ -232,10 +232,9 @@ python test/nvfp4/attention_ncu_compare.py \
 
 结果包含`.md/.json/.xlsx`和双方原始`.ncu-rep`。NCU会重放Kernel，报告
 只用于分析工作量、内存效率、占用率和Warp Stall，不能替代正式TPOT。
-NCU不直接暴露逻辑Split数量，脚本不会把Grid大小误写成Split数量。
-默认让双方使用Eager执行，避免NCU在CUDA Graph录制完成后挂接而遗漏已有
-Graph节点；目标Kernel及张量形状保持不变。`--profile-cuda-graph`仅用于
-实验，不同NCU版本可能无法命中。
+NCU不直接暴露逻辑Split数量，脚本不会把Grid大小误写成Split数量。每个
+后端输出`01-discovery`、`02-startup-calibration`和`03-profile`。重复测试
+可用`--skip-discovery`省略发现阶段，但完整生命周期校准始终执行。
 
 一次执行全部：
 

@@ -98,10 +98,10 @@ python test/w8a8/decode_nsys_compare.py \
 若Nsight Systems已经把Attention差距定位到FastLLM的
 `PersistentVariableLengthMergeStatesKernel`和vLLM的
 `flash_fwd_splitkv_combine_kernel`，可再用独立的Nsight Compute入口做
-同Batch、同Prompt的单Kernel对比。脚本读取前一步的稳定Decode边界，自动
-计算`launch-skip`，跳过正式请求的Prefill尾部，只采集首个稳定Decode合并
-Kernel。vLLM的EngineCore是子进程，脚本会把Profiler启停控制同时注入API
-Server及其Python子进程，避免采到错误进程。
+同Batch、同Prompt的单Kernel对比。双方保持BEST模式CUDA Graph。脚本先从
+进程启动执行一次轻量NCU发现，确认目标Kernel可见；再用完整生命周期Nsys
+统计模型启动、Graph warmup、显式warmup及正式请求的调用数；最后从进程
+启动执行正式NCU，只采集首个稳定Decode合并Kernel。
 
 ```bash
 python test/w8a8/attention_ncu_compare.py \
@@ -119,9 +119,9 @@ python test/w8a8/attention_ncu_compare.py \
 Duration、DRAM读写、带宽、Occupancy、寄存器、共享内存和Warp Stall。
 NCU不直接提供逻辑Split数量，不能用Grid大小代替Split数量。NCU会重放
 Kernel，因此该结果只用于解释合并Kernel为何有差距，不用于计算TPOT。
-默认让双方使用Eager执行，避免NCU在CUDA Graph录制完成后挂接而看不到已有
-Graph节点；目标Kernel及张量形状不变。需要实验性采集Graph节点时可增加
-`--profile-cuda-graph`，但不同NCU版本可能无法命中。
+每个后端会依次生成`01-discovery`、`02-startup-calibration`和`03-profile`
+目录。重复测试且已经确认NCU能看到目标Kernel时，可用`--skip-discovery`
+省略第一阶段；不得跳过完整生命周期校准。
 
 需要进一步区分GPU执行和CPU提交/调度影响时，在同一命令末尾增加
 `--cpu-trace`。脚本会在同一次采集中增加OS Runtime、逐次CUDA API和
