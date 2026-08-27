@@ -54,8 +54,38 @@ def parse_args():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
-    parser.add_argument("--outer-repeats", type=int, default=3)
+    parser.add_argument(
+        "--outer-repeats", type=int, default=5,
+        help="每个形状的独立重复次数；用于计算Median、P95和CV")
     return parser.parse_args()
+
+
+def percentile(samples, ratio):
+    """使用线性插值计算少量独立延迟样本的分位数。"""
+    ordered = sorted(samples)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * ratio
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def summarize_samples(prefix, samples, m, n, k, backend_path):
+    """汇总独立测试样本，并计算延迟、稳定性和有效计算吞吐。"""
+    median_ms = statistics.median(samples)
+    mean_ms = statistics.mean(samples)
+    cv_pct = (statistics.pstdev(samples) / mean_ms * 100.0
+              if len(samples) > 1 and mean_ms > 0.0 else 0.0)
+    return {
+        f"{prefix}_backend_path": backend_path,
+        f"{prefix}_latency_median_ms": median_ms,
+        f"{prefix}_latency_p95_ms": percentile(samples, 0.95),
+        f"{prefix}_latency_cv_pct": cv_pct,
+        f"{prefix}_effective_tops": 2.0 * m * n * k / median_ms / 1e9,
+        f"{prefix}_samples_ms": samples,
+    }
 
 
 def run_fastllm(args, log_dir):
@@ -88,7 +118,8 @@ def run_fastllm(args, log_dir):
             samples.append(float(matches[-1]))
         rows.append({
             "case": name, "m": m, "n": n, "k": k,
-            "fastllm_latency_ms": statistics.median(samples),
+            **summarize_samples(
+                "fastllm", samples, m, n, k, "w8a8-cutlass (strict)"),
         })
         print(json.dumps(rows[-1]), flush=True)
     return rows
@@ -133,7 +164,9 @@ def run_vllm(args):
             del source, weight, weight_scale, output
         rows.append({
             "case": name, "m": m, "n": n, "k": k,
-            "vllm_latency_ms": statistics.median(samples),
+            **summarize_samples(
+                "vllm", samples, m, n, k,
+                "scaled_fp8_quant + cutlass_scaled_mm"),
         })
         print(json.dumps(rows[-1]), flush=True)
     return rows
@@ -144,11 +177,12 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
     combined = []
     for row in fastllm_rows:
         other = vllm[row["case"]]
-        ft_ms = row["fastllm_latency_ms"]
-        vl_ms = other["vllm_latency_ms"]
+        ft_ms = row["fastllm_latency_median_ms"]
+        vl_ms = other["vllm_latency_median_ms"]
         combined.append({
             **row,
-            "vllm_latency_ms": vl_ms,
+            **{key: value for key, value in other.items()
+               if key.startswith("vllm_")},
             "fastllm_speedup_vs_vllm_x": vl_ms / ft_ms,
         })
     (output_dir / "operator-performance-compare.json").write_text(
@@ -161,16 +195,26 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
     lines = [
         "# SM120 W8A8算子性能对比", "",
         "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重",
-        "> CUTLASS GEMM及输出；无bias。每项取外层重复的中位数。", "",
+        "> CUTLASS GEMM及输出；无bias。每项使用独立重复样本计算统计值。", "",
         "> 加速比 = vLLM耗时 / FastLLM耗时；大于1表示FastLLM更快，",
         "> 小于1表示FastLLM更慢。", "",
-        "| Case | M | N | K | FastLLM(ms) | vLLM(ms) | FastLLM相对vLLM加速比 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "> Effective TOPS由`2*M*N*K/Median延迟`推导；CV越小表示重复测试越稳定。", "",
+        "| Case | M | N | K | FastLLM路径 | FastLLM Median(ms) | FastLLM P95(ms) | FastLLM CV(%) | FastLLM TOPS | vLLM路径 | vLLM Median(ms) | vLLM P95(ms) | vLLM CV(%) | vLLM TOPS | FastLLM相对vLLM加速比 |",
+        "| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in combined:
         lines.append(
             f"| {row['case']} | {row['m']} | {row['n']} | {row['k']} | "
-            f"{row['fastllm_latency_ms']:.6f} | {row['vllm_latency_ms']:.6f} | "
+            f"{row['fastllm_backend_path']} | "
+            f"{row['fastllm_latency_median_ms']:.6f} | "
+            f"{row['fastllm_latency_p95_ms']:.6f} | "
+            f"{row['fastllm_latency_cv_pct']:.2f} | "
+            f"{row['fastllm_effective_tops']:.4f} | "
+            f"{row['vllm_backend_path']} | "
+            f"{row['vllm_latency_median_ms']:.6f} | "
+            f"{row['vllm_latency_p95_ms']:.6f} | "
+            f"{row['vllm_latency_cv_pct']:.2f} | "
+            f"{row['vllm_effective_tops']:.4f} | "
             f"{row['fastllm_speedup_vs_vllm_x']:.4f}x |")
     report = "\n".join(lines) + "\n"
     (output_dir / "operator-performance-compare.md").write_text(

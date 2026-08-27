@@ -58,7 +58,10 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-perf" \
 
 性能报告中的`fastllm_speedup_vs_vllm_x`按
 `vLLM耗时 / FastLLM耗时`计算：大于1表示FastLLM更快，小于1表示
-FastLLM更慢。
+FastLLM更慢。每个形状默认独立执行5轮，报告同时给出Median、P95、CV、
+Effective TOPS和实际后端路径；原始轮次样本保存在JSON/CSV的
+`*_samples_ms`字段中。Effective TOPS按`2*M*N*K/Median延迟`计算，
+属于有效计算吞吐；CV越小表示测试越稳定。
 
 forward_check：
 
