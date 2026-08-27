@@ -910,6 +910,33 @@ bool FastllmCudaCutlassLinearInt8W8A8Sm90(
 #endif
 }
 
+/**
+ * 在SM120上执行标准FP8 W8A8 CUTLASS线性计算并维护固定后端状态。
+ *
+ * 本入口只接管FP8_E4M3二维权重，以及tensorwise标量或per-channel
+ * FP32权重scale；blockwise权重不属于本路径。输入必须为FP16或BF16，
+ * 执行时先按token动态量化为FP8，再由CUTLASS完成GEMM、scale广播、
+ * 可选bias和输出类型转换。数学语义为：
+ * output[M,N] = input[M,K] * weight[N,K]^T + bias[N]。
+ *
+ * 后端按“权重对象、GPU”维护生命周期。首次真实GEMM会同步验证异步
+ * CUDA错误，成功后固定为Cutlass，失败则固定为Rejected；固定为Cutlass
+ * 后若运行条件改变或kernel失败会抛出异常，禁止同一权重静默切换到
+ * Legacy。普通调用不额外同步CUDA Stream。
+ *
+ * @param input   CUDA上的FP16或BF16激活，逻辑形状为[m, k]。
+ * @param weight  CUDA上的FP8_E4M3线性权重，逻辑形状为[n, k]；scale数量
+ *                为1表示tensorwise，为n表示per-channel，并要求
+ *                blockK=1、blockM=k以排除blockwise布局。
+ * @param bias    可选CUDA FP32偏置，逻辑形状为[n]；空张量表示无偏置。
+ * @param output  CUDA输出，逻辑形状为[m, n]，数据类型必须与input一致。
+ * @param m       GEMM的M维，通常为本次处理的token数。
+ * @param k       GEMM的K维，即输入特征数，必须按16对齐。
+ * @param n       GEMM的N维，即输出特征数，必须按8对齐。
+ * @return true表示本次CUTLASS计算已成功提交，并在首次选择时完成同步
+ *         验证；false表示该权重不属于本路径，或首次选择失败且允许交给
+ *         Legacy。严格模式及固定Cutlass后的失败通过异常报告。
+ */
 bool FastllmCudaCutlassLinearFp8W8A8Sm120(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output, int m, int k, int n) {
