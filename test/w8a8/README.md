@@ -119,6 +119,9 @@ python test/w8a8/attention_ncu_compare.py \
 Duration、DRAM读写、带宽、Occupancy、寄存器、共享内存和Warp Stall。
 NCU不直接提供逻辑Split数量，不能用Grid大小代替Split数量。NCU会重放
 Kernel，因此该结果只用于解释合并Kernel为何有差距，不用于计算TPOT。
+默认让双方使用Eager执行，避免NCU在CUDA Graph录制完成后挂接而看不到已有
+Graph节点；目标Kernel及张量形状不变。需要实验性采集Graph节点时可增加
+`--profile-cuda-graph`，但不同NCU版本可能无法命中。
 
 需要进一步区分GPU执行和CPU提交/调度影响时，在同一命令末尾增加
 `--cpu-trace`。脚本会在同一次采集中增加OS Runtime、逐次CUDA API和

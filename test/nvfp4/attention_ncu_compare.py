@@ -70,6 +70,9 @@ def parse_args():
     parser.add_argument("--ncu", default="ncu")
     parser.add_argument("--set", dest="section_set", default="full")
     parser.add_argument(
+        "--profile-cuda-graph", action="store_true",
+        help="实验选项：在CUDA Graph内采集；部分NCU版本无法后挂接节点")
+    parser.add_argument(
         "--vllm-extra-arg", action="append", default=[],
         help="追加一个vLLM服务参数；需要多个参数时重复使用")
     return parser.parse_args()
@@ -198,6 +201,14 @@ def run_profile(args, backend, prompt, calibration, backend_dir):
     backend_dir.mkdir(parents=True, exist_ok=True)
     server_command, target_env, served_name = decode_nsys.server_spec(
         args, backend, args.batch)
+    if not args.profile_cuda_graph:
+        # NCU在CUDA Graph已经录制后才由cudaProfilerStart挂接时，部分版本
+        # 看不到已有Graph内的独立节点。微观对比只关闭Graph包装，模型、
+        # Prompt、Batch、Kernel和张量形状保持不变；正式TPOT仍以BEST测试为准。
+        if backend == "fastllm":
+            target_env["FASTLLM_CUDA_GRAPH"] = "0"
+        elif "--enforce-eager" not in server_command:
+            server_command.append("--enforce-eager")
     pid_dir = backend_dir / "target-pids"
     pid_dir.mkdir(parents=True, exist_ok=True)
     for stale_pid in pid_dir.glob("*.pid"):
@@ -255,15 +266,23 @@ def run_profile(args, backend, prompt, calibration, backend_dir):
                 f"PROFILER START PIDS: {','.join(map(str, profiled_pids))}\n")
             log_handle.flush()
             time.sleep(0.2)
+            request_completed = False
             try:
                 decode_nsys.run_decode_batch(
                     server, prompt, args.output_tokens,
                     args.batch, args, "ncu-profile")
+                request_completed = True
             except Exception as error:
                 # --kill=yes会在目标Kernel采集完毕后终止服务，因此正式HTTP
                 # 请求通常在完整Token返回前断开；报告存在时这是预期行为。
                 log_handle.write(f"EXPECTED PROFILE REQUEST END: {error}\n")
                 log_handle.flush()
+            if request_completed and process.poll() is None:
+                # --kill=yes应在目标Kernel采集后终止服务。完整请求已经返回却
+                # 仍在运行，说明过滤条件没有命中；立即失败，禁止空等超时。
+                signal_target_processes(pid_dir, signal.SIGUSR2)
+                raise RuntimeError(
+                    f"NCU未命中目标Kernel：{marker}；完整HTTP请求已结束")
             process.wait(timeout=args.profile_timeout)
         except Exception:
             stop_process_group(process)
@@ -348,7 +367,8 @@ def duration_ns(metric):
     return metric["value"] * factors.get(unit, 1.0)
 
 
-def summarize_backend(backend, report, raw_csv, calibration, rows):
+def summarize_backend(backend, report, raw_csv, calibration, rows,
+                      profiling_mode):
     metrics, launch = normalize_metrics(rows)
     selected = {
         label: select_metric(metrics, candidates)
@@ -372,6 +392,7 @@ def summarize_backend(backend, report, raw_csv, calibration, rows):
         "all_metrics": metrics,
         "split_count": None,
         "split_count_note": "NCU不直接暴露逻辑Split数量，不能仅凭Grid臆测",
+        "profiling_mode": profiling_mode,
     }
 
 
@@ -387,6 +408,8 @@ def make_reports(result_dir, summaries):
         "> NCU使用Nsight Systems稳定Decode边界校准`launch-skip`，只采集",
         "> Batch=1正式Decode中的首个目标合并Kernel。NCU会重放Kernel，",
         "> 本报告用于微观归因，不能替代未使用Profiler的TPOT。", "",
+        "> 默认关闭双方CUDA Graph，避免NCU后挂接时遗漏已录制Graph节点；",
+        "> Kernel与张量形状不变。正式BEST性能仍使用CUDA Graph。", "",
         "| 后端 | Kernel | Grid | Block | Duration | DRAM Read | DRAM Write | "
         "DRAM吞吐 | Occupancy | Registers/Thread | Shared Memory/Block |",
         "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -510,7 +533,8 @@ def main():
         raw_csv = backend_dir / "attention-merge-raw.csv"
         raw_rows = parse_ncu_raw(args, report, raw_csv)
         summaries.append(summarize_backend(
-            backend, report, raw_csv, calibration, raw_rows))
+            backend, report, raw_csv, calibration, raw_rows,
+            "cuda_graph" if args.profile_cuda_graph else "eager"))
 
     md_path, json_path, xlsx_path = make_reports(result_dir, summaries)
     print(f"Markdown: {md_path}")

@@ -233,6 +233,9 @@ python test/nvfp4/attention_ncu_compare.py \
 结果包含`.md/.json/.xlsx`和双方原始`.ncu-rep`。NCU会重放Kernel，报告
 只用于分析工作量、内存效率、占用率和Warp Stall，不能替代正式TPOT。
 NCU不直接暴露逻辑Split数量，脚本不会把Grid大小误写成Split数量。
+默认让双方使用Eager执行，避免NCU在CUDA Graph录制完成后挂接而遗漏已有
+Graph节点；目标Kernel及张量形状保持不变。`--profile-cuda-graph`仅用于
+实验，不同NCU版本可能无法命中。
 
 一次执行全部：
 
