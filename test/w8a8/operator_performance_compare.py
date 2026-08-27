@@ -146,8 +146,11 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
         other = vllm[row["case"]]
         ft_ms = row["fastllm_latency_ms"]
         vl_ms = other["vllm_latency_ms"]
-        combined.append({**row, "vllm_latency_ms": vl_ms,
-                         "fastllm_speedup": vl_ms / ft_ms})
+        combined.append({
+            **row,
+            "vllm_latency_ms": vl_ms,
+            "fastllm_speedup_vs_vllm_x": vl_ms / ft_ms,
+        })
     (output_dir / "operator-performance-compare.json").write_text(
         json.dumps(combined, indent=2), encoding="utf-8")
     with (output_dir / "operator-performance-compare.csv").open(
@@ -159,14 +162,16 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
         "# SM120 W8A8算子性能对比", "",
         "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重",
         "> CUTLASS GEMM及输出；无bias。每项取外层重复的中位数。", "",
-        "| Case | M | N | K | FastLLM(ms) | vLLM(ms) | FastLLM speedup |",
+        "> 加速比 = vLLM耗时 / FastLLM耗时；大于1表示FastLLM更快，",
+        "> 小于1表示FastLLM更慢。", "",
+        "| Case | M | N | K | FastLLM(ms) | vLLM(ms) | FastLLM相对vLLM加速比 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in combined:
         lines.append(
             f"| {row['case']} | {row['m']} | {row['n']} | {row['k']} | "
             f"{row['fastllm_latency_ms']:.6f} | {row['vllm_latency_ms']:.6f} | "
-            f"{row['fastllm_speedup']:.4f}x |")
+            f"{row['fastllm_speedup_vs_vllm_x']:.4f}x |")
     report = "\n".join(lines) + "\n"
     (output_dir / "operator-performance-compare.md").write_text(
         report, encoding="utf-8")

@@ -56,6 +56,10 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-perf" \
   test/w8a8/run_w8a8_tests.sh ops-performance
 ```
 
+性能报告中的`fastllm_speedup_vs_vllm_x`按
+`vLLM耗时 / FastLLM耗时`计算：大于1表示FastLLM更快，小于1表示
+FastLLM更慢。
+
 forward_check：
 
 默认执行功能判定：输入Prompt和首Token必须一致，Top10重合率必须不低于
