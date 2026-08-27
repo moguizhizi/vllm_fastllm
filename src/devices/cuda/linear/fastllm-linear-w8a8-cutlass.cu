@@ -491,42 +491,79 @@ struct FusedScaledEpilogue {
     }
 };
 
-template <typename Element, typename Output, typename Arch,
-          typename Tile, typename Cluster, typename MainloopSchedule,
-          typename EpilogueSchedule,
-          bool HasBias,
-          typename EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto>
+template <
+    typename Element,
+    typename Output,
+    typename Arch,
+    typename Tile,
+    typename Cluster,
+    typename MainloopSchedule,
+    typename EpilogueSchedule,
+    bool HasBias,
+    typename EpilogueTile =
+        cutlass::epilogue::collective::EpilogueTileAuto>
 struct DenseKernel {
     using ElementA = Element;
     using ElementB = Element;
     using ElementD = Output;
     using ElementAccumulator = std::conditional_t<
         std::is_same_v<Element, int8_t>, int32_t, float>;
+
     static constexpr bool HasBiasValue = HasBias;
+
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutD = cutlass::layout::RowMajor;
-    static constexpr int Alignment = 128 / cutlass::sizeof_bits<Element>::value;
-    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<Output>::value;
+
+    static constexpr int Alignment =
+        128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentD =
+        128 / cutlass::sizeof_bits<Output>::value;
+
     using EpilogueOperation = FusedScaledEpilogue<
         ElementAccumulator, Output, Tile, HasBias>;
     using EVTCompute = typename EpilogueOperation::EVTCompute;
+
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-        Arch, cutlass::arch::OpClassTensorOp, Tile, Cluster,
+        Arch,
+        cutlass::arch::OpClassTensorOp,
+        Tile,
+        Cluster,
         EpilogueTile,
-        ElementAccumulator, float, void, LayoutD, AlignmentD,
-        Output, LayoutD, AlignmentD, EpilogueSchedule, EVTCompute>::CollectiveOp;
+        ElementAccumulator,
+        float,
+        void,
+        LayoutD,
+        AlignmentD,
+        Output,
+        LayoutD,
+        AlignmentD,
+        EpilogueSchedule,
+        EVTCompute>::CollectiveOp;
+
     using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-        Arch, cutlass::arch::OpClassTensorOp,
-        Element, LayoutA, Alignment, Element, LayoutB, Alignment,
-        ElementAccumulator, Tile, Cluster,
+        Arch,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        Alignment,
+        Element,
+        LayoutB,
+        Alignment,
+        ElementAccumulator,
+        Tile,
+        Cluster,
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
         MainloopSchedule>::CollectiveOp;
+
     using Base = cutlass::gemm::kernel::GemmUniversal<
         Shape<int, int, int, int>, Mainloop, Epilogue>;
-    using EnabledKernel = std::conditional_t<std::is_same_v<Arch, cutlass::arch::Sm90>,
-        EnableSm90Only<Base>, EnableSm120Only<Base>>;
+    using EnabledKernel = std::conditional_t<
+        std::is_same_v<Arch, cutlass::arch::Sm90>,
+        EnableSm90Only<Base>,
+        EnableSm120Only<Base>>;
+
     struct GemmKernel : EnabledKernel {};
 };
 
