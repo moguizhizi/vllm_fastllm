@@ -61,7 +61,8 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-perf" \
 FastLLM更慢。每个形状默认独立执行5轮，报告同时给出Median、P95、CV、
 Effective TOPS和实际后端路径；原始轮次样本保存在JSON/CSV的
 `*_samples_ms`字段中。Effective TOPS按`2*M*N*K/Median延迟`计算，
-属于有效计算吞吐；CV越小表示测试越稳定。
+属于有效计算吞吐；CV越小表示测试越稳定。MD、CSV和XLSX中的浮点展示值
+统一保留小数点后3位，JSON保留原始精度供复算。
 
 forward_check：
 

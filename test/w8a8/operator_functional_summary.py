@@ -188,8 +188,13 @@ def excel_column_name(index):
     return name
 
 
+def display_value(value):
+    """将功能报告展示层的浮点值统一格式化为小数点后3位。"""
+    return f"{value:.3f}" if isinstance(value, float) else value
+
+
 def excel_cell(reference, value, header=False):
-    style = ' s="1"' if header else ""
+    style = ' s="1"' if header else (' s="2"' if isinstance(value, float) else "")
     if value is None:
         return f'<c r="{reference}"{style} t="inlineStr"><is><t>n/a</t></is></c>'
     if isinstance(value, (int, float)):
@@ -250,10 +255,12 @@ def write_xlsx(path, rows):
     styles = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<numFmts count="1"><numFmt numFmtId="164" formatCode="0.000"/></numFmts>'
         '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/></font></fonts>'
         '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/></patternFill></fill></fills>'
         '<borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs>'
-        '<cellXfs count="2"><xf/><xf fontId="1" fillId="2" applyFont="1" applyFill="1"/></cellXfs>'
+        '<cellXfs count="3"><xf/><xf fontId="1" fillId="2" applyFont="1" applyFill="1"/>'
+        '<xf numFmtId="164" applyNumberFormat="1"/></cellXfs>'
         '</styleSheet>')
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types)
@@ -271,7 +278,9 @@ def write_reports(log_dir, prefix, rows):
     with output.with_suffix(".csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=HEADERS)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            {key: display_value(value) for key, value in row.items()}
+            for row in rows)
     passed = sum(row["result"] == "PASS" for row in rows)
     failed = sum(row["result"] == "FAIL" for row in rows)
     unknown = len(rows) - passed - failed
@@ -282,7 +291,8 @@ def write_reports(log_dir, prefix, rows):
         "| --- | --- | --- | --- | ---: | ---: | ---: | --- | --- | ---: | --- | ---: | ---: | --- |",
     ]
     for row in rows:
-        show = lambda key: "n/a" if row.get(key) is None else str(row[key])
+        show = lambda key: "n/a" if row.get(key) is None else str(
+            display_value(row[key]))
         details = show("details").replace("|", "\\|")
         lines.append(
             f"| {show('case')} | {show('backend')} | {show('category')} | {show('result')} | "

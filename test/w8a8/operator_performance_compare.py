@@ -88,6 +88,17 @@ def summarize_samples(prefix, samples, m, n, k, backend_path):
     }
 
 
+def display_value(value):
+    """将报告展示层的浮点值统一格式化为小数点后3位。"""
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    if isinstance(value, list):
+        return json.dumps(
+            [f"{item:.3f}" if isinstance(item, float) else item
+             for item in value], ensure_ascii=False)
+    return value
+
+
 def run_fastllm(args, log_dir):
     pattern = re.compile(r"latency:\s+avg_ms=([0-9.eE+-]+)")
     rows = []
@@ -191,7 +202,9 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
             "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(combined[0]))
         writer.writeheader()
-        writer.writerows(combined)
+        writer.writerows(
+            {key: display_value(value) for key, value in row.items()}
+            for row in combined)
     lines = [
         "# SM120 W8A8算子性能对比", "",
         "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重",
@@ -206,16 +219,16 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
         lines.append(
             f"| {row['case']} | {row['m']} | {row['n']} | {row['k']} | "
             f"{row['fastllm_backend_path']} | "
-            f"{row['fastllm_latency_median_ms']:.6f} | "
-            f"{row['fastllm_latency_p95_ms']:.6f} | "
-            f"{row['fastllm_latency_cv_pct']:.2f} | "
-            f"{row['fastllm_effective_tops']:.4f} | "
+            f"{row['fastllm_latency_median_ms']:.3f} | "
+            f"{row['fastllm_latency_p95_ms']:.3f} | "
+            f"{row['fastllm_latency_cv_pct']:.3f} | "
+            f"{row['fastllm_effective_tops']:.3f} | "
             f"{row['vllm_backend_path']} | "
-            f"{row['vllm_latency_median_ms']:.6f} | "
-            f"{row['vllm_latency_p95_ms']:.6f} | "
-            f"{row['vllm_latency_cv_pct']:.2f} | "
-            f"{row['vllm_effective_tops']:.4f} | "
-            f"{row['fastllm_speedup_vs_vllm_x']:.4f}x |")
+            f"{row['vllm_latency_median_ms']:.3f} | "
+            f"{row['vllm_latency_p95_ms']:.3f} | "
+            f"{row['vllm_latency_cv_pct']:.3f} | "
+            f"{row['vllm_effective_tops']:.3f} | "
+            f"{row['fastllm_speedup_vs_vllm_x']:.3f}x |")
     report = "\n".join(lines) + "\n"
     (output_dir / "operator-performance-compare.md").write_text(
         report, encoding="utf-8")
