@@ -236,7 +236,7 @@ run_ops_performance() {
         run_logged sm120_w8a8_operator_compare \
             "${vllm_python}" test/w8a8/operator_performance_compare.py \
             --optest "${optest}" --output-dir "${log_dir}/operator-compare" \
-            --warmup 20 --iters 200 --outer-repeats 3
+            --warmup 20 --iters 200 --outer-repeats 5
     fi
 }
 
