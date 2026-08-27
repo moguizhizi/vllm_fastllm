@@ -37,6 +37,11 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-function" \
   test/w8a8/run_w8a8_tests.sh ops-functional
 ```
 
+功能套件结束后会在`W8A8_LOG_DIR`直接生成
+`operator-functional-summary.{md,csv,json,xlsx}`。表格逐项记录后端、类别、
+M/N/K、输入类型、权重scale布局、bias、检查编号、误差和PASS/FAIL结果；
+若某个case失败导致套件提前退出，退出钩子仍会汇总已经执行的case及失败项。
+
 其中SM120生命周期包含四类用例：首次GEMM故障后固定为`Rejected`且
 不再重试；已固定为`Cutlass`后的运行故障必须抛错而不能fallback；权重
 `Data`析构后必须删除以其地址为键的后端状态，防止新对象继承陈旧记录；

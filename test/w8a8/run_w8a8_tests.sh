@@ -9,6 +9,24 @@ vllm_python=${W8A8_VLLM_PYTHON:-python}
 nvcc=${W8A8_NVCC:-/usr/local/cuda/bin/nvcc}
 suite=${1:-ops}
 mkdir -p "${log_dir}"
+functional_summary_pending=0
+
+write_functional_summary() {
+    "${vllm_python}" "${repo_dir}/test/w8a8/operator_functional_summary.py" \
+        --log-dir "${log_dir}"
+}
+
+write_pending_functional_summary() {
+    local status=$?
+    trap - EXIT
+    if [[ "${functional_summary_pending}" == 1 ]]; then
+        write_functional_summary || \
+            echo "WARNING: failed to write W8A8 functional summary" >&2
+    fi
+    exit "${status}"
+}
+
+trap write_pending_functional_summary EXIT
 
 run_logged() {
     local name=$1
@@ -47,7 +65,7 @@ run_sm120_standard_check() {
         --param has_bias="${bias}" --param check=7 --warmup 0 --iters 1
 }
 
-run_ops_functional() {
+run_ops_functional_cases() {
     local arch
     arch=$(detect_arch)
     if [[ "${arch}" == 90 ]]; then
@@ -167,6 +185,13 @@ EOF
         echo "unsupported test GPU: SM${arch}; expected SM90 or SM120" >&2
         exit 2
     fi
+}
+
+run_ops_functional() {
+    functional_summary_pending=1
+    run_ops_functional_cases
+    write_functional_summary
+    functional_summary_pending=0
 }
 
 run_ops_performance() {
