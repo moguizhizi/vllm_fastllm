@@ -530,6 +530,41 @@ struct DenseKernel {
     struct GemmKernel : EnabledKernel {};
 };
 
+/**
+ * 按指定CUTLASS定义提交一次带融合缩放的W8A8 GEMM。
+ *
+ * 本函数负责把已经量化的激活和权重组装为CUTLASS参数、检查当前定义能否
+ * 实现该形状、取得可复用workspace并向指定CUDA Stream提交GEMM。缩放和
+ * 可选bias由epilogue完成；函数不负责激活动态量化、后端生命周期选择，
+ * 也不等待异步计算结束。调用成功仅表示kernel已成功提交，首次后端固定
+ * 所需的异步错误检查由外层同步完成。
+ *
+ * 数学语义为d[M,N] = a[M,K] * b[N,K]^T + bias[N]。scaleA按
+ * perToken选择[M]或标量广播，scaleB按perChannel选择[N]或标量广播。
+ *
+ * @tparam Definition         CUTLASS kernel定义，包含元素类型、布局、tile、
+ *                             调度策略以及融合epilogue。
+ * @param a                   已量化激活，行主序逻辑形状为[m, k]。
+ * @param b                   已量化权重，逻辑形状为[n, k]，计算时按转置使用。
+ * @param d                   输出，行主序逻辑形状为[m, n]。
+ * @param scaleA              激活FP32 scale；perToken为true时长度为m，否则
+ *                             长度为1。
+ * @param perToken            true表示激活scale按token广播；false表示全张量
+ *                             共用一个scale。
+ * @param scaleB              权重FP32 scale；perChannel为true时长度为n，
+ *                             否则长度为1。
+ * @param perChannel          true表示权重scale按输出通道广播；false表示
+ *                             全张量共用一个scale。
+ * @param bias                可选偏置，类型与输出一致、长度为n；无bias的
+ *                             Definition应传nullptr。
+ * @param m                   GEMM的M维，通常为本次处理的token数。
+ * @param n                   GEMM的N维，即输出特征数。
+ * @param k                   GEMM的K维，即输入特征数。
+ * @param stream              提交CUTLASS kernel的CUDA Stream。
+ * @param scratch             当前GPU可复用临时区，用于提供CUTLASS workspace。
+ * @return true表示参数可实现、workspace准备成功且kernel已成功提交；false
+ *         表示形状不受支持、workspace不足或提交阶段出现CUDA/CUTLASS错误。
+ */
 template <typename Definition>
 bool Run(typename Definition::ElementA const *a,
          typename Definition::ElementB const *b,
