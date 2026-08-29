@@ -22,6 +22,11 @@ HEADERS = [
 
 FUNCTIONAL_LOG_PATTERNS = (
     re.compile(r"^sm90_.*_function$"),
+    re.compile(r"^sm90_branch_"),
+    re.compile(r"^sm90_semantics_"),
+    re.compile(r"^sm90_tensorwise_"),
+    re.compile(r"^sm90_dense_lifecycle_"),
+    re.compile(r"^sm90_vllm_"),
     re.compile(r"^sm120_branch_"),
     re.compile(r"^sm120_semantics_"),
     re.compile(r"^sm120_tensorwise_"),
@@ -206,7 +211,7 @@ def collect_rows(log_dir):
         if not any(pattern.search(path.stem) for pattern in FUNCTIONAL_LOG_PATTERNS):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        if path.stem.startswith("sm120_vllm_official_functional"):
+        if re.match(r"^sm(?:90|120)_vllm_official_functional", path.stem):
             rows.extend(parse_vllm_official(path, text))
         elif "--op " in text and "--param " in text:
             rows.append(parse_fastllm_log(path, text))

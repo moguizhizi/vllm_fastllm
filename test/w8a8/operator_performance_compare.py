@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""比较FastLLM与vLLM的SM120动态FP8 W8A8线性算子性能。"""
+"""比较FastLLM与vLLM的动态FP8 W8A8线性算子性能。"""
 
 import argparse
 import csv
@@ -17,7 +17,7 @@ REPO_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_DIR / "test" / "nvfp4"))
 from xlsx_report import write_xlsx  # noqa: E402
 
-# 前七项覆盖FastLLM SM120的M分支边界；其余形状来自vLLM
+# 前几项覆盖FastLLM SM90/SM120的分派边界；其余形状来自vLLM
 # tests/kernels/quantization/test_cutlass_scaled_mm.py::MNK_FACTORS。
 CASES = [
     ("branch_m1", 1, 4096, 4096),
@@ -27,6 +27,9 @@ CASES = [
     ("branch_m33", 33, 4096, 4096),
     ("branch_m256", 256, 4096, 4096),
     ("branch_m257", 257, 4096, 4096),
+    ("sm90_swap_n1280", 17, 1280, 4096),
+    ("sm90_swap_n1288", 17, 1288, 4096),
+    ("sm90_cooperative", 8192, 128, 6144),
     ("vllm_m1_n256_k128", 1, 256, 128),
     ("vllm_m1_n16384_k1024", 1, 16384, 1024),
     ("vllm_m1_n24576_k496", 1, 24576, 496),
@@ -66,7 +69,7 @@ BLOCK128_CASES = [
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="SM120 W8A8 FastLLM/vLLM算子性能对比")
+        description="SM90/SM120 W8A8 FastLLM/vLLM算子性能对比")
     parser.add_argument("--optest", default=str(REPO_DIR / "optest"))
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--warmup", type=int, default=20)
@@ -267,7 +270,7 @@ def write_reports(output_dir, fastllm_rows, vllm_rows, scale_layout):
         [("算子性能", headers,
           [[display_value(row[key]) for key in headers] for row in combined])])
     lines = [
-        f"# SM120 W8A8算子性能对比（{scale_layout}）", "",
+        f"# SM90/SM120 W8A8算子性能对比（{scale_layout}）", "",
         ("> 双方都计入BF16激活动态per-group(1,128) FP8量化、"
          "block(128,128)权重"
          if scale_layout == "block128"
