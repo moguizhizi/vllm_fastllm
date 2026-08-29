@@ -188,13 +188,18 @@ static ExecutionScratch *GetExecutionScratch(size_t quantizedBytes,
 
 static void *GetWorkspace(ExecutionScratch &scratch, size_t bytes) {
     if (bytes == 0) return nullptr;
+
     if (scratch.workspace != nullptr && scratch.workspaceBytes >= bytes) {
         return scratch.workspace;
     }
+
     if (FastllmCudaGraphIsCapturing()) return nullptr;
+
     void *replacement = FastllmCudaMalloc(bytes);
     if (replacement == nullptr) return nullptr;
+
     if (scratch.workspace != nullptr) FastllmCudaFree(scratch.workspace);
+
     scratch.workspace = replacement;
     scratch.workspaceBytes = bytes;
     return scratch.workspace;
