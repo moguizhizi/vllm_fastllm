@@ -136,6 +136,9 @@ def run_fastllm(args, log_dir):
     })
     weight_layout = (
         "separate" if args.scale_layout == "block128" else "perchannel")
+    op_name = (
+        "linear_fp8_block128"
+        if args.scale_layout == "block128" else "linear_fp8_w8a8")
     backend_path = (
         "w8a8-block128-cutlass (strict)"
         if args.scale_layout == "block128" else "w8a8-cutlass (strict)")
@@ -144,7 +147,7 @@ def run_fastllm(args, log_dir):
         samples = []
         for repeat in range(args.outer_repeats):
             command = [
-                args.optest, "--op", "linear_fp8_block128", "--device", "cuda:0",
+                args.optest, "--op", op_name, "--device", "cuda:0",
                 "--param", f"batch={m}", "--param", f"in={k}",
                 "--param", f"out={n}",
                 "--param", f"weight_layout={weight_layout}",

@@ -59,10 +59,10 @@ run_sm120_standard_check() {
     local name=$1 m=$2 n=$3 k=$4 dtype=$5 bias=$6
     run_logged "${name}_${dtype}_bias${bias}" env \
         FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
-        "${optest}" --op linear_fp8_block128 --device cuda:0 \
+        "${optest}" --op linear_fp8_w8a8 --device cuda:0 \
         --param batch="${m}" --param in="${k}" --param out="${n}" \
         --param weight_layout=perchannel --param input_type="${dtype}" \
-        --param has_bias="${bias}" --param check=7 --warmup 0 --iters 1
+        --param has_bias="${bias}" --param check=1 --warmup 0 --iters 1
 }
 
 run_sm120_block128_check() {
@@ -103,7 +103,7 @@ run_ops_functional_cases() {
             --param path=check_fp8 --warmup 0 --iters 1
     elif [[ "${arch}" == 120 ]]; then
         # 16/32/256是SM120 CUTLASS tile选择的三个边界；两侧值用于确认
-        # 每个条件分支都被执行。check=7才是标准per-channel W8A8检查。
+        # 每个条件分支都被执行。独立Dense入口的check=1执行正确性检查。
         for m in 1 16 17 32 33 256 257; do
             run_sm120_standard_check "sm120_branch_m${m}" \
                 "${m}" 4096 4096 bf16 1
@@ -120,43 +120,43 @@ run_ops_functional_cases() {
         for bias in 0 1; do
             run_logged "sm120_tensorwise_weight_bias${bias}" env \
                 FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
-                "${optest}" --op linear_fp8_block128 --device cuda:0 \
+                "${optest}" --op linear_fp8_w8a8 --device cuda:0 \
                 --param batch=17 --param in=4096 --param out=4096 \
                 --param weight_layout=tensorwise --param input_type=bf16 \
-                --param has_bias="${bias}" --param check=7 --warmup 0 --iters 1
+                --param has_bias="${bias}" --param check=1 --warmup 0 --iters 1
         done
         run_logged sm120_fixed_backend_lifecycle env \
             FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
-            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            "${optest}" --op linear_fp8_w8a8 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param weight_layout=perchannel --param input_type=bf16 \
-            --param has_bias=1 --param check=8 --warmup 0 --iters 1
+            --param has_bias=1 --param check=2 --warmup 0 --iters 1
         # 后端生命周期故障测试使用正式CUTLASS入口，只通过测试开关注入
         # GEMM失败；不绕过正式状态机、缓存或同步边界。
         run_logged sm120_first_gemm_failure_rejected env \
             FASTLLM_CUDA_W8A8=1 \
-            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            "${optest}" --op linear_fp8_w8a8 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param weight_layout=perchannel --param input_type=bf16 \
-            --param has_bias=1 --param check=9 --warmup 0 --iters 1
+            --param has_bias=1 --param check=3 --warmup 0 --iters 1
         run_logged sm120_fixed_cutlass_failure_no_fallback env \
             FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
-            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            "${optest}" --op linear_fp8_w8a8 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param weight_layout=perchannel --param input_type=bf16 \
-            --param has_bias=1 --param check=10 --warmup 0 --iters 1
+            --param has_bias=1 --param check=4 --warmup 0 --iters 1
         run_logged sm120_destructor_clears_backend_state env \
             FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
-            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            "${optest}" --op linear_fp8_w8a8 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param weight_layout=perchannel --param input_type=bf16 \
-            --param has_bias=1 --param check=11 --warmup 0 --iters 1
+            --param has_bias=1 --param check=5 --warmup 0 --iters 1
         run_logged sm120_gpu_migration_rebuilds_cache env \
             FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
-            "${optest}" --op linear_fp8_block128 --device cuda:0 \
+            "${optest}" --op linear_fp8_w8a8 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param weight_layout=perchannel --param input_type=bf16 \
-            --param has_bias=1 --param check=12 --warmup 0 --iters 1
+            --param has_bias=1 --param check=6 --warmup 0 --iters 1
         # vLLM test_cutlass_scaled_mm.py中的全部对齐MNK形状。FastLLM只
         # 比较双方共同支持的per-token A scale和per-channel B scale语义。
         while read -r m n k; do
@@ -217,7 +217,7 @@ EOF
         run_sm120_block128_check \
             sm120_vllm_block_output_dtype 512 512 512 fp16
 
-        for check in 13 14 15 16 17; do
+        for check in 2 3 4 5 6; do
             run_logged "sm120_fp8_blockwise_lifecycle_${check}" env \
                 FASTLLM_CUDA_W8A8=1 \
                 "${optest}" --op linear_fp8_block128 --device cuda:0 \

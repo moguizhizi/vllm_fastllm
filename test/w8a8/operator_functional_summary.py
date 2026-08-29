@@ -6,8 +6,12 @@ import csv
 import json
 from pathlib import Path
 import re
-import zipfile
-from xml.sax.saxutils import escape
+import sys
+
+
+REPO_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_DIR / "test" / "nvfp4"))
+from xlsx_report import write_xlsx as write_workbook  # noqa: E402
 
 
 HEADERS = [
@@ -27,7 +31,7 @@ FUNCTIONAL_LOG_PATTERNS = (
     re.compile(r"^sm120_destructor_clears_backend_state$"),
     re.compile(r"^sm120_gpu_migration_rebuilds_cache$"),
     re.compile(r"^sm120_vllm_"),
-    re.compile(r"^sm120_fp8_blockwise_fallback_guard$"),
+    re.compile(r"^sm120_fp8_blockwise_"),
 )
 
 
@@ -154,9 +158,26 @@ def parse_vllm_official(path, text):
             "check": dtype, "max_abs_diff": None, "mean_abs_diff": None,
             "details": "", "log": path.name,
         })
+    block_pattern = re.compile(
+        r"^PASS block128 m=(?P<m>\d+) n=(?P<n>\d+) k=(?P<k>\d+) "
+        r"output_dtype=(?P<dtype>[^\s]+)$",
+        re.MULTILINE,
+    )
+    for index, match in enumerate(block_pattern.finditer(text), 1):
+        values = match.groupdict()
+        rows.append({
+            "case": f"vllm_block128_{index:03d}",
+            "backend": "vLLM", "category": "vLLM Block128 coverage",
+            "result": "PASS", "op": "cutlass_scaled_mm_block128",
+            "m": int(values["m"]), "n": int(values["n"]),
+            "k": int(values["k"]), "input_type": "bf16",
+            "weight_layout": "block128", "bias": 0,
+            "check": values["dtype"], "max_abs_diff": None,
+            "mean_abs_diff": None, "details": "", "log": path.name,
+        })
     rows.append({
         "case": path.stem, "backend": "vLLM", "category": "vLLM suite",
-        "result": result_from_log(text), "op": "cutlass_scaled_mm",
+        "result": result_from_log(text), "op": "cutlass_scaled_mm_suite",
         "m": None, "n": None, "k": None, "input_type": None,
         "weight_layout": None, "bias": None, "check": None,
         "max_abs_diff": None, "mean_abs_diff": None,
@@ -180,95 +201,37 @@ def collect_rows(log_dir):
     return rows
 
 
-def excel_column_name(index):
-    name = ""
-    while index:
-        index, remainder = divmod(index - 1, 26)
-        name = chr(ord("A") + remainder) + name
-    return name
-
-
 def display_value(value):
     """将功能报告展示层的浮点值统一格式化为小数点后3位。"""
     return f"{value:.3f}" if isinstance(value, float) else value
 
 
-def excel_cell(reference, value, header=False):
-    style = ' s="1"' if header else (' s="2"' if isinstance(value, float) else "")
-    if value is None:
-        return f'<c r="{reference}"{style} t="inlineStr"><is><t>n/a</t></is></c>'
-    if isinstance(value, (int, float)):
-        return f'<c r="{reference}"{style}><v>{value}</v></c>'
-    return (f'<c r="{reference}"{style} t="inlineStr"><is><t>'
-            f'{escape(str(value))}</t></is></c>')
+def report_group(row):
+    """按实际scale语义把功能结果分配到独立工作表。"""
+    if row.get("weight_layout") in ("per-channel", "tensorwise"):
+        return "Dense W8A8功能"
+    if row.get("weight_layout") in ("separate", "block128"):
+        return "Block128 W8A8功能"
+    if row.get("op") in ("linear_fp8_block128",
+                          "cutlass_scaled_mm_block128"):
+        return "Block128 W8A8功能"
+    if row.get("op") in ("linear_fp8_w8a8", "cutlass_scaled_mm"):
+        return "Dense W8A8功能"
+    return "其他W8A8功能"
 
 
 def write_xlsx(path, rows):
-    values = [[row.get(header) for header in HEADERS] for row in rows]
-    all_rows = [HEADERS, *values]
-    row_xml = []
-    for row_index, row in enumerate(all_rows, 1):
-        cells = "".join(
-            excel_cell(f"{excel_column_name(column)}{row_index}", value, row_index == 1)
-            for column, value in enumerate(row, 1))
-        row_xml.append(f'<row r="{row_index}">{cells}</row>')
-    widths = []
-    for index, header in enumerate(HEADERS):
-        width = max(len(header), *(len(str(row[index])) for row in values)) + 2 if values else len(header) + 2
-        widths.append(min(60, max(10, width)))
-    columns = "".join(
-        f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
-        for index, width in enumerate(widths, 1))
-    last = f"{excel_column_name(len(HEADERS))}{len(all_rows)}"
-    worksheet = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
-        'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
-        f'<cols>{columns}</cols><sheetData>{"".join(row_xml)}</sheetData>'
-        f'<autoFilter ref="A1:{last}"/></worksheet>')
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        '</Types>')
-    root_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-        '</Relationships>')
-    workbook = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        '<sheets><sheet name="Functional" sheetId="1" r:id="rId1"/></sheets></workbook>')
-    workbook_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-        '</Relationships>')
-    styles = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<numFmts count="1"><numFmt numFmtId="164" formatCode="0.000"/></numFmts>'
-        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/></font></fonts>'
-        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/></patternFill></fill></fills>'
-        '<borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs>'
-        '<cellXfs count="3"><xf/><xf fontId="1" fillId="2" applyFont="1" applyFill="1"/>'
-        '<xf numFmtId="164" applyNumberFormat="1"/></cellXfs>'
-        '</styleSheet>')
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types)
-        archive.writestr("_rels/.rels", root_rels)
-        archive.writestr("xl/workbook.xml", workbook)
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        archive.writestr("xl/styles.xml", styles)
-        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+    """生成按Dense、Block128和其他W8A8分类的多工作表报告。"""
+    sheets = []
+    for name in ("Dense W8A8功能", "Block128 W8A8功能", "其他W8A8功能"):
+        selected = [row for row in rows if report_group(row) == name]
+        if selected:
+            sheets.append((
+                name,
+                HEADERS,
+                [[row.get(header) for header in HEADERS] for row in selected],
+            ))
+    write_workbook(path, sheets)
 
 
 def write_reports(log_dir, prefix, rows):
