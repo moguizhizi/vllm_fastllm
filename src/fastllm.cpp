@@ -2927,6 +2927,16 @@ namespace fastllm {
             // 只记录Prepared，首次真实GEMM验证后再固定最终后端。
             FastllmCudaTryPrepareFp8W8A8Weight(*this);
         }
+        if (device == DataDevice::CUDA && copyData &&
+            this->dataType == DataType::FP8_E4M3 &&
+            this->linearQuantScheme ==
+                LinearQuantScheme::FP8_W8A8_BLOCK128 &&
+            this->weightType == WeightType::LINEAR &&
+            this->cudaData != nullptr) {
+            // Blockwise FP8权重上传后构建设备scale，并记录Prepared；首次
+            // 真实GEMM验证成功后固定CUTLASS后端。
+            FastllmCudaTryPrepareFp8W8A8Block128Weight(*this);
+        }
 #endif
     }
 

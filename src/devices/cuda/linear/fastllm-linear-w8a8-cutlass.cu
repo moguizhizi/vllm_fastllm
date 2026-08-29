@@ -902,6 +902,9 @@ void FastllmCudaReleaseFp8W8A8BackendState(const fastllm::Data *weight) {
 #else
     (void)weight;
 #endif
+    // 标准per-channel/tensorwise和Blockwise共用Data生命周期入口；
+    // 覆盖、迁移或析构任一FP8权重时同时清理两类后端状态。
+    FastllmCudaReleaseFp8W8A8Block128BackendState(weight);
 }
 
 FastllmCudaFp8W8A8BackendState FastllmCudaGetFp8W8A8BackendState(

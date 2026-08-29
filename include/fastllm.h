@@ -352,6 +352,7 @@ namespace fastllm {
         NONE = 0,
         LEGACY_AUTO,
         FP8_W8A8,
+        FP8_W8A8_BLOCK128,
         INT8_W8A8,
         INT4_W4A8,
         NVFP4_W4A4,

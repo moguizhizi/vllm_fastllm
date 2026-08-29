@@ -5017,6 +5017,9 @@ namespace fastllm {
         } else if (quantScheme == LinearQuantScheme::FP8_W8A8) {
             if (FastllmCudaCutlassLinearFp8W8A8Sm120(
                     input, weight, bias, output, n, m, k)) return;
+        } else if (quantScheme == LinearQuantScheme::FP8_W8A8_BLOCK128) {
+            if (FastllmCudaCutlassLinearFp8W8A8Block128(
+                    input, weight, bias, output, n, m, k)) return;
         } else if (quantScheme == LinearQuantScheme::NVFP4_W4A4) {
             // 首次调用统一选择并固定CUTLASS W4A4、Marlin W4A16兼容路径
             // 或原生W4A16兼容路径；正式推理不再用短路表达式反复探测。
@@ -5053,6 +5056,12 @@ namespace fastllm {
                 "Linear error: compressed-tensors W4A8 is unavailable. The CUDA build "
                 "must enable the SM90 CUTLASS W4A8 kernel, and the weight must use "
                 "symmetric INT4 group_size=128 without zero points or act-order.\n");
+        }
+        if (quantScheme == LinearQuantScheme::FP8_W8A8_BLOCK128) {
+            ErrorInFastLLM(
+                "Linear error: configured FP8 W8A8 Block128 requires the "
+                "SM90/SM120 CUTLASS blockwise backend, FP8_E4M3 [N,K] weights, "
+                "128x128 FP32 weight scales, and K/N aligned to 128.\n");
         }
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT32) {

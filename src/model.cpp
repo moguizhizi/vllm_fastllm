@@ -1663,6 +1663,14 @@ namespace fastllm {
         const int inputBits = input["num_bits"].int_value();
         const std::string inputStrategy = input["strategy"].string_value();
 
+        auto blockStructureEquals = [](const json11::Json &value,
+                                       int rows, int cols) {
+            const auto &items = value.array_items();
+            return items.size() == 2 &&
+                   items[0].int_value() == rows &&
+                   items[1].int_value() == cols;
+        };
+
         if (weightType == "float" && weightBits == 4 &&
             format.find("nvfp4") != std::string::npos) {
             // 与vLLM的compressed-tensors分派保持一致：存在NVFP4激活
@@ -1673,6 +1681,14 @@ namespace fastllm {
             if (inputType == "float" && inputBits == 4) {
                 return LinearQuantScheme::NVFP4_W4A4;
             }
+        }
+        if (weightType == "float" && weightBits == 8 &&
+            inputType == "float" && inputBits == 8 &&
+            blockStructureEquals(weight["block_structure"], 128, 128) &&
+            input["group_size"].int_value() == 128 &&
+            !weight["dynamic"].bool_value() &&
+            input["dynamic"].bool_value()) {
+            return LinearQuantScheme::FP8_W8A8_BLOCK128;
         }
         if (weightType == "float" && weightBits == 8 &&
             inputType == "float" && inputBits == 8 &&
@@ -1709,10 +1725,32 @@ namespace fastllm {
             const json11::Json &config) {
         CompressedTensorsLinearSchemePlan plan;
         const auto &quant = config["quantization_config"];
-        if (quant.is_null() ||
-            quant["quant_method"].string_value() != "compressed-tensors") {
+        if (quant.is_null()) {
             return plan;
         }
+
+        const std::string quantMethod = quant["quant_method"].string_value();
+        if (quantMethod == "fp8") {
+            const auto &blockSize = quant["weight_block_size"].array_items();
+            CompressedTensorsLinearSchemeGroup parsed;
+            parsed.scheme = blockSize.size() == 2 &&
+                            blockSize[0].int_value() == 128 &&
+                            blockSize[1].int_value() == 128
+                ? LinearQuantScheme::FP8_W8A8_BLOCK128
+                : LinearQuantScheme::FP8_W8A8;
+            parsed.targets.push_back("Linear");
+
+            plan.configured = true;
+            for (const auto &value : quant["ignored_layers"].array_items()) {
+                if (!value.string_value().empty()) {
+                    plan.ignore.push_back(value.string_value());
+                }
+            }
+            plan.groups.push_back(std::move(parsed));
+            return plan;
+        }
+        if (quantMethod != "compressed-tensors") return plan;
+
         plan.configured = true;
         for (const auto &value : quant["ignore"].array_items()) {
             if (!value.string_value().empty()) plan.ignore.push_back(value.string_value());
@@ -1745,6 +1783,20 @@ namespace fastllm {
                            weightName + ": " + reason + "\n");
         };
         switch (weight.linearQuantScheme) {
+            case LinearQuantScheme::FP8_W8A8_BLOCK128:
+                if (weight.dataType != DataType::FP8_E4M3 ||
+                    weight.dims.size() != 2) {
+                    fail("blockwise FP8 W8A8 requires a 2D FP8_E4M3 weight");
+                }
+                if (weight.blockK != 128 || weight.blockM != 128 ||
+                    weight.dims[0] % 128 != 0 ||
+                    weight.dims[1] % 128 != 0 ||
+                    weight.scales.size() !=
+                        (size_t)(weight.dims[0] / 128) *
+                        (weight.dims[1] / 128)) {
+                    fail("blockwise FP8 W8A8 requires 128x128 weight scales");
+                }
+                break;
             case LinearQuantScheme::FP8_W8A8:
                 if (weight.dataType != DataType::FP8_E4M3 || weight.dims.size() != 2) {
                     fail("FP8 W8A8 requires a 2D FP8_E4M3 weight");
