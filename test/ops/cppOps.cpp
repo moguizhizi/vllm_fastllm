@@ -3207,6 +3207,8 @@ namespace {
                 InitPackedWeight(weight, out, in, block, 0.7f);
             } else if (weightLayout == "separate") {
                 InitSeparateScaleWeight(weight, out, in, block, 0.7f);
+                weight.linearQuantScheme =
+                    fastllm::LinearQuantScheme::FP8_W8A8_BLOCK128;
             } else if (weightLayout == "perchannel") {
                 InitPerChannelWeight(weight, out, in, 0.7f);
                 weight.linearQuantScheme = fastllm::LinearQuantScheme::FP8_W8A8;
@@ -3381,11 +3383,9 @@ namespace {
         }
         ForceDeviceSync();
 
-        ok = FastllmCudaCutlassLinearFP8E4M3Block128(state->input, state->weight, state->bias,
-                                                     cutlass, state->batch, state->in, state->out);
-        if (!ok) {
-            throw std::runtime_error("CUTLASS FP8 linear path failed");
-        }
+        // 被测结果走正式Linear入口；权重在Init阶段已经声明为Block128
+        // W8A8，严格模式下目标CUTLASS后端未接管会直接失败。
+        fastllm::Linear(state->input, state->weight, state->bias, cutlass);
         ForceDeviceSync();
 
         fastllm::Data ref32 = ConvertToFloat32Data(ref);
@@ -3393,6 +3393,12 @@ namespace {
         std::vector<float> refVec = ToFloatVector(ref32);
         std::vector<float> cutlassVec = ToFloatVector(cutlass32);
         PrintLinearFp8Block128CheckStats(refVec, cutlassVec, state->batch, state->out);
+
+        ComparisonStats stats = CompareData(ref32, cutlass32, 0.5f, 0.1f);
+        if (!stats.passed) {
+            throw std::runtime_error(
+                "Block128 FP8 W8A8 output mismatch");
+        }
 
         if (params.GetInt("print") != 0) {
             fastllm::Data input32 = ConvertToFloat32Data(state->input);
@@ -3689,6 +3695,184 @@ namespace {
         }
         FastllmCudaSetDevice(0);
         std::cout << "SM120 W8A8 GPU migration rebuilds cache: PASS\n";
+    }
+
+    static void CheckLinearFp8Block128LifecycleCuda(
+            const OpTestParams &params, int mode) {
+        const char *enabledValue = std::getenv("FASTLLM_CUDA_W8A8");
+        const char *strictValue = std::getenv("FASTLLM_CUDA_W8A8_STRICT");
+        const char *failureValue = std::getenv(
+            "FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+        const std::optional<std::string> oldEnabled = enabledValue == nullptr
+            ? std::nullopt : std::optional<std::string>(enabledValue);
+        const std::optional<std::string> oldStrict = strictValue == nullptr
+            ? std::nullopt : std::optional<std::string>(strictValue);
+        const std::optional<std::string> oldFailure = failureValue == nullptr
+            ? std::nullopt : std::optional<std::string>(failureValue);
+        auto restore = [](const char *name,
+                          const std::optional<std::string> &value) {
+            if (value.has_value()) setenv(name, value->c_str(), 1);
+            else unsetenv(name);
+        };
+        auto restoreAll = [&]() {
+            restore("FASTLLM_CUDA_W8A8", oldEnabled);
+            restore("FASTLLM_CUDA_W8A8_STRICT", oldStrict);
+            restore("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", oldFailure);
+        };
+
+        try {
+            setenv("FASTLLM_CUDA_W8A8", "1", 1);
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+
+            if (mode == 0) {
+                setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 first backend selection failed");
+                }
+                setenv("FASTLLM_CUDA_W8A8", "0", 1);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "fixed Block128 backend was not retained");
+                }
+            } else if (mode == 1) {
+                unsetenv("FASTLLM_CUDA_W8A8_STRICT");
+                setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+                bool ok = FastllmCudaCutlassLinearFp8W8A8Block128(
+                    state.input, state.weight, state.bias, state.output,
+                    state.batch, state.in, state.out);
+                if (ok || FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, FastllmCudaGetDevice()) !=
+                        FastllmCudaFp8W8A8BackendState::Rejected) {
+                    throw std::runtime_error(
+                        "Block128 first failure did not fix Rejected");
+                }
+                unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+                if (FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Rejected Block128 weight retried CUTLASS");
+                }
+            } else if (mode == 2) {
+                setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 backend was not fixed to CUTLASS");
+                }
+                setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+                bool threw = false;
+                try {
+                    FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out);
+                } catch (const std::runtime_error &) {
+                    threw = true;
+                }
+                if (!threw || FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, FastllmCudaGetDevice()) !=
+                        FastllmCudaFp8W8A8BackendState::Cutlass) {
+                    throw std::runtime_error(
+                        "fixed Block128 failure did not forbid fallback");
+                }
+            } else if (mode == 3) {
+                std::optional<LinearFp8Block128BenchState> holder;
+                holder.emplace();
+                holder->Init(params);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        holder->input, holder->weight, holder->bias,
+                        holder->output, holder->batch, holder->in,
+                        holder->out)) {
+                    throw std::runtime_error(
+                        "Block128 destructor test selection failed");
+                }
+                const fastllm::Data *address = &holder->weight;
+                holder.reset();
+                holder.emplace();
+                if (&holder->weight != address ||
+                    FastllmCudaGetFp8W8A8Block128BackendState(
+                        holder->weight, FastllmCudaGetDevice()) !=
+                        FastllmCudaFp8W8A8BackendState::Uninitialized) {
+                    throw std::runtime_error(
+                        "destroyed Block128 weight left stale state");
+                }
+            } else if (mode == 4) {
+                if (FastllmCudaGetDeviceCount() < 2) {
+                    std::cout << "Block128 W8A8 GPU migration: SKIP "
+                              << "(requires 2 GPUs)\n";
+                    restoreAll();
+                    return;
+                }
+
+                setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 GPU0 backend selection failed");
+                }
+                ForceDeviceSync();
+                fastllm::Data gpu0 = ConvertToFloat32Data(state.output);
+
+                state.input.ToDevice(fastllm::DataDevice::CUDA, {1});
+                state.weight.ToDevice(fastllm::DataDevice::CUDA, {1});
+                if (!state.bias.dims.empty()) {
+                    state.bias.ToDevice(fastllm::DataDevice::CUDA, {1});
+                }
+                state.output.ToDevice(
+                    fastllm::DataDevice::CUDA, {1}, false);
+                FastllmCudaSetDevice(1);
+
+                if (FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, 0) !=
+                            FastllmCudaFp8W8A8BackendState::Uninitialized ||
+                    FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, 1) !=
+                            FastllmCudaFp8W8A8BackendState::Prepared) {
+                    throw std::runtime_error(
+                        "Block128 GPU migration retained stale backend state");
+                }
+
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 GPU1 backend selection failed");
+                }
+                ForceDeviceSync();
+                fastllm::Data gpu1 = ConvertToFloat32Data(state.output);
+
+                ComparisonStats stats = CompareData(gpu0, gpu1, 0.02f, 0.02f);
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "Block128 GPU migration output mismatch");
+                }
+                FastllmCudaSetDevice(0);
+            }
+        } catch (...) {
+            FastllmCudaSetDevice(0);
+            restoreAll();
+            throw;
+        }
+
+        restoreAll();
+        std::cout << "Block128 W8A8 lifecycle check " << mode
+                  << ": PASS\n";
     }
 
     static void CheckLinearFp8PerChannelCuda(const OpTestParams &params) {
@@ -4085,6 +4269,11 @@ namespace {
         } else if (params.GetInt("check") == 12) {
             CheckLinearFp8W8A8DeviceMoveCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") >= 13 &&
+                   params.GetInt("check") <= 17) {
+            CheckLinearFp8Block128LifecycleCuda(
+                params, params.GetInt("check") - 13);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -4168,7 +4357,10 @@ namespace {
                            "6 per-channel CUTLASS scaled-mm, 7 SM120 standard FP8, "
                            "8 SM120 fixed backend lifecycle, 9 first failure rejection, "
                            "10 fixed backend failure, 11 destructor state cleanup, "
-                           "12 GPU migration cache rebuild");
+                           "12 GPU migration cache rebuild, 13 Block128 fixed backend, "
+                           "14 Block128 first failure rejection, "
+                           "15 Block128 fixed failure, 16 Block128 destructor cleanup, "
+                           "17 Block128 GPU migration cache rebuild");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },

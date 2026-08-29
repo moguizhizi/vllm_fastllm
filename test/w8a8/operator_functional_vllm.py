@@ -54,6 +54,28 @@ def check_case(m, n, k, per_token, per_channel, use_bias,
         actual.float(), expected, rtol=5e-1, atol=1.5e-1)
 
 
+def check_block128_case(m, n, k, out_dtype=torch.bfloat16):
+    """验证vLLM正式(1,128)x(128,128) Blockwise scaled-mm。"""
+    fp8 = torch.float8_e4m3fn
+    a = torch.empty((m, k), device="cuda", dtype=torch.bfloat16).normal_().to(fp8)
+    b = torch.empty((n, k), device="cuda", dtype=torch.bfloat16).normal_().to(fp8).t()
+    scale_a = torch.empty(
+        (m, k // 128), device="cuda", dtype=torch.float32).uniform_(0.001, 0.01)
+    scale_b = torch.empty(
+        (k // 128, n // 128), device="cuda",
+        dtype=torch.float32).uniform_(0.001, 0.01)
+    scale_b = scale_b.t().contiguous().t()
+
+    actual = ops.cutlass_scaled_mm(
+        a, b, scale_a, scale_b, out_dtype, None)
+    expected = (
+        a.float() * scale_a.repeat_interleave(128, dim=1)) @ (
+        b.float() * scale_b.repeat_interleave(
+            128, dim=0).repeat_interleave(128, dim=1))
+    torch.testing.assert_close(
+        actual.float(), expected, rtol=5e-1, atol=1.5e-1)
+
+
 def check_unaligned_case(m, n, k, per_token, per_channel, use_bias):
     """按vLLM高层Linear kernel的真实padding路径检查非对齐形状。"""
     from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
@@ -129,6 +151,21 @@ def main():
         check_case(512, 512, 512, True, True, True, out_dtype)
         total += 1
         print(f"PASS output_dtype={out_dtype}", flush=True)
+
+    # 对应vLLM test_cutlass_fp8_blockwise_scale_gemm：只执行满足
+    # Block128布局约束的官方MNK，并覆盖BF16/FP16输出。
+    for m, n, k in ALIGNED:
+        if n % 128 != 0 or k % 128 != 0:
+            continue
+        for out_dtype in (torch.bfloat16, torch.float16):
+            check_block128_case(m, n, k, out_dtype)
+            total += 1
+            print(
+                f"PASS block128 m={m} n={n} k={k} "
+                f"output_dtype={out_dtype}", flush=True)
+            torch.cuda.empty_cache()
+            gc.collect()
+
     print(f"Summary: PASS ({total} vLLM FP8 scaled-mm cases)")
 
 

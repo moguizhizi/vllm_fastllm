@@ -65,6 +65,17 @@ run_sm120_standard_check() {
         --param has_bias="${bias}" --param check=7 --warmup 0 --iters 1
 }
 
+run_sm120_block128_check() {
+    local name=$1 m=$2 n=$3 k=$4 dtype=$5
+    run_logged "${name}_${dtype}" env \
+        FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+        "${optest}" --op linear_fp8_block128 --device cuda:0 \
+        --param batch="${m}" --param in="${k}" --param out="${n}" \
+        --param block=128 --param weight_layout=separate \
+        --param input_type="${dtype}" --param has_bias=0 \
+        --param check=1 --warmup 0 --iters 1
+}
+
 run_ops_functional_cases() {
     local arch
     arch=$(detect_arch)
@@ -75,8 +86,7 @@ run_ops_functional_cases() {
             --param input_type=bf16 --param has_bias=1 --param check=1 \
             --warmup 0 --iters 1
         run_logged sm90_fp8_blockwise_function env \
-            FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
-            FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH=1 \
+            FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
             "${optest}" --op linear_fp8_block128 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param block=128 --param weight_layout=separate \
@@ -173,12 +183,49 @@ run_ops_functional_cases() {
 512 16384 128
 512 24576 128
 EOF
-        run_logged sm120_fp8_blockwise_fallback_guard env \
-            FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
-            "${optest}" --op linear_fp8_block128 --device cuda:0 \
-            --param batch=17 --param in=4096 --param out=4096 \
-            --param block=128 --param weight_layout=separate \
-            --param input_type=bf16 --param check=1 --warmup 0 --iters 1
+        # vLLM SM120 Blockwise分派边界：M<=64或M%4!=0走SwapAB；
+        # 其余M<=256走Pingpong；M>256走默认Cooperative配置。
+        for m in 1 64 65 68 256 257; do
+            run_sm120_block128_check \
+                "sm120_fp8_blockwise_m${m}" "${m}" 4096 4096 bf16
+        done
+
+        # 与vLLM test_cutlass_fp8_blockwise_scale_gemm相同的MNK集合；
+        # 仅保留K/N均可被128整除的合法Block128形状。
+        while read -r m n k; do
+            run_sm120_block128_check \
+                "sm120_vllm_block_m${m}_n${n}_k${k}" \
+                "${m}" "${n}" "${k}" bf16
+        done <<'EOF'
+1 256 128
+1 16384 1024
+16 16384 128
+16 24576 4096
+32 8192 4096
+32 16384 4096
+33 1024 1024
+33 8192 128
+64 16384 1024
+128 32768 4096
+256 4096 4096
+512 256 1024
+512 8192 4096
+512 16384 128
+512 24576 128
+EOF
+        # vLLM官方dtype case同时覆盖BF16和FP16输出。
+        run_sm120_block128_check \
+            sm120_vllm_block_output_dtype 512 512 512 fp16
+
+        for check in 13 14 15 16 17; do
+            run_logged "sm120_fp8_blockwise_lifecycle_${check}" env \
+                FASTLLM_CUDA_W8A8=1 \
+                "${optest}" --op linear_fp8_block128 --device cuda:0 \
+                --param batch=68 --param in=4096 --param out=4096 \
+                --param block=128 --param weight_layout=separate \
+                --param input_type=bf16 --param has_bias=1 \
+                --param check="${check}" --warmup 0 --iters 1
+        done
         run_logged sm120_vllm_official_functional \
             "${vllm_python}" test/w8a8/operator_functional_vllm.py
     else
@@ -205,8 +252,7 @@ run_ops_performance() {
                 --param input_type=bf16 --param has_bias=1 \
                 --warmup 20 --iters 200
             run_logged "sm90_fp8_blockwise_m${batch}_perf" env \
-                FASTLLM_CUDA_CUTLASS_LINEAR_FP8=1 \
-                FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH=1 \
+                FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
                 "${optest}" --op linear_fp8_block128 --device cuda:0 \
                 --param batch="${batch}" --param in=4096 --param out=4096 \
                 --param block=128 --param weight_layout=separate \
@@ -233,9 +279,17 @@ run_ops_performance() {
             --param scale_layout=perchannel \
             --param path=operator --warmup 20 --iters 200
     elif [[ "${arch}" == 120 ]]; then
-        run_logged sm120_w8a8_operator_compare \
+        run_logged sm120_w8a8_perchannel_operator_compare \
             "${vllm_python}" test/w8a8/operator_performance_compare.py \
-            --optest "${optest}" --output-dir "${log_dir}/operator-compare" \
+            --optest "${optest}" \
+            --output-dir "${log_dir}/operator-compare/perchannel" \
+            --scale-layout perchannel \
+            --warmup 20 --iters 200 --outer-repeats 5
+        run_logged sm120_w8a8_block128_operator_compare \
+            "${vllm_python}" test/w8a8/operator_performance_compare.py \
+            --optest "${optest}" \
+            --output-dir "${log_dir}/operator-compare/block128" \
+            --scale-layout block128 \
             --warmup 20 --iters 200 --outer-repeats 5
     fi
 }

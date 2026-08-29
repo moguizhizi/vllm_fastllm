@@ -48,6 +48,21 @@ CASES = [
     ("vllm_m512_n24576_k128", 512, 24576, 128),
 ]
 
+# Block128只接受K、N均按128对齐。前六项覆盖vLLM SM120分派条件：
+# M<=64或M不能被4整除时走SwapAB，其余M<=256走Pingpong，之后走默认配置。
+BLOCK128_CASES = [
+    ("block_branch_m1", 1, 4096, 4096),
+    ("block_branch_m64", 64, 4096, 4096),
+    ("block_branch_m65", 65, 4096, 4096),
+    ("block_branch_m68", 68, 4096, 4096),
+    ("block_branch_m256", 256, 4096, 4096),
+    ("block_branch_m257", 257, 4096, 4096),
+] + [
+    (f"block_{name}", m, n, k)
+    for name, m, n, k in CASES
+    if name.startswith("vllm_") and n % 128 == 0 and k % 128 == 0
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -59,7 +74,16 @@ def parse_args():
     parser.add_argument(
         "--outer-repeats", type=int, default=5,
         help="每个形状的独立重复次数；用于计算Median、P95和CV")
+    parser.add_argument(
+        "--scale-layout", choices=("perchannel", "block128"),
+        default="perchannel",
+        help="双方共同使用的权重/激活scale语义")
     return parser.parse_args()
+
+
+def selected_cases(args):
+    """按scale布局返回合法且覆盖正式分派边界的测试形状。"""
+    return BLOCK128_CASES if args.scale_layout == "block128" else CASES
 
 
 def percentile(samples, ratio):
@@ -110,13 +134,20 @@ def run_fastllm(args, log_dir):
         "FASTLLM_CUDA_W8A8_STRICT": "1",
         "FASTLLM_CUDA_W8A8_TRACE": "0",
     })
-    for name, m, n, k in CASES:
+    weight_layout = (
+        "separate" if args.scale_layout == "block128" else "perchannel")
+    backend_path = (
+        "w8a8-block128-cutlass (strict)"
+        if args.scale_layout == "block128" else "w8a8-cutlass (strict)")
+
+    for name, m, n, k in selected_cases(args):
         samples = []
         for repeat in range(args.outer_repeats):
             command = [
                 args.optest, "--op", "linear_fp8_block128", "--device", "cuda:0",
                 "--param", f"batch={m}", "--param", f"in={k}",
-                "--param", f"out={n}", "--param", "weight_layout=perchannel",
+                "--param", f"out={n}",
+                "--param", f"weight_layout={weight_layout}",
                 "--param", "input_type=bf16", "--param", "has_bias=0",
                 "--warmup", str(args.warmup), "--iters", str(args.iters),
             ]
@@ -131,8 +162,9 @@ def run_fastllm(args, log_dir):
             samples.append(float(matches[-1]))
         rows.append({
             "case": name, "m": m, "n": n, "k": k,
+            "scale_layout": args.scale_layout,
             **summarize_samples(
-                "fastllm", samples, m, n, k, "w8a8-cutlass (strict)"),
+                "fastllm", samples, m, n, k, backend_path),
         })
         print(json.dumps(rows[-1]), flush=True)
     return rows
@@ -141,10 +173,13 @@ def run_fastllm(args, log_dir):
 def run_vllm(args):
     import torch
     from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
 
     rows = []
     fp8 = torch.float8_e4m3fn
-    for name, m, n, k in CASES:
+    for name, m, n, k in selected_cases(args):
         samples = []
         for _ in range(args.outer_repeats):
             torch.cuda.empty_cache()
@@ -153,12 +188,24 @@ def run_vllm(args):
                 (m, k), device="cuda", dtype=torch.bfloat16).normal_()
             weight = torch.empty(
                 (n, k), device="cuda", dtype=torch.bfloat16).normal_().to(fp8).t()
-            weight_scale = torch.empty(
-                (1, n), device="cuda", dtype=torch.float32).uniform_(0.001, 0.01)
+            if args.scale_layout == "block128":
+                weight_scale = torch.empty(
+                    (k // 128, n // 128), device="cuda",
+                    dtype=torch.float32).uniform_(0.001, 0.01)
+                # 与vLLM功能测试相同：B scale在逻辑上K-major，且末维连续。
+                weight_scale = weight_scale.t().contiguous().t()
+            else:
+                weight_scale = torch.empty(
+                    (1, n), device="cuda",
+                    dtype=torch.float32).uniform_(0.001, 0.01)
 
             def run():
-                quantized, token_scale = ops.scaled_fp8_quant(
-                    source, scale=None, use_per_token_if_dynamic=True)
+                if args.scale_layout == "block128":
+                    quantized, token_scale = per_token_group_quant_fp8(
+                        source, 128, use_ue8m0=False)
+                else:
+                    quantized, token_scale = ops.scaled_fp8_quant(
+                        source, scale=None, use_per_token_if_dynamic=True)
                 return ops.cutlass_scaled_mm(
                     quantized, weight, token_scale, weight_scale,
                     torch.bfloat16, None)
@@ -177,15 +224,18 @@ def run_vllm(args):
             del source, weight, weight_scale, output
         rows.append({
             "case": name, "m": m, "n": n, "k": k,
+            "scale_layout": args.scale_layout,
             **summarize_samples(
                 "vllm", samples, m, n, k,
-                "scaled_fp8_quant + cutlass_scaled_mm"),
+                ("per_token_group_quant_fp8(128) + cutlass_scaled_mm"
+                 if args.scale_layout == "block128"
+                 else "scaled_fp8_quant + cutlass_scaled_mm")),
         })
         print(json.dumps(rows[-1]), flush=True)
     return rows
 
 
-def write_reports(output_dir, fastllm_rows, vllm_rows):
+def write_reports(output_dir, fastllm_rows, vllm_rows, scale_layout):
     vllm = {row["case"]: row for row in vllm_rows}
     combined = []
     for row in fastllm_rows:
@@ -214,8 +264,11 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
         [("算子性能", headers,
           [[display_value(row[key]) for key in headers] for row in combined])])
     lines = [
-        "# SM120 W8A8算子性能对比", "",
-        "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重",
+        f"# SM120 W8A8算子性能对比（{scale_layout}）", "",
+        ("> 双方都计入BF16激活动态per-group(1,128) FP8量化、"
+         "block(128,128)权重"
+         if scale_layout == "block128"
+         else "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重"),
         "> CUTLASS GEMM及输出；无bias。每项使用独立重复样本计算统计值。", "",
         "> 加速比 = vLLM耗时 / FastLLM耗时；大于1表示FastLLM更快，",
         "> 小于1表示FastLLM更慢。", "",
@@ -252,7 +305,7 @@ def main():
     fastllm_rows = run_fastllm(args, output_dir)
     # FastLLM均在子进程中运行并退出，父进程此时才加载vLLM，避免显存共存。
     vllm_rows = run_vllm(args)
-    write_reports(output_dir, fastllm_rows, vllm_rows)
+    write_reports(output_dir, fastllm_rows, vllm_rows, args.scale_layout)
 
 
 if __name__ == "__main__":
