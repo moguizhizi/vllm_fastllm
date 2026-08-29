@@ -3236,7 +3236,7 @@ namespace {
             ForceDeviceSync();
 #else
             (void)params;
-            throw std::runtime_error("linear_fp8_block128 benchmark requires USE_CUDA");
+            throw std::runtime_error("linear FP8 benchmark requires USE_CUDA");
 #endif
         }
 
@@ -3278,9 +3278,9 @@ namespace {
         return output;
     }
 
-    static void PrintLinearFp8Block128CheckStats(const std::vector<float> &expected,
-                                                 const std::vector<float> &actual,
-                                                 int batch, int out) {
+    static void PrintLinearFp8CheckStats(const std::vector<float> &expected,
+                                         const std::vector<float> &actual,
+                                         int batch, int out) {
         if (expected.empty() || expected.size() != actual.size()) {
             throw std::runtime_error(
                 "linear FP8 check received empty or mismatched output vectors");
@@ -3313,7 +3313,7 @@ namespace {
         }
         int row = out == 0 ? 0 : (int)(maxIndex / (size_t)out);
         int col = out == 0 ? 0 : (int)(maxIndex % (size_t)out);
-        std::cout << "linear_fp8_block128 check: batch=" << batch << ", out=" << out
+        std::cout << "linear_fp8 check: batch=" << batch << ", out=" << out
                   << ", count=" << expected.size() << "\n";
         std::cout << "  max_abs_diff=" << maxAbsDiff
                   << ", max_rel_diff=" << maxRelDiff
@@ -3392,7 +3392,7 @@ namespace {
         fastllm::Data cutlass32 = ConvertToFloat32Data(cutlass);
         std::vector<float> refVec = ToFloatVector(ref32);
         std::vector<float> cutlassVec = ToFloatVector(cutlass32);
-        PrintLinearFp8Block128CheckStats(refVec, cutlassVec, state->batch, state->out);
+        PrintLinearFp8CheckStats(refVec, cutlassVec, state->batch, state->out);
 
         ComparisonStats stats = CompareData(ref32, cutlass32, 0.5f, 0.1f);
         if (!stats.passed) {
@@ -3446,7 +3446,7 @@ namespace {
         ForceDeviceSync();
         fastllm::Data reference32 = ConvertToFloat32Data(reference);
         fastllm::Data actual32 = ConvertToFloat32Data(actual);
-        PrintLinearFp8Block128CheckStats(
+        PrintLinearFp8CheckStats(
             ToFloatVector(reference32), ToFloatVector(actual32),
             state->batch, state->out);
         ComparisonStats stats = CompareData(reference32, actual32, 0.5f, 0.1f);
@@ -3908,7 +3908,7 @@ namespace {
 
         std::vector<float> refVec = ToFloatVector(ConvertToFloat32Data(reference));
         std::vector<float> cutlassVec = ToFloatVector(ConvertToFloat32Data(cutlass));
-        PrintLinearFp8Block128CheckStats(
+        PrintLinearFp8CheckStats(
             refVec, cutlassVec, state->batch, state->out);
         const float atol = state->input.dataType == fastllm::DataType::FLOAT16
             ? 2.0e-3f : 8.0e-3f;
@@ -3961,7 +3961,7 @@ namespace {
         expected.resize(state->out);
         std::vector<float> observed =
             ToFloatVector(ConvertToFloat32Data(single));
-        PrintLinearFp8Block128CheckStats(
+        PrintLinearFp8CheckStats(
             expected, observed, 1, state->out);
 
         int mismatches = 0;
@@ -4044,7 +4044,7 @@ namespace {
 
         std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(reference));
         std::vector<float> observed = ToFloatVector(ConvertToFloat32Data(actual));
-        PrintLinearFp8Block128CheckStats(
+        PrintLinearFp8CheckStats(
             expected, observed, state->batch, state->out);
 
         int mismatches = 0;
@@ -4062,7 +4062,7 @@ namespace {
 
         expected.resize(state->out);
         observed = ToFloatVector(ConvertToFloat32Data(actualSingle));
-        PrintLinearFp8Block128CheckStats(expected, observed, 1, state->out);
+        PrintLinearFp8CheckStats(expected, observed, 1, state->out);
         mismatches = 0;
         for (size_t i = 0; i < expected.size(); i++) {
             float diff = std::fabs(expected[i] - observed[i]);
@@ -4207,7 +4207,7 @@ namespace {
         fastllm::Data fused32 = ConvertToFloat32Data(fused);
         std::vector<float> refVec = ToFloatVector(ref32);
         std::vector<float> fusedVec = ToFloatVector(fused32);
-        PrintLinearFp8Block128CheckStats(refVec, fusedVec, state->batch, state->out);
+        PrintLinearFp8CheckStats(refVec, fusedVec, state->batch, state->out);
 
         float maxAbsDiff = 0.0f;
         for (size_t i = 0; i < refVec.size(); i++) {
@@ -4316,7 +4316,9 @@ namespace {
         result.bytesMoved = (double)batch * in * 2.0 +
                             (double)batch * out * 2.0 +
                             weightBytes +
-                            (double)out * sizeof(float);
+                            (params.GetInt("has_bias") != 0
+                                ? (double)out * sizeof(float)
+                                : 0.0);
         result.flops = 2.0 * (double)batch * in * out;
         double seconds = result.avgMs / 1000.0;
         if (seconds > 0.0 && result.bytesMoved > 0.0) {
@@ -4331,14 +4333,225 @@ namespace {
         (void)device;
         (void)warmup;
         (void)iters;
-        throw std::runtime_error("linear_fp8_block128 benchmark requires USE_CUDA");
+        throw std::runtime_error("linear FP8 benchmark requires USE_CUDA");
 #endif
     }
 
+    /**
+     * 执行标准Dense FP8 W8A8功能或性能测试。
+     *
+     * 本入口只接受per-channel或tensorwise权重scale，并把对外连续编号的
+     * 检查项映射到已有公共实现；实际计算仍通过正式Linear入口完成。
+     *
+     * @param params  测试参数；check=1..6依次表示正确性、固定后端、首次
+     *                失败拒绝、固定后端失败、析构清理和设备迁移。
+     * @param device  CUDA设备名称。
+     * @param warmup  性能测试预热次数。
+     * @param iters   性能测试正式迭代次数。
+     * @return 功能检查结果或性能统计。
+     */
+    static BenchmarkResult BenchmarkLinearFp8W8A8Cuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+        const std::string layout = params.GetString("weight_layout");
+        if (layout != "perchannel" && layout != "tensorwise") {
+            throw std::runtime_error(
+                "linear_fp8_w8a8 requires perchannel or tensorwise "
+                "weight_layout");
+        }
+        if (params.GetString("kernel") != "auto") {
+            throw std::runtime_error(
+                "linear_fp8_w8a8 only supports the production auto path");
+        }
+
+        const int check = params.GetInt("check");
+        if (check < 0 || check > 6) {
+            throw std::runtime_error("linear_fp8_w8a8 check must be 0..6");
+        }
+
+        OpTestParams forwarded = params;
+        if (check != 0) {
+            forwarded.Override("check", std::to_string(check + 6));
+        }
+        return BenchmarkLinearFp8Block128Cuda(
+            forwarded, device, warmup, iters);
+    }
+
+    /**
+     * 执行Block128 FP8 W8A8功能或性能测试。
+     *
+     * 本入口只接受分离存放的(128,128)权重scale；check=2..6复用已有
+     * Block128后端生命周期检查，实际计算仍通过正式Linear入口完成。
+     *
+     * @param params  测试参数；check=1表示正确性，2..6表示后端生命周期。
+     * @param device  CUDA设备名称。
+     * @param warmup  性能测试预热次数。
+     * @param iters   性能测试正式迭代次数。
+     * @return 功能检查结果或性能统计。
+     */
+    static BenchmarkResult BenchmarkLinearFp8Block128OnlyCuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+        if (params.GetString("weight_layout") != "separate") {
+            throw std::runtime_error(
+                "linear_fp8_block128 requires separate weight_layout");
+        }
+        if (params.GetString("kernel") != "auto") {
+            throw std::runtime_error(
+                "linear_fp8_block128 only supports the production auto path");
+        }
+
+        const int check = params.GetInt("check");
+        if (check < 0 || check > 6) {
+            throw std::runtime_error(
+                "linear_fp8_block128 check must be 0..6");
+        }
+
+        OpTestParams forwarded = params;
+        if (check >= 2) {
+            forwarded.Override("check", std::to_string(check + 11));
+        }
+        return BenchmarkLinearFp8Block128Cuda(
+            forwarded, device, warmup, iters);
+    }
+
+    /**
+     * 构造标准Dense FP8 W8A8测试入口。
+     *
+     * 该入口仅暴露per-channel和tensorwise scale语义，并统一调用正式
+     * Linear路径；Block128和历史实验检查由其他入口承载。
+     *
+     * @return 标准Dense FP8 W8A8算子测试定义。
+     */
+    static OpCase MakeLinearFp8W8A8Case() {
+        return {
+            "linear_fp8_w8a8",
+            "dense FP8 W8A8 linear functional and performance test",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "16", "token batch size");
+                params.Add("in", "4096", "input features");
+                params.Add("out", "4096", "output features");
+                params.Add("block", "128", "input pattern group size");
+                params.Add("input_type", "bf16", "fp16 or bf16");
+                params.Add("input_pattern", "blocky", "smooth or blocky");
+                params.Add("weight_layout", "perchannel",
+                           "perchannel or tensorwise");
+                params.Add("has_bias", "1",
+                           "1 to include a float32 bias, 0 for no bias");
+                params.Add("kernel", "auto", "auto only for production path");
+                params.Add("check", "0",
+                           "1 correctness, 2 fixed backend lifecycle, "
+                           "3 first failure rejection, 4 fixed backend failure, "
+                           "5 destructor cleanup, 6 GPU migration cache rebuild");
+                params.Add("print", "0", "1 to print debug tensors");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkLinearFp8W8A8Cuda,
+            [](const OpTestParams &params) {
+                int batch = params.GetInt("batch");
+                int in = params.GetInt("in");
+                int out = params.GetInt("out");
+                double inputBytes = (double)batch * in * 2.0;
+                double outputBytes = (double)batch * out * 2.0;
+                double scaleBytes =
+                    params.GetString("weight_layout") == "tensorwise"
+                        ? sizeof(float)
+                        : (double)out * sizeof(float);
+                double biasBytes = params.GetInt("has_bias") != 0
+                    ? (double)out * sizeof(float)
+                    : 0.0;
+                return inputBytes + outputBytes +
+                       (double)out * in + scaleBytes + biasBytes;
+            },
+            [](const OpTestParams &params) {
+                return 2.0 * (double)params.GetInt("batch") *
+                       params.GetInt("in") * params.GetInt("out");
+            },
+            true
+        };
+    }
+
+    /**
+     * 构造Block128 FP8 W8A8测试入口。
+     *
+     * 该入口只允许独立存放的(128,128)权重scale，并通过正式Linear
+     * 路径验证Block128后端及其生命周期。
+     *
+     * @return Block128 FP8 W8A8算子测试定义。
+     */
     static OpCase MakeLinearFp8Block128Case() {
         return {
             "linear_fp8_block128",
-            "dense FP8 linear functional and performance test",
+            "Block128 FP8 W8A8 linear functional and performance test",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "16", "token batch size");
+                params.Add("in", "4096", "input features");
+                params.Add("out", "4096", "output features");
+                params.Add("block", "128", "FP8 scale block size");
+                params.Add("input_type", "bf16", "fp16 or bf16");
+                params.Add("input_pattern", "blocky", "smooth or blocky");
+                params.Add("weight_layout", "separate",
+                           "separate Block128 scales only");
+                params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
+                params.Add("kernel", "auto", "auto only for production path");
+                params.Add("check", "0",
+                           "1 correctness, 2 fixed backend lifecycle, "
+                           "3 first failure rejection, 4 fixed backend failure, "
+                           "5 destructor cleanup, 6 GPU migration cache rebuild");
+                params.Add("print", "0", "1 to print debug tensors when check=1");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkLinearFp8Block128OnlyCuda,
+            [](const OpTestParams &params) {
+                int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
+                double inputBytes = (double)batch * in * 2.0;
+                double outputBytes = (double)batch * out * 2.0;
+                double weightBytes = (double)out * in;
+                double scaleBytes = (double)(out / 128) * (in / 128) *
+                                    sizeof(float);
+                double biasBytes = params.GetInt("has_bias") != 0
+                    ? (double)out * sizeof(float)
+                    : 0.0;
+                return inputBytes + outputBytes + weightBytes +
+                       scaleBytes + biasBytes;
+            },
+            [](const OpTestParams &params) {
+                return 2.0 * (double)params.GetInt("batch") * params.GetInt("in") * params.GetInt("out");
+            },
+            true
+        };
+    }
+
+    /**
+     * 构造历史FP8专项检查入口。
+     *
+     * 该入口保留融合SwiGLU、Marlin、原始Batch-1和布局安全等既有测试，
+     * 避免Dense与Block128入口拆分后丢失原有专项验证能力。
+     *
+     * @return 历史FP8专项测试定义。
+     */
+    static OpCase MakeLinearFp8LegacyCase() {
+        return {
+            "linear_fp8_legacy",
+            "legacy FP8 fused, Marlin and layout safety tests",
             []() {
                 OpTestParams params;
                 params.Add("batch", "16", "token batch size");
@@ -4349,19 +4562,15 @@ namespace {
                 params.Add("input_pattern", "blocky", "smooth or blocky");
                 params.Add("weight_layout", "packed",
                            "packed, separate, perchannel or tensorwise");
-                params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
-                params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
+                params.Add("has_bias", "1",
+                           "1 to include a float32 bias, 0 for no bias");
+                params.Add("kernel", "auto",
+                           "auto, legacy, or marlin_batch1");
                 params.Add("check", "0",
-                           "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
+                           "2 fused swiglu+quant, 3 Marlin bulk/tail, "
                            "4 raw batch-one, 5 Marlin/CUTLASS layout safety, "
-                           "6 per-channel CUTLASS scaled-mm, 7 SM120 standard FP8, "
-                           "8 SM120 fixed backend lifecycle, 9 first failure rejection, "
-                           "10 fixed backend failure, 11 destructor state cleanup, "
-                           "12 GPU migration cache rebuild, 13 Block128 fixed backend, "
-                           "14 Block128 first failure rejection, "
-                           "15 Block128 fixed failure, 16 Block128 destructor cleanup, "
-                           "17 Block128 GPU migration cache rebuild");
-                params.Add("print", "0", "1 to print debug tensors when check=1");
+                           "6 per-channel CUTLASS scaled-mm");
+                params.Add("print", "0", "1 to print debug tensors");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
@@ -4374,14 +4583,18 @@ namespace {
             },
             BenchmarkLinearFp8Block128Cuda,
             [](const OpTestParams &params) {
-                int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
-                double inputBytes = (double)batch * in * 2.0;
-                double outputBytes = (double)batch * out * 2.0;
-                double weightBytes = (double)fastllm::GetDataBytes(fastllm::DataType::FP8_E4M3_BLOCK_128, out, in);
-                return inputBytes + outputBytes + weightBytes + (double)out * sizeof(float);
+                int batch = params.GetInt("batch");
+                int in = params.GetInt("in");
+                int out = params.GetInt("out");
+                return (double)batch * in * 2.0 +
+                       (double)batch * out * 2.0 +
+                       (double)fastllm::GetDataBytes(
+                           fastllm::DataType::FP8_E4M3_BLOCK_128, out, in) +
+                       (double)out * sizeof(float);
             },
             [](const OpTestParams &params) {
-                return 2.0 * (double)params.GetInt("batch") * params.GetInt("in") * params.GetInt("out");
+                return 2.0 * (double)params.GetInt("batch") *
+                       params.GetInt("in") * params.GetInt("out");
             },
             true
         };
@@ -5809,6 +6022,8 @@ namespace {
             MakeAttentionCase(),
             MakeRmsNormSpecializedCase(),
             MakeRecurrentFromConvFp16Case(),
+            MakeLinearFp8LegacyCase(),
+            MakeLinearFp8W8A8Case(),
             MakeLinearFp8Block128Case(),
             MakeLinearInt8W8A8Case(),
             MakeMergeMoeFp8Case(),
