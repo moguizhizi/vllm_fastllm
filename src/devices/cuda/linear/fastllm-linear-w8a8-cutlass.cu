@@ -313,27 +313,35 @@ static void ReleaseScaleCache(ScaleCache &cache) {
 static ScaleCache *GetScaleCache(fastllm::Data &weight, int device) {
     const std::pair<const fastllm::Data *, int> key{&weight, device};
     auto found = scaleCaches.find(key);
+
     if (found != scaleCaches.end()) {
         ScaleCache &cache = found->second;
+
         if (cache.weight == weight.cudaData &&
             cache.count == static_cast<int>(weight.scales.size())) {
             return &cache;
         }
+
         if (FastllmCudaGraphIsCapturing()) return nullptr;
+
         ReleaseScaleCache(cache);
         scaleCaches.erase(found);
     }
+
     if (FastllmCudaGraphIsCapturing() || weight.scales.empty()) return nullptr;
 
     ScaleCache cache;
     cache.weight = weight.cudaData;
     cache.count = static_cast<int>(weight.scales.size());
+
     cache.scales = static_cast<float *>(
         FastllmCudaMalloc((size_t)cache.count * sizeof(float)));
     if (cache.scales == nullptr) return nullptr;
+
     FastllmCudaCopyFromHostToDevice(
         cache.scales, weight.scales.data(),
         (size_t)cache.count * sizeof(float));
+
     auto inserted = scaleCaches.emplace(key, cache);
     return &inserted.first->second;
 }
