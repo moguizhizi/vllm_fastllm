@@ -14,6 +14,8 @@ import sys
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_DIR / "test" / "nvfp4"))
+from xlsx_report import write_xlsx  # noqa: E402
 
 # 前七项覆盖FastLLM SM120的M分支边界；其余形状来自vLLM
 # tests/kernels/quantization/test_cutlass_scaled_mm.py::MNK_FACTORS。
@@ -191,6 +193,7 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
         ft_ms = row["fastllm_latency_median_ms"]
         vl_ms = other["vllm_latency_median_ms"]
         combined.append({
+            "result": "PASS",
             **row,
             **{key: value for key, value in other.items()
                if key.startswith("vllm_")},
@@ -205,6 +208,11 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
         writer.writerows(
             {key: display_value(value) for key, value in row.items()}
             for row in combined)
+    headers = list(combined[0])
+    write_xlsx(
+        output_dir / "operator-performance-compare.xlsx",
+        [("算子性能", headers,
+          [[display_value(row[key]) for key in headers] for row in combined])])
     lines = [
         "# SM120 W8A8算子性能对比", "",
         "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重",
@@ -212,12 +220,12 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
         "> 加速比 = vLLM耗时 / FastLLM耗时；大于1表示FastLLM更快，",
         "> 小于1表示FastLLM更慢。", "",
         "> Effective TOPS由`2*M*N*K/Median延迟`推导；CV越小表示重复测试越稳定。", "",
-        "| Case | M | N | K | FastLLM路径 | FastLLM Median(ms) | FastLLM P95(ms) | FastLLM CV(%) | FastLLM TOPS | vLLM路径 | vLLM Median(ms) | vLLM P95(ms) | vLLM CV(%) | vLLM TOPS | FastLLM相对vLLM加速比 |",
-        "| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| 状态 | Case | M | N | K | FastLLM路径 | FastLLM Median(ms) | FastLLM P95(ms) | FastLLM CV(%) | FastLLM TOPS | vLLM路径 | vLLM Median(ms) | vLLM P95(ms) | vLLM CV(%) | vLLM TOPS | FastLLM相对vLLM加速比 |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in combined:
         lines.append(
-            f"| {row['case']} | {row['m']} | {row['n']} | {row['k']} | "
+            f"| {row['result']} | {row['case']} | {row['m']} | {row['n']} | {row['k']} | "
             f"{row['fastllm_backend_path']} | "
             f"{row['fastllm_latency_median_ms']:.3f} | "
             f"{row['fastllm_latency_p95_ms']:.3f} | "
@@ -233,6 +241,8 @@ def write_reports(output_dir, fastllm_rows, vllm_rows):
     (output_dir / "operator-performance-compare.md").write_text(
         report, encoding="utf-8")
     print(report)
+    print(f"Summary: PASS ({len(combined)} operator performance cases)")
+    print(f"Excel: {output_dir / 'operator-performance-compare.xlsx'}")
 
 
 def main():

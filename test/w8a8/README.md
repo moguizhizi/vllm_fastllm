@@ -48,7 +48,7 @@ M/N/K、输入类型、权重scale布局、bias、检查编号、误差和PASS/F
 权重从GPU0迁移到GPU1时必须清理旧卡状态，并从主机scale源在新卡重建缓存。
 故障通过测试专用环境变量注入，但调用的仍是正式W8A8 CUTLASS入口和状态机。
 
-算子性能（直接生成FastLLM/vLLM Markdown、CSV和JSON对比）：
+算子性能（直接生成FastLLM/vLLM Markdown、CSV、JSON和XLSX对比）：
 
 ```bash
 W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
@@ -62,12 +62,15 @@ FastLLM更慢。每个形状默认独立执行5轮，报告同时给出Median、
 Effective TOPS和实际后端路径；原始轮次样本保存在JSON/CSV的
 `*_samples_ms`字段中。Effective TOPS按`2*M*N*K/Median延迟`计算，
 属于有效计算吞吐；CV越小表示测试越稳定。MD、CSV和XLSX中的浮点展示值
-统一保留小数点后3位，JSON保留原始精度供复算。
+统一保留小数点后3位，JSON保留原始精度供复算。成功完成双方测试且
+FastLLM严格目标路径生效的case标记为`PASS`；性能高低本身不决定PASS/FAIL。
 
 forward_check：
 
 默认执行功能判定：输入Prompt和首Token必须一致，Top10重合率必须不低于
 0.8。首Token logprob差仍会打印，但超过0.1时只警告，不会使功能测试失败。
+结果目录生成`forward-check-summary.{md,csv,json,xlsx}`，明确记录功能判定、
+严格对齐诊断项及最终PASS/FAIL。
 
 ```bash
 W8A8_MODEL=/root/autodl-tmp/neuralmagic/Qwen2___5-7B-FP8-dynamic \
@@ -88,6 +91,9 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-model" \
   test/w8a8/run_w8a8_tests.sh model-performance
 ```
 
+结果目录生成`model-performance-compare.{md,csv,json,xlsx}`。成功完成全部
+请求并得到完整对应记录的case标记为`PASS`；速度比不作为正确性判定。
+
 Decode性能归因使用独立的`decode_nsys_compare.py`。它让两个后端分时加载
 同一模型；每个Batch先用同一Prompt完成CUDA Graph、shape和Prefix Cache
 warmup，再由Nsight Systems只采集一轮BEST模式HTTP请求。默认覆盖
@@ -96,6 +102,7 @@ batch=1/2/4/8/16/32，并输出GPU kernel、CUDA API、显存操作、按名称�
 Decode步归一化的GPU时间和kernel数，以及GPU事件跨度内的空闲时间；未返回
 缓存统计时明确标记为“未报告”。Nsight会扰动绝对延迟，因此报告用于解释
 时间构成，正式TPOT仍以`model-performance`结果为准。
+每个成功完成采集和稳定Decode边界校验的后端/Batch记录标记为`PASS`。
 
 ```bash
 python test/w8a8/decode_nsys_compare.py \
@@ -132,6 +139,7 @@ python test/w8a8/attention_ncu_compare.py \
 Duration、DRAM读写、带宽、Occupancy、寄存器、共享内存和Warp Stall。
 NCU不直接提供逻辑Split数量，不能用Grid大小代替Split数量。NCU会重放
 Kernel，因此该结果只用于解释合并Kernel为何有差距，不用于计算TPOT。
+每个成功命中目标Kernel并完成NCU指标解析的后端记录标记为`PASS`。
 每个后端会依次生成`01-discovery`、`02-startup-calibration`和`03-profile`
 目录。重复测试且已经确认NCU能看到目标Kernel时，可用`--skip-discovery`
 省略第一阶段；不得跳过完整生命周期校准。

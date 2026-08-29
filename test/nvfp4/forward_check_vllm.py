@@ -2,6 +2,7 @@
 """Compare one NVFP4 FastLLM request with vLLM in isolated processes."""
 
 import argparse
+import csv
 import ctypes
 import heapq
 import json
@@ -16,6 +17,7 @@ import sys
 REPO_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_DIR / "test" / "basic"))
 from config import default_messages_list  # noqa: E402
+from xlsx_report import write_xlsx  # noqa: E402
 
 
 def parse_args():
@@ -220,8 +222,81 @@ def compare_results(args, vllm_result, fastllm_result):
         ("FAIL" if args.strict_alignment else "WARN")))
     check_mode = "strict-alignment" if args.strict_alignment else "functional"
     print(f"check_mode: {check_mode}")
-    print(f"Summary: {'PASS' if passed else 'FAIL'}")
-    return passed
+    result = "PASS" if passed else "FAIL"
+    print(f"Summary: {result}")
+    return passed, {
+        "result": result,
+        "label": args.label,
+        "check_mode": check_mode,
+        "prompt_token_ids_match": same_prompt,
+        "generated_token_ids_match": same_tokens,
+        "first_token_match": first_token_match,
+        "topk": args.top_logprobs,
+        "topk_overlap": overlap,
+        "minimum_topk_overlap": args.min_topk_overlap,
+        "first_token_logprob_diff": first_token_logprob_diff,
+        "maximum_first_logprob_diff": args.max_first_logprob_diff,
+        "strict_alignment_result": (
+            "PASS" if alignment_passed else
+            ("FAIL" if args.strict_alignment else "WARN")),
+        "common_topk_max_logprob_diff": max_diff,
+        "vllm_generated_token_ids": vllm_result["generated_token_ids"],
+        "fastllm_generated_token_ids": fastllm_result["generated_token_ids"],
+    }
+
+
+def write_summary_reports(result_dir, summary):
+    """写出Forward Check的机器可读结果和单行Excel汇总。"""
+    output = result_dir / "forward-check-summary"
+    write_json(output.with_suffix(".json"), summary)
+
+    lines = [
+        f"# {summary['label']} Forward Check汇总", "",
+        "| 状态 | 模式 | Prompt一致 | 生成Token一致 | 首Token一致 | "
+        "TopK重合率 | 最低重合率 | 首Token logprob差 | 阈值 | 严格对齐 |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
+        f"| {summary['result']} | {summary['check_mode']} | "
+        f"{summary['prompt_token_ids_match']} | "
+        f"{summary['generated_token_ids_match']} | "
+        f"{summary['first_token_match']} | {summary['topk_overlap']:.3f} | "
+        f"{summary['minimum_topk_overlap']:.3f} | "
+        f"{summary['first_token_logprob_diff']:.3f} | "
+        f"{summary['maximum_first_logprob_diff']:.3f} | "
+        f"{summary['strict_alignment_result']} |",
+    ]
+    output.with_suffix(".md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8")
+
+    with output.with_suffix(".csv").open(
+            "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(summary))
+        writer.writeheader()
+        writer.writerow({
+            key: (json.dumps(value, ensure_ascii=False)
+                  if isinstance(value, list) else value)
+            for key, value in summary.items()
+        })
+
+    headers = [
+        "状态", "标签", "模式", "Prompt一致", "生成Token一致", "首Token一致",
+        "TopK", "TopK重合率", "最低重合率", "首Token logprob差",
+        "首Token logprob阈值", "严格对齐结果", "共同TopK最大logprob差",
+        "vLLM生成Token", "FastLLM生成Token",
+    ]
+    row = [
+        summary["result"], summary["label"], summary["check_mode"],
+        summary["prompt_token_ids_match"], summary["generated_token_ids_match"],
+        summary["first_token_match"], summary["topk"], summary["topk_overlap"],
+        summary["minimum_topk_overlap"], summary["first_token_logprob_diff"],
+        summary["maximum_first_logprob_diff"],
+        summary["strict_alignment_result"],
+        summary["common_topk_max_logprob_diff"],
+        json.dumps(summary["vllm_generated_token_ids"], ensure_ascii=False),
+        json.dumps(summary["fastllm_generated_token_ids"], ensure_ascii=False),
+    ]
+    write_xlsx(output.with_suffix(".xlsx"), [("Forward Check", headers, [row])])
+    for suffix in ("md", "csv", "json", "xlsx"):
+        print(f"{suffix.upper()}: {output.with_suffix('.' + suffix)}")
 
 
 def child_command(args, stage, output, python):
@@ -258,7 +333,9 @@ def orchestrate(args):
         vllm_result = json.load(handle)
     with open(fastllm_output, encoding="utf-8") as handle:
         fastllm_result = json.load(handle)
-    return compare_results(args, vllm_result, fastllm_result)
+    passed, summary = compare_results(args, vllm_result, fastllm_result)
+    write_summary_reports(result_dir, summary)
+    return passed
 
 
 def main():

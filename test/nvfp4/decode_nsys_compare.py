@@ -904,6 +904,7 @@ def profile_backend(args, backend, batches, prompts, result_dir):
             timeline["idle_ms_per_decode_step"] = (
                 timeline["idle_ms"] / decode_steps)
             row = {
+                "result": "PASS",
                 "backend": backend,
                 "batch": batch,
                 "prompt_tokens": len(prompt),
@@ -1117,7 +1118,7 @@ def make_excel_report(result_dir, rows, top_count):
     ]))
 
     engine_headers = [
-        "Batch", "后端", "平均TPOT(ms)", "请求TPOT P50(ms)",
+        "状态", "Batch", "后端", "平均TPOT(ms)", "请求TPOT P50(ms)",
         "请求TPOT P95(ms)", "ITL(ms)", "请求E2EL P50(ms)",
         "请求E2EL P95(ms)", "Batch Wall(ms)", "Output(tok/s)",
         "Cache命中率",
@@ -1125,7 +1126,7 @@ def make_excel_report(result_dir, rows, top_count):
     engine_rows = []
     for row in rows:
         engine_rows.append([
-            row["batch"], row["backend"], row["tpot_ms"],
+            row["result"], row["batch"], row["backend"], row["tpot_ms"],
             row["request_tpot_p50_ms"], row["request_tpot_p95_ms"],
             row["itl_ms"], row["request_e2el_p50_ms"],
             row["request_e2el_p95_ms"], row["request_wall_ms"],
@@ -1376,10 +1377,10 @@ def make_report(result_dir, rows, top_count):
         "> GPU时间线空闲只统计首个与最后一个GPU事件之间的内部空隙；",
         "> 第一个输出Token属于Prefill，逐步指标按`output_tokens - 1`归一化。", "",
         "## 引擎指标", "",
-        "| Batch | 后端 | 平均TPOT(ms) | 请求TPOT P50(ms) | 请求TPOT P95(ms) | "
+        "| 状态 | Batch | 后端 | 平均TPOT(ms) | 请求TPOT P50(ms) | 请求TPOT P95(ms) | "
         "ITL(ms) | 请求E2EL P50(ms) | 请求E2EL P95(ms) | Batch Wall(ms) | "
         "Output(tok/s) | Cache命中 |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
         "---: | --- |",
     ]
     for row in rows:
@@ -1387,7 +1388,7 @@ def make_report(result_dir, rows, top_count):
         cache_text = ("未报告" if row["cache_status"] == "unreported" else
                       f"{cache * 100:.1f}%")
         lines.append(
-            f"| {row['batch']} | {row['backend']} | {fmt(row['tpot_ms'])} | "
+            f"| {row['result']} | {row['batch']} | {row['backend']} | {fmt(row['tpot_ms'])} | "
             f"{fmt(row['request_tpot_p50_ms'])} | "
             f"{fmt(row['request_tpot_p95_ms'])} | {fmt(row['itl_ms'])} | "
             f"{fmt(row['request_e2el_p50_ms'])} | "
@@ -1586,6 +1587,7 @@ def make_report(result_dir, rows, top_count):
         json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     excel_path = make_excel_report(result_dir, rows, top_count)
     print(report)
+    print(f"Summary: PASS ({len(rows)} Decode Nsight cases)")
     print(f"Markdown: {path}")
     print(f"Excel: {excel_path}")
 

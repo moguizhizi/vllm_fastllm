@@ -537,6 +537,7 @@ def summarize_backend(backend, report, raw_csv, request_calibration,
               item["value"] is not None]
     stalls.sort(key=lambda item: item["value"], reverse=True)
     return {
+        "result": "PASS",
         "backend": backend,
         "kernel_marker": BACKEND_KERNELS[backend],
         "report": str(report),
@@ -572,14 +573,14 @@ def make_reports(result_dir, summaries):
         "> Nsight Systems统计进程启动、Graph warmup和正式请求的完整生命周期，",
         "> 最后从进程启动采集首个稳定Decode目标Kernel。NCU会重放Kernel，",
         "> 本报告用于微观归因，不能替代未使用Profiler的TPOT。", "",
-        "| 后端 | Kernel | 完整跳过数 | 启动/预热调用 | Grid | Block | Duration | DRAM Read | DRAM Write | "
+        "| 状态 | 后端 | Kernel | 完整跳过数 | 启动/预热调用 | Grid | Block | Duration | DRAM Read | DRAM Write | "
         "DRAM吞吐 | Occupancy | Registers/Thread | Shared Memory/Block |",
-        "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in summaries:
         selected = item["selected_metrics"]
         lines.append(
-            f"| {item['backend']} | `{item['kernel_marker']}` | "
+            f"| {item['result']} | {item['backend']} | `{item['kernel_marker']}` | "
             f"{item['launch_skip']} | {item['startup_and_warmup_matches']} | "
             f"{item['grid'] or 'n/a'} | {item['block'] or 'n/a'} | "
             f"{metric_text(selected['Duration'])} | "
@@ -627,7 +628,8 @@ def make_reports(result_dir, summaries):
     for item in summaries:
         selected = item["selected_metrics"]
         summary_rows.append([
-            item["backend"], item["kernel_marker"], item["grid"], item["block"],
+            item["result"], item["backend"], item["kernel_marker"],
+            item["grid"], item["block"],
             metric_text(selected["Duration"]),
             metric_text(selected["DRAM Read Bytes"]),
             metric_text(selected["DRAM Write Bytes"]),
@@ -651,7 +653,7 @@ def make_reports(result_dir, summaries):
             ])
     decode_nsys.write_xlsx(xlsx_path, [
         ("关键指标", [
-            "后端", "Kernel", "Grid", "Block", "Duration", "DRAM Read",
+            "状态", "后端", "Kernel", "Grid", "Block", "Duration", "DRAM Read",
             "DRAM Write", "DRAM吞吐", "Occupancy", "Registers/Thread",
             "Shared Memory/Block", "完整launch-skip", "启动及预热调用数",
             "正式请求稳定边界前调用数", "校准区间稳定调用数"],
@@ -720,6 +722,7 @@ def main():
     print(f"Markdown: {md_path}")
     print(f"JSON: {json_path}")
     print(f"Excel: {xlsx_path}")
+    print(f"Summary: PASS ({len(summaries)} Attention NCU cases)")
 
 
 if __name__ == "__main__":

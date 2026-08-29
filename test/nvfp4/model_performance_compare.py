@@ -15,6 +15,8 @@ import time
 
 import requests
 
+from xlsx_report import write_xlsx
+
 
 REPO_DIR = Path(__file__).resolve().parents[2]
 MODES = ("eager", "best")
@@ -496,21 +498,22 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
         "> 每个Case测试5轮并取中位数。Cold与Cache Hit分别统计。", "",
     ]
     csv_rows = []
+    comparison_rows = []
     for mode in MODES:
         for scenario in SCENARIOS:
             rows = ordered_results(
                 fastllm_results, vllm_results, mode, scenario)
             lines.extend([
                 f"## {mode.upper()} / {scenario}", "",
-                "| Workload | 后端 | Batch | Prompt/请求 | Prompt总数 | "
+                "| 状态 | Workload | 后端 | Batch | Prompt/请求 | Prompt总数 | "
                 "Output总数 | Cache命中 | TTFT(ms) | TPOT(ms) | ITL(ms) | E2EL(ms) | "
                 "Prefill(tok/s) | Output(tok/s) | Wall(s) |",
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
                 "---: | ---: | ---: | ---: | ---: |",
             ])
             for item in rows:
                 lines.append(
-                    f"| {item['workload']} | {item['backend']} | {item['batch']} | "
+                    f"| PASS | {item['workload']} | {item['backend']} | {item['batch']} | "
                     f"{item['prompt_tokens_per_request']} | "
                     f"{item['total_prompt_tokens']} | {item['total_output_tokens']} | "
                     f"{fmt_percent(item['cache_hit_ratio'])} | "
@@ -519,6 +522,7 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                     f"{fmt_number(item['prefill_tok_s'])} | "
                     f"{fmt_number(item['output_tok_s'])} | {item['wall_s']:.6f} |")
                 csv_rows.append({
+                    "result": "PASS",
                     "mode": mode,
                     "scenario": scenario,
                     "workload": item["workload"],
@@ -551,6 +555,26 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                     f"{ratio(fastllm_item['itl_s'], vllm_item['itl_s'])} | "
                     f"{ratio(fastllm_item['e2el_s'], vllm_item['e2el_s'])} | "
                     f"{ratio(fastllm_item['output_tok_s'], vllm_item['output_tok_s'])} |")
+                comparison_rows.append([
+                    "PASS", mode, scenario, fastllm_item["workload"],
+                    fastllm_item["batch"],
+                    (None if fastllm_item["ttft_s"] is None or
+                     vllm_item["ttft_s"] in (None, 0) else
+                     fastllm_item["ttft_s"] / vllm_item["ttft_s"]),
+                    (None if fastllm_item["tpot_s"] is None or
+                     vllm_item["tpot_s"] in (None, 0) else
+                     fastllm_item["tpot_s"] / vllm_item["tpot_s"]),
+                    (None if fastllm_item["itl_s"] is None or
+                     vllm_item["itl_s"] in (None, 0) else
+                     fastllm_item["itl_s"] / vllm_item["itl_s"]),
+                    (None if fastllm_item["e2el_s"] is None or
+                     vllm_item["e2el_s"] in (None, 0) else
+                     fastllm_item["e2el_s"] / vllm_item["e2el_s"]),
+                    (None if fastllm_item["output_tok_s"] is None or
+                     vllm_item["output_tok_s"] in (None, 0) else
+                     fastllm_item["output_tok_s"] /
+                     vllm_item["output_tok_s"]),
+                ])
             lines.append("")
     report = "\n".join(lines)
     markdown_path = result_dir / "model-performance-compare.md"
@@ -561,12 +585,23 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
         writer.writeheader()
         writer.writerows(csv_rows)
     write_json(result_dir / "model-performance-compare.json", {
+        "summary": {"result": "PASS", "case_records": len(csv_rows)},
         "fastllm": fastllm_results,
         "vllm": vllm_results,
     })
+    detail_headers = list(csv_rows[0])
+    write_xlsx(result_dir / "model-performance-compare.xlsx", [
+        ("性能明细", detail_headers,
+         [[row[key] for key in detail_headers] for row in csv_rows]),
+        ("FastLLM-vLLM比值", [
+            "状态", "模式", "场景", "Workload", "Batch", "TTFT比", "TPOT比",
+            "ITL比", "E2EL比", "Output吞吐比"], comparison_rows),
+    ])
     print(report)
+    print(f"Summary: PASS ({len(csv_rows)} backend case records)")
     print(f"Markdown: {markdown_path}")
     print(f"CSV: {csv_path}")
+    print(f"Excel: {result_dir / 'model-performance-compare.xlsx'}")
 
 
 def orchestrate(args):
