@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """覆盖vLLM CUTLASS FP8 scaled-mm官方形状和缩放组合。"""
 
+import argparse
 import gc
 
 import torch
@@ -20,6 +21,15 @@ UNALIGNED = [
     (32, 3420, 1280), (32, 1280, 6840), (1, 3420, 1280),
     (64, 6840, 1280), (16, 100, 200), (33, 255, 513),
 ]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="验证vLLM Dense或Block128 FP8 scaled-mm")
+    parser.add_argument(
+        "--scale-layout", choices=("all", "dense", "block128"),
+        default="all", help="选择需要验证的scale布局")
+    return parser.parse_args()
 
 
 def expanded_scale(scale, rows, columns, side):
@@ -118,55 +128,71 @@ def check_unaligned_case(m, n, k, per_token, per_channel, use_bias):
 
 
 def main():
+    args = parse_args()
+
     if torch.cuda.get_device_capability() != (12, 0):
         raise RuntimeError("本测试要求SM120 GPU")
+
     total = 0
-    # 与vLLM官方test_cutlass_fp8_gemm一致，覆盖两种A scale、两种B scale和bias。
-    for m, n, k in ALIGNED:
-        for per_token in (True, False):
-            for per_channel in (True, False):
-                for use_bias in (False, True):
-                    check_case(m, n, k, per_token, per_channel, use_bias)
-                    total += 1
-                    print(
-                        f"PASS m={m} n={n} k={k} per_token={per_token} "
-                        f"per_channel={per_channel} bias={use_bias}", flush=True)
-                    torch.cuda.empty_cache()
-                    gc.collect()
-    for m, n, k in UNALIGNED:
-        for per_token in (True, False):
-            for per_channel in (True, False):
-                for use_bias in (False, True):
-                    check_unaligned_case(
-                        m, n, k, per_token, per_channel, use_bias)
-                    total += 1
-                    print(
-                        f"PASS padded m={m} n={n} k={k} "
-                        f"per_token={per_token} per_channel={per_channel} "
-                        f"bias={use_bias}", flush=True)
-                    torch.cuda.empty_cache()
-                    gc.collect()
-    # 对应vLLM output-dtype case；FastLLM侧也独立覆盖FP16/BF16输出。
-    for out_dtype in (torch.bfloat16, torch.float16):
-        check_case(512, 512, 512, True, True, True, out_dtype)
-        total += 1
-        print(f"PASS output_dtype={out_dtype}", flush=True)
 
-    # 对应vLLM test_cutlass_fp8_blockwise_scale_gemm：只执行满足
-    # Block128布局约束的官方MNK，并覆盖BF16/FP16输出。
-    for m, n, k in ALIGNED:
-        if n % 128 != 0 or k % 128 != 0:
-            continue
+    if args.scale_layout in ("all", "dense"):
+        # 与vLLM官方test_cutlass_fp8_gemm一致，覆盖两种A scale、
+        # 两种B scale和bias。
+        for m, n, k in ALIGNED:
+            for per_token in (True, False):
+                for per_channel in (True, False):
+                    for use_bias in (False, True):
+                        check_case(
+                            m, n, k, per_token, per_channel, use_bias)
+                        total += 1
+                        print(
+                            f"PASS m={m} n={n} k={k} "
+                            f"per_token={per_token} "
+                            f"per_channel={per_channel} bias={use_bias}",
+                            flush=True)
+                        torch.cuda.empty_cache()
+                        gc.collect()
+
+        for m, n, k in UNALIGNED:
+            for per_token in (True, False):
+                for per_channel in (True, False):
+                    for use_bias in (False, True):
+                        check_unaligned_case(
+                            m, n, k, per_token, per_channel, use_bias)
+                        total += 1
+                        print(
+                            f"PASS padded m={m} n={n} k={k} "
+                            f"per_token={per_token} "
+                            f"per_channel={per_channel} "
+                            f"bias={use_bias}", flush=True)
+                        torch.cuda.empty_cache()
+                        gc.collect()
+
+        # 对应vLLM output-dtype case；FastLLM侧也独立覆盖
+        # FP16/BF16输出。
         for out_dtype in (torch.bfloat16, torch.float16):
-            check_block128_case(m, n, k, out_dtype)
+            check_case(512, 512, 512, True, True, True, out_dtype)
             total += 1
-            print(
-                f"PASS block128 m={m} n={n} k={k} "
-                f"output_dtype={out_dtype}", flush=True)
-            torch.cuda.empty_cache()
-            gc.collect()
+            print(f"PASS output_dtype={out_dtype}", flush=True)
 
-    print(f"Summary: PASS ({total} vLLM FP8 scaled-mm cases)")
+    if args.scale_layout in ("all", "block128"):
+        # 对应vLLM test_cutlass_fp8_blockwise_scale_gemm：只执行
+        # 满足Block128布局约束的官方MNK。
+        for m, n, k in ALIGNED:
+            if n % 128 != 0 or k % 128 != 0:
+                continue
+            for out_dtype in (torch.bfloat16, torch.float16):
+                check_block128_case(m, n, k, out_dtype)
+                total += 1
+                print(
+                    f"PASS block128 m={m} n={n} k={k} "
+                    f"output_dtype={out_dtype}", flush=True)
+                torch.cuda.empty_cache()
+                gc.collect()
+
+    print(
+        f"Summary: PASS ({total} vLLM FP8 scaled-mm cases; "
+        f"scale_layout={args.scale_layout})")
 
 
 if __name__ == "__main__":

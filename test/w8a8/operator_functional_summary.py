@@ -126,6 +126,8 @@ def parse_fastllm_log(path, text):
 
 def parse_vllm_official(path, text):
     rows = []
+    layout_match = re.search(r"--scale-layout\s+([^\s]+)", text)
+    suite_layout = layout_match.group(1) if layout_match else "all"
     pattern = re.compile(
         r"^PASS (?P<padded>padded )?m=(?P<m>\d+) n=(?P<n>\d+) "
         r"k=(?P<k>\d+) per_token=(?P<per_token>True|False) "
@@ -175,11 +177,21 @@ def parse_vllm_official(path, text):
             "check": values["dtype"], "max_abs_diff": None,
             "mean_abs_diff": None, "details": "", "log": path.name,
         })
+    if suite_layout == "dense":
+        suite_op = "cutlass_scaled_mm"
+        suite_weight_layout = "per-channel"
+    elif suite_layout == "block128":
+        suite_op = "cutlass_scaled_mm_block128"
+        suite_weight_layout = "block128"
+    else:
+        suite_op = "cutlass_scaled_mm_suite"
+        suite_weight_layout = None
+
     rows.append({
         "case": path.stem, "backend": "vLLM", "category": "vLLM suite",
-        "result": result_from_log(text), "op": "cutlass_scaled_mm_suite",
+        "result": result_from_log(text), "op": suite_op,
         "m": None, "n": None, "k": None, "input_type": None,
-        "weight_layout": None, "bias": None, "check": None,
+        "weight_layout": suite_weight_layout, "bias": None, "check": None,
         "max_abs_diff": None, "mean_abs_diff": None,
         "details": failure_details(text), "log": path.name,
     })
@@ -194,7 +206,7 @@ def collect_rows(log_dir):
         if not any(pattern.search(path.stem) for pattern in FUNCTIONAL_LOG_PATTERNS):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        if path.stem == "sm120_vllm_official_functional":
+        if path.stem.startswith("sm120_vllm_official_functional"):
             rows.extend(parse_vllm_official(path, text))
         elif "--op " in text and "--param " in text:
             rows.append(parse_fastllm_log(path, text))

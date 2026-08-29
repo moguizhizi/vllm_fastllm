@@ -49,9 +49,18 @@ detect_arch() {
     printf '%d\n' "$((10#${major} * 10 + 10#${minor}))"
 }
 
+ops_scope() {
+    case "${suite}" in
+        ops-dense|ops-dense-*) printf 'dense\n' ;;
+        ops-block128|ops-block128-*) printf 'block128\n' ;;
+        *) printf 'all\n' ;;
+    esac
+}
+
 run_build() {
     run_logged build bash install.sh -DUSE_CUDA=ON \
         -DCMAKE_CUDA_COMPILER="${nvcc}" -DCUDA_ARCH=120 \
+        -DUNIT_TEST=ON \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 }
 
@@ -77,33 +86,47 @@ run_sm120_block128_check() {
 }
 
 run_ops_functional_cases() {
-    local arch
+    local arch scope
     arch=$(detect_arch)
+    scope=$(ops_scope)
+
     if [[ "${arch}" == 90 ]]; then
-        run_logged sm90_int8_w8a8_function \
-            "${optest}" --op linear_int8_w8a8 --device cuda:0 \
-            --param batch=17 --param in=4096 --param out=4096 \
-            --param input_type=bf16 --param has_bias=1 --param check=1 \
-            --warmup 0 --iters 1
+        if [[ "${scope}" == dense ]]; then
+            echo "Dense FP8 W8A8当前只支持SM120" >&2
+            exit 2
+        fi
+
+        if [[ "${scope}" == all ]]; then
+            run_logged sm90_int8_w8a8_function \
+                "${optest}" --op linear_int8_w8a8 --device cuda:0 \
+                --param batch=17 --param in=4096 --param out=4096 \
+                --param input_type=bf16 --param has_bias=1 --param check=1 \
+                --warmup 0 --iters 1
+        fi
+
         run_logged sm90_fp8_blockwise_function env \
             FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
             "${optest}" --op linear_fp8_block128 --device cuda:0 \
             --param batch=17 --param in=4096 --param out=4096 \
             --param block=128 --param weight_layout=separate \
             --param input_type=bf16 --param check=1 --warmup 0 --iters 1
-        run_logged sm90_fp8_grouped_moe_function env \
-            FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
-            FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
-            FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=1 \
-            "${optest}" --op mergemoe_fp8 --device cuda:0 \
-            --param batch=128 --param hidden=2048 --param inter=768 \
-            --param experts=16 --param topk=4 --param block=128 \
-            --param input_type=bf16 --param weight_type=fp8 \
-            --param scale_layout=perchannel \
-            --param path=check_fp8 --warmup 0 --iters 1
+
+        if [[ "${scope}" == all ]]; then
+            run_logged sm90_fp8_grouped_moe_function env \
+                FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
+                FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
+                FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=1 \
+                "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                --param batch=128 --param hidden=2048 --param inter=768 \
+                --param experts=16 --param topk=4 --param block=128 \
+                --param input_type=bf16 --param weight_type=fp8 \
+                --param scale_layout=perchannel \
+                --param path=check_fp8 --warmup 0 --iters 1
+        fi
     elif [[ "${arch}" == 120 ]]; then
-        # 16/32/256是SM120 CUTLASS tile选择的三个边界；两侧值用于确认
-        # 每个条件分支都被执行。独立Dense入口的check=1执行正确性检查。
+        if [[ "${scope}" != block128 ]]; then
+            # 16/32/256是SM120 CUTLASS tile选择的三个边界；
+            # 两侧值用于确认每个条件分支都被执行。
         for m in 1 16 17 32 33 256 257; do
             run_sm120_standard_check "sm120_branch_m${m}" \
                 "${m}" 4096 4096 bf16 1
@@ -183,8 +206,11 @@ run_ops_functional_cases() {
 512 16384 128
 512 24576 128
 EOF
-        # vLLM SM120 Blockwise分派边界：M<=64或M%4!=0走SwapAB；
-        # 其余M<=256走Pingpong；M>256走默认Cooperative配置。
+        fi
+
+        if [[ "${scope}" != dense ]]; then
+            # vLLM SM120 Blockwise分派边界：M<=64或M%4!=0
+            # 走SwapAB；其余M<=256走Pingpong；M>256走Cooperative。
         for m in 1 64 65 68 256 257; do
             run_sm120_block128_check \
                 "sm120_fp8_blockwise_m${m}" "${m}" 4096 4096 bf16
@@ -226,8 +252,11 @@ EOF
                 --param input_type=bf16 --param has_bias=1 \
                 --param check="${check}" --warmup 0 --iters 1
         done
-        run_logged sm120_vllm_official_functional \
-            "${vllm_python}" test/w8a8/operator_functional_vllm.py
+        fi
+
+        run_logged "sm120_vllm_official_functional_${scope}" \
+            "${vllm_python}" test/w8a8/operator_functional_vllm.py \
+            --scale-layout "${scope}"
     else
         echo "unsupported test GPU: SM${arch}; expected SM90 or SM120" >&2
         exit 2
@@ -242,15 +271,25 @@ run_ops_functional() {
 }
 
 run_ops_performance() {
-    local arch
+    local arch scope
     arch=$(detect_arch)
+    scope=$(ops_scope)
+
     if [[ "${arch}" == 90 ]]; then
+        if [[ "${scope}" == dense ]]; then
+            echo "Dense FP8 W8A8当前只支持SM120" >&2
+            exit 2
+        fi
+
         for batch in 1 16 64 256 1024; do
-            run_logged "sm90_int8_w8a8_m${batch}_perf" \
-                "${optest}" --op linear_int8_w8a8 --device cuda:0 \
-                --param batch="${batch}" --param in=4096 --param out=4096 \
-                --param input_type=bf16 --param has_bias=1 \
-                --warmup 20 --iters 200
+            if [[ "${scope}" == all ]]; then
+                run_logged "sm90_int8_w8a8_m${batch}_perf" \
+                    "${optest}" --op linear_int8_w8a8 --device cuda:0 \
+                    --param batch="${batch}" --param in=4096 \
+                    --param out=4096 --param input_type=bf16 \
+                    --param has_bias=1 --warmup 20 --iters 200
+            fi
+
             run_logged "sm90_fp8_blockwise_m${batch}_perf" env \
                 FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
                 "${optest}" --op linear_fp8_block128 --device cuda:0 \
@@ -258,39 +297,48 @@ run_ops_performance() {
                 --param block=128 --param weight_layout=separate \
                 --param input_type=bf16 --warmup 20 --iters 200
         done
-        run_logged sm90_fp8_grouped_moe_perf env \
-            FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
-            FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
-            FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=1 \
-            "${optest}" --op mergemoe_fp8 --device cuda:0 \
-            --param batch=256 --param hidden=2048 --param inter=768 \
-            --param experts=16 --param topk=4 --param block=128 \
-            --param input_type=bf16 --param weight_type=fp8 \
-            --param scale_layout=perchannel \
-            --param path=operator --warmup 20 --iters 200
-        run_logged sm90_fp8_grouped_moe_fallback_perf env \
-            FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
-            FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
-            FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=0 \
-            "${optest}" --op mergemoe_fp8 --device cuda:0 \
-            --param batch=256 --param hidden=2048 --param inter=768 \
-            --param experts=16 --param topk=4 --param block=128 \
-            --param input_type=bf16 --param weight_type=fp8 \
-            --param scale_layout=perchannel \
-            --param path=operator --warmup 20 --iters 200
+
+        if [[ "${scope}" == all ]]; then
+            run_logged sm90_fp8_grouped_moe_perf env \
+                FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
+                FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
+                FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=1 \
+                "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                --param batch=256 --param hidden=2048 --param inter=768 \
+                --param experts=16 --param topk=4 --param block=128 \
+                --param input_type=bf16 --param weight_type=fp8 \
+                --param scale_layout=perchannel \
+                --param path=operator --warmup 20 --iters 200
+
+            run_logged sm90_fp8_grouped_moe_fallback_perf env \
+                FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
+                FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
+                FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=0 \
+                "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                --param batch=256 --param hidden=2048 --param inter=768 \
+                --param experts=16 --param topk=4 --param block=128 \
+                --param input_type=bf16 --param weight_type=fp8 \
+                --param scale_layout=perchannel \
+                --param path=operator --warmup 20 --iters 200
+        fi
     elif [[ "${arch}" == 120 ]]; then
-        run_logged sm120_w8a8_perchannel_operator_compare \
-            "${vllm_python}" test/w8a8/operator_performance_compare.py \
-            --optest "${optest}" \
-            --output-dir "${log_dir}/operator-compare/perchannel" \
-            --scale-layout perchannel \
-            --warmup 20 --iters 200 --outer-repeats 5
-        run_logged sm120_w8a8_block128_operator_compare \
-            "${vllm_python}" test/w8a8/operator_performance_compare.py \
-            --optest "${optest}" \
-            --output-dir "${log_dir}/operator-compare/block128" \
-            --scale-layout block128 \
-            --warmup 20 --iters 200 --outer-repeats 5
+        if [[ "${scope}" != block128 ]]; then
+            run_logged sm120_w8a8_perchannel_operator_compare \
+                "${vllm_python}" test/w8a8/operator_performance_compare.py \
+                --optest "${optest}" \
+                --output-dir "${log_dir}/operator-compare/perchannel" \
+                --scale-layout perchannel \
+                --warmup 20 --iters 200 --outer-repeats 5
+        fi
+
+        if [[ "${scope}" != dense ]]; then
+            run_logged sm120_w8a8_block128_operator_compare \
+                "${vllm_python}" test/w8a8/operator_performance_compare.py \
+                --optest "${optest}" \
+                --output-dir "${log_dir}/operator-compare/block128" \
+                --scale-layout block128 \
+                --warmup 20 --iters 200 --outer-repeats 5
+        fi
     fi
 }
 
@@ -326,6 +374,12 @@ run_model_performance() {
 
 case "${suite}" in
     build) run_build ;;
+    ops-dense-functional) run_ops_functional ;;
+    ops-dense-performance) run_ops_performance ;;
+    ops-dense) run_ops_functional; run_ops_performance ;;
+    ops-block128-functional) run_ops_functional ;;
+    ops-block128-performance) run_ops_performance ;;
+    ops-block128) run_ops_functional; run_ops_performance ;;
     ops-functional) run_ops_functional ;;
     ops-performance) run_ops_performance ;;
     ops-compare) run_ops_performance ;;
@@ -333,7 +387,10 @@ case "${suite}" in
     forward) run_forward ;;
     model-performance) run_model_performance ;;
     all) run_ops_functional; run_ops_performance; run_forward; run_model_performance ;;
-    *) echo "usage: $0 {build|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2; exit 2 ;;
+    *)
+        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
+        exit 2
+        ;;
 esac
 
 printf 'Logs: %s\n' "${log_dir}"
