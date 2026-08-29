@@ -782,21 +782,28 @@ bool Execute(const fastllm::Data &input, fastllm::Data &weight,
              int m, int k, int n, int arch) {
     ExecutionScratch *scratch = GetExecutionScratch(
         (size_t)m * k * sizeof(Quant), (size_t)m * sizeof(float));
+
     const int device = FastllmCudaGetDevice();
     WeightCache *cache = GetWeightCache<Output>(weight, bias, device, n);
+
     if (scratch == nullptr || cache == nullptr || cache->weight == nullptr ||
         cache->scales == nullptr) return false;
+
     Quant *quant = static_cast<Quant *>(scratch->quantized);
     float *tokenScales = scratch->tokenScales;
     const float *channelScales = cache->scales;
     const Output *biasData = static_cast<const Output *>(cache->bias);
+
     cudaStream_t stream = 0;
     QuantizePerToken<Input, Quant, MaxValue><<<m, 256, 0, stream>>>(
         (const Input*)input.cudaData, quant, tokenScales, m, k);
+
     if (cudaGetLastError() != cudaSuccess) return false;
+
     Output *outputData = static_cast<Output *>(output.cudaData);
     const Quant *weightData = static_cast<const Quant *>(cache->weight);
     const bool perChannel = cache->scaleCount != 1;
+
     return biasData == nullptr
         ? Dispatch<Quant, Output, false>(
               arch, quant, weightData, outputData,
