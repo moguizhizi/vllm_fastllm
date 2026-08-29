@@ -385,18 +385,24 @@ static WeightCache *GetWeightCache(fastllm::Data &weight,
             ? fastllm::DataType::FLOAT16
             : fastllm::DataType::BFLOAT16;
     const WeightCacheKey key{&weight, &bias, device, outputType};
+
     std::lock_guard<std::mutex> guard(weightCacheMutex);
     auto found = weightCaches.find(key);
+
     if (found != weightCaches.end()) {
         WeightCache &cache = found->second;
+
         if (cache.weight == weight.cudaData && cache.n == n &&
             cache.biasSource == bias.cudaData) {
             return &cache;
         }
+
         if (FastllmCudaGraphIsCapturing()) return nullptr;
+
         ReleaseWeightCache(cache);
         weightCaches.erase(found);
     }
+
     if (FastllmCudaGraphIsCapturing()) return nullptr;
 
     ScaleCache *scaleCache = GetScaleCache(weight, device);
@@ -408,19 +414,24 @@ static WeightCache *GetWeightCache(fastllm::Data &weight,
     cache.scaleCount = scaleCache->count;
     cache.n = n;
     cache.biasSource = bias.cudaData;
+
     if (!bias.dims.empty()) {
         cache.bias = FastllmCudaMalloc((size_t)n * sizeof(Output));
         if (cache.bias == nullptr) return nullptr;
+
         const int threads = 256;
         const int blocks = std::min(4096, (n + threads - 1) / threads);
+
         ConvertBias<<<blocks, threads>>>(
             static_cast<const float *>(bias.cudaData),
             static_cast<Output *>(cache.bias), n);
+
         if (cudaGetLastError() != cudaSuccess) {
             ReleaseWeightCache(cache);
             return nullptr;
         }
     }
+
     auto inserted = weightCaches.emplace(key, cache);
     return &inserted.first->second;
 }
