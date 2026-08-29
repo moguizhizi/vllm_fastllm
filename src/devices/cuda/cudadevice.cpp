@@ -5015,7 +5015,7 @@ namespace fastllm {
             if (FastllmCudaCutlassLinearInt8W8A8Sm90(
                     input, weight, bias, output, n, m, k)) return;
         } else if (quantScheme == LinearQuantScheme::FP8_W8A8) {
-            if (FastllmCudaCutlassLinearFp8W8A8Sm120(
+            if (FastllmCudaCutlassLinearFp8W8A8(
                     input, weight, bias, output, n, m, k)) return;
         } else if (quantScheme == LinearQuantScheme::FP8_W8A8_BLOCK128) {
             if (FastllmCudaCutlassLinearFp8W8A8Block128(
@@ -5033,7 +5033,7 @@ namespace fastllm {
             if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) return;
             if (FastllmCudaCutlassLinearInt8W8A8Sm90(
                     input, weight, bias, output, n, m, k) ||
-                FastllmCudaCutlassLinearFp8W8A8Sm120(
+                FastllmCudaCutlassLinearFp8W8A8(
                     input, weight, bias, output, n, m, k)) return;
             if (FastllmCudaTryNvfp4W4A4Linear(
                     input, weight, bias, output, n, m, k)) return;

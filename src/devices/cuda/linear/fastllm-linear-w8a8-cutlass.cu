@@ -1,4 +1,4 @@
-// Apache-2.0. Native FastLLM adaptation of vLLM scaled_mm SM90 INT8 and
+// Apache-2.0. Native FastLLM adaptation of vLLM scaled_mm SM90 INT8/FP8 and
 // SM120 FP8 kernels.  The public wrappers intentionally reject every layout
 // except dynamic per-token activation scale + symmetric per-output-channel or
 // tensorwise weight scale.
@@ -39,7 +39,7 @@ using namespace cute;
 using BackendState = FastllmCudaFp8W8A8BackendState;
 
 /**
- * SM120 W8A8执行阶段按GPU复用的临时显存。
+ * Dense W8A8执行阶段按GPU复用的临时显存。
  *
  * FP8权重已经是CUTLASS直接消费的[N,K]格式，不需要像NVFP4一样保留
  * 第二份重排权重。本结构只缓存动态量化激活、per-token scale和可能
@@ -116,17 +116,18 @@ static bool ForceGemmFailureForTest() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
-[[noreturn]] static void ThrowFixedBackend(const char *reason) {
+[[noreturn]] static void ThrowFixedBackend(int arch, const char *reason) {
     throw std::runtime_error(
-        std::string("fixed SM120 FP8 W8A8 CUTLASS backend failed: ") + reason);
+        "fixed SM" + std::to_string(arch) +
+        " FP8 W8A8 CUTLASS backend failed: " + reason);
 }
 
 static void Trace(const char *path, const char *reason,
                   int m, int n, int k) {
     if (!TraceEnabled()) return;
     std::fprintf(stderr,
-                 "[fastllm][w8a8] path=%s reason=%s m=%d n=%d k=%d sm=120\n",
-                 path, reason, m, n, k);
+                 "[fastllm][w8a8] path=%s reason=%s m=%d n=%d k=%d sm=%d\n",
+                 path, reason, m, n, k, FastllmCudaRuntimeArch());
 }
 
 static BackendState GetBackendState(const fastllm::Data &weight, int device) {
@@ -483,7 +484,7 @@ struct EnableSm120Only : Kernel {
  * 使同一内核同时支持per-token/per-channel和tensorwise广播语义。
  */
 template <typename ElementAcc, typename ElementD, typename TileShape,
-          bool HasBias>
+          bool HasBias, bool SwapAB = false>
 struct FusedScaledEpilogue {
     using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
     using ScaleAStride = Stride<bool, _0, _0>;
@@ -492,9 +493,13 @@ struct FusedScaledEpilogue {
         0, TileShape, float, float, ScaleAStride, 4, false>;
     using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
         0, TileShape, float, float, ScaleBStride, 4, false>;
-    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
-        0, TileShape, ElementD, ElementD, Stride<_0, _1, _0>,
-        128 / sizeof_bits_v<ElementD>, false>;
+    using Bias = std::conditional_t<SwapAB,
+        cutlass::epilogue::fusion::Sm90ColBroadcast<
+            0, TileShape, ElementD, ElementD, Stride<_1, _0, _0>,
+            128 / sizeof_bits_v<ElementD>, false>,
+        cutlass::epilogue::fusion::Sm90RowBroadcast<
+            0, TileShape, ElementD, ElementD, Stride<_0, _1, _0>,
+            128 / sizeof_bits_v<ElementD>, false>>;
     using MultiplyB = cutlass::epilogue::fusion::Sm90Compute<
         cutlass::multiplies, float, float,
         cutlass::FloatRoundStyle::round_to_nearest>;
@@ -517,10 +522,17 @@ struct FusedScaledEpilogue {
     static Arguments Prepare(const float *scaleA, bool perToken,
                              const float *scaleB, bool perChannel,
                              const ElementD *bias) {
+        const float *kernelScaleA = SwapAB ? scaleB : scaleA;
+        const float *kernelScaleB = SwapAB ? scaleA : scaleB;
+        const bool kernelPerRow = SwapAB ? perChannel : perToken;
+        const bool kernelPerColumn = SwapAB ? perToken : perChannel;
+
         typename ScaleA::Arguments aArgs{
-            scaleA, 0.0f, ScaleAStride{perToken, _0{}, _0{}}};
+            kernelScaleA, 0.0f,
+            ScaleAStride{kernelPerRow, _0{}, _0{}}};
         typename ScaleB::Arguments bArgs{
-            scaleB, 0.0f, ScaleBStride{_0{}, perChannel, _0{}}};
+            kernelScaleB, 0.0f,
+            ScaleBStride{_0{}, kernelPerColumn, _0{}}};
         typename ScaledB::Arguments scaledBArgs{bArgs, {}, {}};
         if constexpr (HasBias) {
             typename Bias::Arguments biasArgs{bias, ElementD(0), {}};
@@ -607,6 +619,98 @@ struct DenseKernel {
     struct GemmKernel : EnabledKernel {};
 };
 
+#if defined(FASTLLM_CUTLASS_W8A8_SM90)
+/**
+ * 定义与vLLM SM90标准FP8 scaled-mm一致的CUTLASS GEMM。
+ *
+ * SM90使用FP8 FastAccum mainloop和Persistent tile scheduler。SwapAB为true
+ * 时实际计算D^T=B*A^T，以便小M形状把原N维映射到kernel的M维；输入布局、
+ * 输出布局、scale广播和bias广播均随之转置，但对外数学语义保持不变。
+ */
+template <
+    typename Element,
+    typename Output,
+    typename Tile,
+    typename Cluster,
+    typename MainloopSchedule,
+    typename EpilogueSchedule,
+    bool HasBias,
+    bool SwapAB>
+struct Sm90Fp8DenseKernel {
+    using ElementA = Element;
+    using ElementB = Element;
+    using ElementD = Output;
+    using ElementAccumulator = float;
+
+    static constexpr bool HasBiasValue = HasBias;
+    static constexpr bool SwapABValue = SwapAB;
+
+    using OriginalLayoutA = cutlass::layout::RowMajor;
+    using OriginalLayoutB = cutlass::layout::ColumnMajor;
+    using OriginalLayoutD = cutlass::layout::RowMajor;
+    using TransposedLayoutA = typename cutlass::layout::LayoutTranspose<
+        OriginalLayoutA>::type;
+    using TransposedLayoutB = typename cutlass::layout::LayoutTranspose<
+        OriginalLayoutB>::type;
+    using TransposedLayoutD = typename cutlass::layout::LayoutTranspose<
+        OriginalLayoutD>::type;
+    using LayoutA = std::conditional_t<
+        SwapAB, TransposedLayoutB, OriginalLayoutA>;
+    using LayoutB = std::conditional_t<
+        SwapAB, TransposedLayoutA, OriginalLayoutB>;
+    using LayoutD = std::conditional_t<
+        SwapAB, TransposedLayoutD, OriginalLayoutD>;
+
+    static constexpr int Alignment =
+        128 / cutlass::sizeof_bits<Element>::value;
+    static constexpr int AlignmentD =
+        128 / cutlass::sizeof_bits<Output>::value;
+
+    using EpilogueOperation = FusedScaledEpilogue<
+        ElementAccumulator, Output, Tile, HasBias, SwapAB>;
+    using EVTCompute = typename EpilogueOperation::EVTCompute;
+
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Tile,
+        Cluster,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        float,
+        void,
+        LayoutD,
+        AlignmentD,
+        Output,
+        LayoutD,
+        AlignmentD,
+        EpilogueSchedule,
+        EVTCompute>::CollectiveOp;
+
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        Alignment,
+        Element,
+        LayoutB,
+        Alignment,
+        ElementAccumulator,
+        Tile,
+        Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+        MainloopSchedule>::CollectiveOp;
+
+    using Base = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, Mainloop, Epilogue,
+        cutlass::gemm::PersistentScheduler>;
+
+    struct GemmKernel : EnableSm90Only<Base> {};
+};
+#endif
+
 /**
  * 按指定CUTLASS定义提交一次带融合缩放的W8A8 GEMM。
  *
@@ -686,6 +790,75 @@ bool Run(typename Definition::ElementA const *a,
     return status == cutlass::Status::kSuccess && cudaGetLastError() == cudaSuccess;
 }
 
+#if defined(FASTLLM_CUTLASS_W8A8_SM90)
+/**
+ * 提交一次SM90标准FP8 W8A8 GEMM，并处理可选的A/B转置计算。
+ *
+ * SwapAB=false时直接计算D[M,N]=A[M,K]*B[N,K]^T；SwapAB=true时构造
+ * 等价问题D^T[N,M]=B[N,K]*A[M,K]^T。转置只改变CUTLASS看到的布局和
+ * 参数顺序，不搬运输入、权重或输出数据。
+ *
+ * @return true表示CUTLASS接受参数且kernel成功提交；false表示形状、
+ *         workspace或提交阶段失败。
+ */
+template <typename Definition>
+bool RunSm90Fp8(typename Definition::ElementA const *a,
+                typename Definition::ElementB const *b,
+                typename Definition::ElementD *d,
+                const float *scaleA, bool perToken,
+                const float *scaleB, bool perChannel,
+                const typename Definition::ElementD *bias,
+                int m, int n, int k, cudaStream_t stream,
+                ExecutionScratch &scratch) {
+    using Kernel = typename Definition::GemmKernel;
+    using Adapter = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+    using StrideA = typename Kernel::StrideA;
+    using StrideB = typename Kernel::StrideB;
+    using StrideD = typename Kernel::StrideD;
+
+    const int kernelM = Definition::SwapABValue ? n : m;
+    const int kernelN = Definition::SwapABValue ? m : n;
+
+    StrideA strideA = cutlass::make_cute_packed_stride(
+        StrideA{}, make_shape(kernelM, k, 1));
+    StrideB strideB = cutlass::make_cute_packed_stride(
+        StrideB{}, make_shape(kernelN, k, 1));
+    StrideD strideD = cutlass::make_cute_packed_stride(
+        StrideD{}, make_shape(kernelM, kernelN, 1));
+
+    const auto *kernelA = Definition::SwapABValue ? b : a;
+    const auto *kernelB = Definition::SwapABValue ? a : b;
+    typename Kernel::MainloopArguments mainloop{
+        kernelA, strideA, kernelB, strideB};
+
+    auto callbackArgs = Definition::EpilogueOperation::Prepare(
+        scaleA, perToken, scaleB, perChannel, bias);
+    typename Kernel::EpilogueArguments epilogue{
+        callbackArgs, d, strideD, d, strideD};
+
+    cutlass::KernelHardwareInfo hw;
+    hw.device_id = FastllmCudaGetDevice();
+    hw.sm_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+            hw.device_id);
+
+    typename Kernel::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        make_shape(kernelM, kernelN, k, 1), mainloop, epilogue, hw};
+
+    Adapter gemm;
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
+
+    const size_t workspaceBytes = Adapter::get_workspace_size(args);
+    void *workspace = GetWorkspace(scratch, workspaceBytes);
+    if (workspaceBytes != 0 && workspace == nullptr) return false;
+
+    const cutlass::Status status = gemm.run(args, workspace, stream);
+    return status == cutlass::Status::kSuccess &&
+           cudaGetLastError() == cudaSuccess;
+}
+#endif
+
 template <typename Element, typename Output, bool HasBias>
 bool Dispatch(int arch, Element const *a, Element const *b, Output *d,
               const float *scaleA, bool perToken,
@@ -694,6 +867,85 @@ bool Dispatch(int arch, Element const *a, Element const *b, Output *d,
               int m, int n, int k, cudaStream_t stream,
               ExecutionScratch &scratch) {
 #if defined(FASTLLM_CUTLASS_W8A8_SM90)
+    if constexpr (std::is_same_v<Element, cutlass::float_e4m3_t>) {
+        if (arch != 90) return false;
+
+        if (m <= 16) {
+            if (n <= 1280) {
+                using D = Sm90Fp8DenseKernel<
+                    Element, Output, Shape<_64,_16,_256>, Shape<_1,_2,_1>,
+                    cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum,
+                    cutlass::epilogue::TmaWarpSpecialized,
+                    HasBias, true>;
+                return RunSm90Fp8<D>(
+                    a, b, d, scaleA, perToken, scaleB, perChannel,
+                    bias, m, n, k, stream, scratch);
+            }
+
+            using D = Sm90Fp8DenseKernel<
+                Element, Output, Shape<_64,_16,_256>, Shape<_1,_1,_1>,
+                cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum,
+                cutlass::epilogue::TmaWarpSpecialized,
+                HasBias, true>;
+            return RunSm90Fp8<D>(
+                a, b, d, scaleA, perToken, scaleB, perChannel,
+                bias, m, n, k, stream, scratch);
+        }
+
+        if (m <= 64) {
+            if (n <= 1280) {
+                using D = Sm90Fp8DenseKernel<
+                    Element, Output, Shape<_64,_16,_256>, Shape<_1,_4,_1>,
+                    cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum,
+                    cutlass::epilogue::TmaWarpSpecialized,
+                    HasBias, true>;
+                return RunSm90Fp8<D>(
+                    a, b, d, scaleA, perToken, scaleB, perChannel,
+                    bias, m, n, k, stream, scratch);
+            }
+
+            using D = Sm90Fp8DenseKernel<
+                Element, Output, Shape<_64,_64,_256>, Shape<_1,_1,_1>,
+                cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum,
+                cutlass::epilogue::TmaWarpSpecialized,
+                HasBias, true>;
+            return RunSm90Fp8<D>(
+                a, b, d, scaleA, perToken, scaleB, perChannel,
+                bias, m, n, k, stream, scratch);
+        }
+
+        if (m <= 128) {
+            using D = Sm90Fp8DenseKernel<
+                Element, Output, Shape<_64,_128,_128>, Shape<_2,_1,_1>,
+                cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
+                cutlass::epilogue::TmaWarpSpecialized,
+                HasBias, false>;
+            return RunSm90Fp8<D>(
+                a, b, d, scaleA, perToken, scaleB, perChannel,
+                bias, m, n, k, stream, scratch);
+        }
+
+        if (m >= 8192 && k >= 6144) {
+            using D = Sm90Fp8DenseKernel<
+                Element, Output, Shape<_256,_128,_128>, Shape<_2,_1,_1>,
+                cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum,
+                cutlass::epilogue::TmaWarpSpecializedCooperative,
+                HasBias, false>;
+            return RunSm90Fp8<D>(
+                a, b, d, scaleA, perToken, scaleB, perChannel,
+                bias, m, n, k, stream, scratch);
+        }
+
+        using D = Sm90Fp8DenseKernel<
+            Element, Output, Shape<_128,_128,_128>, Shape<_2,_1,_1>,
+            cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
+            cutlass::epilogue::TmaWarpSpecialized,
+            HasBias, false>;
+        return RunSm90Fp8<D>(
+            a, b, d, scaleA, perToken, scaleB, perChannel,
+            bias, m, n, k, stream, scratch);
+    }
+
     if constexpr (std::is_same_v<Element, int8_t>) {
         if (arch != 90) return false;
         if (m <= 32 && n < 8192) {
@@ -807,7 +1059,7 @@ bool Dispatch(int arch, Element const *a, Element const *b, Output *d,
  * @param m            GEMM的M维，通常为本次处理的token数。
  * @param k            GEMM的K维，即输入特征数。
  * @param n            GEMM的N维，即输出特征数。
- * @param arch         当前GPU计算能力，例如SM120传120。
+ * @param arch         当前GPU计算能力，例如SM90传90、SM120传120。
  * @return true表示量化、GEMM和缩放写回均已成功提交；false表示临时区、
  *         scale/bias准备、CUTLASS分派或CUDA kernel启动失败。
  */
@@ -919,7 +1171,7 @@ FastllmCudaFp8W8A8BackendState FastllmCudaGetFp8W8A8BackendState(
 }
 
 /**
- * 在标准FP8权重上传当前GPU后预先记录SM120 W8A8候选后端。
+ * 在标准FP8权重上传当前GPU后预先记录Dense W8A8候选后端。
  *
  * 标准FP8权重已经是CUTLASS直接消费的[N,K]布局，因此本阶段不复制或
  * 重排权重，也不释放原始CUDA表示；这里只检查与M无关的GPU、权重形状
@@ -932,7 +1184,9 @@ FastllmCudaFp8W8A8BackendState FastllmCudaGetFp8W8A8BackendState(
  *         已固定交给Legacy。
  */
 bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight) {
-#if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && defined(FASTLLM_CUTLASS_W8A8_SM120)
+#if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && \
+    (defined(FASTLLM_CUTLASS_W8A8_SM90) || \
+     defined(FASTLLM_CUTLASS_W8A8_SM120))
     using namespace fastllm_w8a8_dense_detail;
     if (weight.dataType != fastllm::DataType::FP8_E4M3 ||
         weight.weightType != fastllm::WeightType::LINEAR ||
@@ -941,8 +1195,17 @@ bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight) {
     const BackendState state = GetBackendState(weight, device);
     if (state == BackendState::Prepared || state == BackendState::Cutlass) return true;
     if (state == BackendState::Rejected) return false;
+    const int arch = FastllmCudaRuntimeArch();
+    bool archSupported = false;
+#if defined(FASTLLM_CUTLASS_W8A8_SM90)
+    archSupported = archSupported || arch == 90;
+#endif
+#if defined(FASTLLM_CUTLASS_W8A8_SM120)
+    archSupported = archSupported || arch == 120;
+#endif
+
     const int n = weight.dims[0], k = weight.dims[1];
-    const bool supported = Enabled() && FastllmCudaRuntimeArch() == 120 &&
+    const bool supported = Enabled() && archSupported &&
         n > 0 && k > 0 && n % 8 == 0 && k % 16 == 0 &&
         weight.blockK == 1 && weight.blockM == k &&
         (weight.scales.size() == 1 || weight.scales.size() == (size_t)n) &&
@@ -952,7 +1215,8 @@ bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight) {
         Trace("fallback", "weight-load backend selection rejected", 1, n, k);
         if (StrictEnabled()) {
             throw std::runtime_error(
-                "strict SM120 FP8 W8A8 weight-load selection failed");
+                "strict SM" + std::to_string(arch) +
+                " FP8 W8A8 weight-load selection failed");
         }
         return false;
     }
@@ -966,7 +1230,8 @@ bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight) {
         Trace("fallback", "weight scale cache creation failed", 1, n, k);
         if (StrictEnabled()) {
             throw std::runtime_error(
-                "strict SM120 FP8 W8A8 scale cache creation failed");
+                "strict SM" + std::to_string(arch) +
+                " FP8 W8A8 scale cache creation failed");
         }
         return false;
     }
@@ -1006,7 +1271,7 @@ bool FastllmCudaCutlassLinearInt8W8A8Sm90(
 }
 
 /**
- * 在SM120上执行标准FP8 W8A8 CUTLASS线性计算并维护固定后端状态。
+ * 在SM90或SM120上执行标准FP8 W8A8 CUTLASS线性计算并维护固定后端状态。
  *
  * 本入口只接管FP8_E4M3二维权重，以及tensorwise标量或per-channel
  * FP32权重scale；blockwise权重不属于本路径。输入必须为FP16或BF16，
@@ -1032,31 +1297,43 @@ bool FastllmCudaCutlassLinearInt8W8A8Sm90(
  *         验证；false表示该权重不属于本路径，或首次选择失败且允许交给
  *         Legacy。严格模式及固定Cutlass后的失败通过异常报告。
  */
-bool FastllmCudaCutlassLinearFp8W8A8Sm120(
+bool FastllmCudaCutlassLinearFp8W8A8(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output, int m, int k, int n) {
-#if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && defined(FASTLLM_CUTLASS_W8A8_SM120)
+#if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && \
+    (defined(FASTLLM_CUTLASS_W8A8_SM90) || \
+     defined(FASTLLM_CUTLASS_W8A8_SM120))
     using namespace fastllm_w8a8_dense_detail;
     // 本入口只接管标准FP8权重及per-channel/tensorwise scale；blockwise
     // 等其他布局继续交给原有后端。
     if (weight.dataType != fastllm::DataType::FP8_E4M3) return false;
 
     const int device = FastllmCudaGetDevice();
+    const int arch = FastllmCudaRuntimeArch();
     const BackendState state = GetBackendState(weight, device);
     if (state == BackendState::Rejected) {
         Trace("fallback", "backend fixed to legacy", m, n, k);
         if (StrictEnabled()) {
             throw std::runtime_error(
-                "strict SM120 FP8 W8A8 requires the CUTLASS backend");
+                "strict SM" + std::to_string(arch) +
+                " FP8 W8A8 requires the CUTLASS backend");
         }
         return false;
     }
 
     const bool selecting = state == BackendState::Uninitialized ||
                            state == BackendState::Prepared;
+    bool archSupported = false;
+#if defined(FASTLLM_CUTLASS_W8A8_SM90)
+    archSupported = archSupported || arch == 90;
+#endif
+#if defined(FASTLLM_CUTLASS_W8A8_SM120)
+    archSupported = archSupported || arch == 120;
+#endif
+
     const char *failure = nullptr;
     if (selecting && !Enabled()) failure = "backend disabled";
-    else if (FastllmCudaRuntimeArch() != 120) failure = "runtime SM is not 120";
+    else if (!archSupported) failure = "runtime SM is not enabled in this build";
     else if (m <= 0 || k <= 0 || n <= 0) failure = "invalid GEMM dimensions";
     else if (k % 16 != 0) failure = "K is not aligned to 16";
     else if (n % 8 != 0) failure = "N is not aligned to 8";
@@ -1084,19 +1361,20 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
             SetBackendState(weight, device, BackendState::Rejected);
             if (StrictEnabled()) {
                 throw std::runtime_error(
-                    std::string("strict SM120 FP8 W8A8 selection failed: ") + failure);
+                    "strict SM" + std::to_string(arch) +
+                    " FP8 W8A8 selection failed: " + failure);
             }
             return false;
         }
-        ThrowFixedBackend(failure);
+        ThrowFixedBackend(arch, failure);
     }
 
     const bool ok = input.dataType == fastllm::DataType::FLOAT16
         ? Execute<half, cutlass::float_e4m3_t, cutlass::half_t, 448>(
-              input, weight, bias, output, m, k, n, 120)
+              input, weight, bias, output, m, k, n, arch)
         : Execute<__nv_bfloat16, cutlass::float_e4m3_t,
                   cutlass::bfloat16_t, 448>(
-              input, weight, bias, output, m, k, n, 120);
+              input, weight, bias, output, m, k, n, arch);
 
     // CUDA调用异步返回。后端只在首次真实GEMM同步验证成功后固定，避免
     // 把异步内核错误误判为成功并在后续请求中静默混用Legacy。
@@ -1119,11 +1397,12 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
             SetBackendState(weight, device, BackendState::Rejected);
             if (StrictEnabled()) {
                 throw std::runtime_error(
-                    std::string("strict SM120 FP8 W8A8 warmup failed: ") + reason);
+                    "strict SM" + std::to_string(arch) +
+                    " FP8 W8A8 warmup failed: " + reason);
             }
             return false;
         }
-        ThrowFixedBackend(reason);
+        ThrowFixedBackend(arch, reason);
     }
 
     if (selecting) SetBackendState(weight, device, BackendState::Cutlass);
@@ -1133,4 +1412,18 @@ bool FastllmCudaCutlassLinearFp8W8A8Sm120(
     (void)input; (void)weight; (void)bias; (void)output; (void)m; (void)k; (void)n;
     return false;
 #endif
+}
+
+/**
+ * 保留旧SM120入口的兼容包装，不参与SM90生产分派。
+ *
+ * @return 运行时为SM120时转发到通用Dense FP8 W8A8入口，否则返回false。
+ */
+bool FastllmCudaCutlassLinearFp8W8A8Sm120(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output, int m, int k, int n) {
+    if (FastllmCudaRuntimeArch() != 120) return false;
+
+    return FastllmCudaCutlassLinearFp8W8A8(
+        input, weight, bias, output, m, k, n);
 }
