@@ -240,17 +240,22 @@ __global__ void QuantizePerToken(const Input *input, Quant *quant,
                                  float *scales, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
+
     static_assert(sizeof(Input) == 2 && sizeof(Quant) == 1);
+
     // 与vLLM dynamic_per_token_scaled_fp8_quant保持一致：每次处理16个
     // 元素。FP16/BF16侧读取32字节，FP8侧写入16字节。
     constexpr int ValuesPerVector = 16;
     const int vectors = cols / ValuesPerVector;
+
     struct __align__(32) InputVector {
         Input values[ValuesPerVector];
     };
+
     struct __align__(16) QuantVector {
         Quant values[ValuesPerVector];
     };
+
     const InputVector *vectorInput = reinterpret_cast<const InputVector *>(
         input + (size_t)row * cols);
     QuantVector *vectorOutput = reinterpret_cast<QuantVector *>(
@@ -265,10 +270,12 @@ __global__ void QuantizePerToken(const Input *input, Quant *quant,
             local = fmaxf(local, fabsf(ToFloat(values.values[i])));
         }
     }
+
     using BlockReduce = cub::BlockReduce<float, 256>;
     __shared__ typename BlockReduce::TempStorage reductionStorage;
     float maximum = BlockReduce(reductionStorage).Reduce(
         local, QuantizeMaxOp{});
+
     __shared__ float rowScale;
     if (threadIdx.x == 0) {
         const float minScale = std::is_same_v<Quant, int8_t>
@@ -277,6 +284,7 @@ __global__ void QuantizePerToken(const Input *input, Quant *quant,
         rowScale = fmaxf(maximum / (float)MaxValue, minScale);
         scales[row] = rowScale;
     }
+
     __syncthreads();
 
     for (int vector = threadIdx.x; vector < vectors;
@@ -288,6 +296,7 @@ __global__ void QuantizePerToken(const Input *input, Quant *quant,
             target.values[i] = QuantizeValue<Quant>(
                 ToFloat(source.values[i]), rowScale);
         }
+
         vectorOutput[vector] = target;
     }
 }
