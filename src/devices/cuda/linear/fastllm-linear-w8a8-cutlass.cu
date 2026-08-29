@@ -162,27 +162,34 @@ static ExecutionScratch *GetExecutionScratch(size_t quantizedBytes,
                                              size_t tokenScaleBytes) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
+
     std::lock_guard<std::mutex> guard(scratchMutex);
     ExecutionScratch &scratch = executionScratch[device];
+
     if (scratch.quantized != nullptr && scratch.tokenScales != nullptr &&
         scratch.quantizedBytes >= quantizedBytes &&
         scratch.tokenScaleBytes >= tokenScaleBytes) {
         return &scratch;
     }
+
     if (FastllmCudaGraphIsCapturing()) return nullptr;
 
     ExecutionScratch replacement;
     replacement.quantized = FastllmCudaMalloc(quantizedBytes);
     replacement.tokenScales = static_cast<float *>(
         FastllmCudaMalloc(tokenScaleBytes));
+
     if (replacement.quantized == nullptr || replacement.tokenScales == nullptr) {
         ReleaseScratch(replacement);
         return nullptr;
     }
+
     replacement.quantizedBytes = quantizedBytes;
     replacement.tokenScaleBytes = tokenScaleBytes;
+
     ReleaseScratch(scratch);
     scratch = replacement;
+
     return &scratch;
 }
 
