@@ -312,6 +312,18 @@ def run_discovery(args, backend, prompt, backend_dir):
                 except Exception as error:
                     log_handle.write(f"EXPECTED DISCOVERY END: {error}\n")
                     log_handle.flush()
+
+                # --launch-count只限制NCU采集的Kernel数量，不保证常驻HTTP
+                # 服务随采集结束自动退出。请求结束后主动关闭已登记的Python
+                # 目标进程，使NCU完成报告落盘，避免一直等待到profile超时。
+                if process.poll() is None:
+                    signaled = signal_target_processes(
+                        pid_dir, signal.SIGTERM)
+                    log_handle.write(
+                        "DISCOVERY TARGET SIGTERM: "
+                        f"{','.join(map(str, signaled))}\n")
+                    log_handle.flush()
+
                 report = completed_profile_report(
                     process, output_base, args.profile_timeout, log_path)
         except Exception:
@@ -437,10 +449,19 @@ def run_profile(args, backend, prompt, calibration, backend_dir):
             except Exception as error:
                 log_handle.write(f"EXPECTED PROFILE END: {error}\n")
                 log_handle.flush()
-            if request_completed and process.poll() is None:
-                raise RuntimeError(
-                    f"NCU未命中目标Kernel：{marker}；"
-                    f"calibrated launch-skip={calibration['launch_skip']}")
+
+            # NCU达到launch-count后仍可能等待常驻服务退出。不能以目标进程
+            # 仍存活判断Kernel未命中；应先正常终止服务，再由报告是否生成及
+            # 报告内容确认目标Kernel是否被采集。
+            if process.poll() is None:
+                signaled = signal_target_processes(
+                    pid_dir, signal.SIGTERM)
+                log_handle.write(
+                    "PROFILE TARGET SIGTERM: "
+                    f"{','.join(map(str, signaled))}; "
+                    f"request_completed={request_completed}\n")
+                log_handle.flush()
+
             report = wait_profile_result(
                 process, output_base, args.profile_timeout, log_path)
         except Exception:
