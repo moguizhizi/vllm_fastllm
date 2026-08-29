@@ -616,24 +616,32 @@ bool Run(typename Definition::ElementA const *a,
     using StrideA = typename Kernel::StrideA;
     using StrideB = typename Kernel::StrideB;
     using StrideD = typename Kernel::StrideD;
+
     StrideA strideA = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
     StrideB strideB = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
     StrideD strideD = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
+
     typename Kernel::MainloopArguments mainloop{a, strideA, b, strideB};
+
     auto callbackArgs = Definition::EpilogueOperation::Prepare(
         scaleA, perToken, scaleB, perChannel, bias);
     typename Kernel::EpilogueArguments epilogue{
         callbackArgs, d, strideD, d, strideD};
+
     cutlass::KernelHardwareInfo hw;
     hw.device_id = FastllmCudaGetDevice();
     hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw.device_id);
+
     typename Kernel::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
                                     make_shape(m, n, k, 1), mainloop, epilogue, hw};
+
     Adapter gemm;
     if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
+
     size_t workspaceBytes = Adapter::get_workspace_size(args);
     void *workspace = GetWorkspace(scratch, workspaceBytes);
     if (workspaceBytes && workspace == nullptr) return false;
+
     cutlass::Status status = gemm.run(args, workspace, stream);
     return status == cutlass::Status::kSuccess && cudaGetLastError() == cudaSuccess;
 }
