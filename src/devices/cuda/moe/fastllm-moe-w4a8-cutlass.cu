@@ -10,6 +10,7 @@
 #include "cutlass/layout/matrix.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/mixed_dtype_utils.hpp"
+#include "cutlass/util/packed_stride.hpp"
 #include "libtorch_stable/cutlass_extensions/epilogue/broadcast_load_epilogue_array_c3x.hpp"
 
 #include <cuda_bf16.h>
@@ -525,11 +526,9 @@ static bool FastllmDispatchFp8Grouped(
     const std::vector<int> &counts, int totalTasks,
     int inChannels, int outChannels, cudaStream_t stream) {
     int average = (totalTasks + counts.size() - 1) / counts.size();
-    if (average <= 16) {
-        return FastllmFp8GroupedKernel<Shape<_16,_128,_128>, Shape<_1,_1,_1>>::run(
-            activationPtrs, weightPtrs, tokenScalePtrs, channelScalePtrs,
-            outputPtrs, counts, inChannels, outChannels, stream);
-    }
+
+    // SM90 GMMA要求TileM是64的倍数；小expert通过边界谓词处理有效行，
+    // 不能为了贴合平均任务数把threadblock TileM缩到16。
     if (average <= 64) {
         return FastllmFp8GroupedKernel<Shape<_64,_128,_128>, Shape<_1,_1,_1>>::run(
             activationPtrs, weightPtrs, tokenScalePtrs, channelScalePtrs,
