@@ -510,6 +510,7 @@ namespace fastllm {
 
     struct LogitsDebugOptions {
         bool printLogits = false;
+        bool traceSamplingTop1 = false;
         std::string dumpPath;
     };
 
@@ -522,6 +523,8 @@ namespace fastllm {
             LogitsDebugOptions ret;
             ret.printLogits = GetFastllmEnv().printLogits ||
                               IsLogitsEnvEnabled(std::getenv("FASTLLM_PRINT_LOGITS"));
+            ret.traceSamplingTop1 = IsLogitsEnvEnabled(
+                std::getenv("FASTLLM_SAMPLING_TOP1_TRACE"));
             const char *path = std::getenv("FASTLLM_DSV4_DUMP_LOGITS");
             if (path != nullptr) {
                 ret.dumpPath = path;
@@ -533,6 +536,19 @@ namespace fastllm {
 
     static bool ShouldPrintLogits() {
         return GetLogitsDebugOptions().printLogits;
+    }
+
+    /**
+     * 判断是否比较同一份正式logits的CUDA Top1与CPU argmax。
+     *
+     * 该诊断仅在FASTLLM_SAMPLING_TOP1_TRACE为真值时启用。启用后会产生
+     * 一次额外的设备内拷贝和设备到主机同步，只用于定位采样差异，不应在
+     * 性能测试中开启。
+     *
+     * @return true表示输出CUDA与CPU Top1对照日志；false表示保持正式路径。
+     */
+    static bool ShouldTraceSamplingTop1() {
+        return GetLogitsDebugOptions().traceSamplingTop1;
     }
 
     static const std::string &LogitsDumpPath() {
@@ -638,10 +654,34 @@ namespace fastllm {
         if (allSimple && !needLogits) {
             Data topk;
             TopK(logits, topk, 1);
+
+            Data cpuTopk;
+            if (ShouldTraceSamplingTop1()) {
+                Data cpuLogits(logits);
+                cpuLogits.ToDevice(DataDevice::CPU);
+                TopK(cpuLogits, cpuTopk, 1);
+            }
+
             topk.ToDevice(DataDevice::CPU);
             float *topkData = (float*)topk.cpuData;
+            float *cpuTopkData = ShouldTraceSamplingTop1()
+                ? (float*)cpuTopk.cpuData : nullptr;
+
             for (int b = 0; b < batch; b++) {
-                lastRet.push_back((int) (topkData[0] + 1e-3));
+                const int cudaToken = (int)(topkData[0] + 1e-3);
+                lastRet.push_back(cudaToken);
+
+                if (cpuTopkData != nullptr) {
+                    const int cpuToken = (int)(cpuTopkData[0] + 1e-3);
+                    printf("[fastllm][sampling-top1] cuda_token=%d "
+                           "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
+                           "match=%s batch_index=%d\n",
+                           cudaToken, cpuToken, topkData[1], cpuTopkData[1],
+                           cudaToken == cpuToken ? "true" : "false", b);
+                    fflush(stdout);
+                    cpuTopkData += cpuTopk.Count(2);
+                }
+
                 topkData += topk.Count(2);
             }
         } else if (!needLogits && !needToolNameMask) {

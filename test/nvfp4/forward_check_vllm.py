@@ -233,6 +233,10 @@ def compare_results(args, vllm_result, fastllm_result):
     target_backend_confirmed = fastllm_result.get("target_backend_confirmed")
     target_backend_ok = (
         not target_backend_required or target_backend_confirmed is True)
+    sampling_top1_first = fastllm_result.get("sampling_top1_first")
+    sampling_top1_first_match = (
+        sampling_top1_first.get("match")
+        if sampling_top1_first is not None else None)
 
     v_ranked = sorted(v_probs, key=v_probs.get, reverse=True)
     f_ranked = sorted(f_probs, key=f_probs.get, reverse=True)
@@ -254,6 +258,8 @@ def compare_results(args, vllm_result, fastllm_result):
         failure_class = "prompt_token_ids_mismatch"
     elif not target_backend_ok:
         failure_class = "target_backend_not_confirmed"
+    elif sampling_top1_first_match is False:
+        failure_class = "fastllm_cuda_cpu_top1_mismatch"
     elif not v_generation_matches_argmax:
         failure_class = "vllm_generation_differs_from_reported_argmax"
     elif not first_token_match:
@@ -280,6 +286,10 @@ def compare_results(args, vllm_result, fastllm_result):
           f"{fastllm_result.get('production_trace_boundaries_found', False)}")
     print(f"target_backend_trace_count: "
           f"{fastllm_result.get('target_backend_trace_count', 0)}")
+    print("sampling_top1_trace_count: "
+          f"{fastllm_result.get('sampling_top1_trace_count', 0)}")
+    print(f"sampling_top1_first: {sampling_top1_first}")
+    print(f"sampling_top1_first_match: {sampling_top1_first_match}")
     print("vllm_token_rank_in_fastllm_probe_topk: "
           f"{v_token_rank_in_fastllm_probe}")
     print("fastllm_production_rank_in_vllm_topk: "
@@ -326,6 +336,10 @@ def compare_results(args, vllm_result, fastllm_result):
             "target_backend_trace_count", 0),
         "production_trace_boundaries_found": fastllm_result.get(
             "production_trace_boundaries_found", False),
+        "sampling_top1_trace_count": fastllm_result.get(
+            "sampling_top1_trace_count", 0),
+        "sampling_top1_first": sampling_top1_first,
+        "sampling_top1_first_match": sampling_top1_first_match,
         "vllm_token_rank_in_fastllm_probe_topk": (
             v_token_rank_in_fastllm_probe),
         "fastllm_production_rank_in_vllm_topk": (
@@ -358,12 +372,14 @@ def write_summary_reports(result_dir, summary):
 
     lines = [
         f"# {summary['label']} Forward Check汇总", "",
-        "| 状态 | 失败分类 | 目标后端确认 | Prompt一致 | 正式首Token一致 | "
+        "| 状态 | 失败分类 | 目标后端确认 | CUDA/CPU Top1一致 | "
+        "Prompt一致 | 正式首Token一致 | "
         "FastLLM正式Token/探针argmax一致 | 探针TopK重合率 | "
         "首Token logprob差 | 严格对齐 |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |",
         f"| {summary['result']} | {summary['failure_class']} | "
-        f"{target_backend} | {summary['prompt_token_ids_match']} | "
+        f"{target_backend} | {summary['sampling_top1_first_match']} | "
+        f"{summary['prompt_token_ids_match']} | "
         f"{summary['first_token_match']} | "
         f"{summary['fastllm_production_matches_probe_argmax']} | "
         f"{summary['topk_overlap']:.3f} | "
@@ -387,6 +403,7 @@ def write_summary_reports(result_dir, summary):
         "状态", "标签", "模式", "失败分类", "Prompt一致", "生成Token一致",
         "正式首Token一致", "目标后端要求", "目标后端确认", "目标Trace次数",
         "生产Trace边界完整", "目标Trace模式", "vLLM首步argmax",
+        "采样Top1 Trace次数", "首步CUDA/CPU Top1一致", "首步Top1诊断",
         "FastLLM logits探针argmax",
         "vLLM argmax/FastLLM探针一致", "vLLM生成/argmax一致",
         "FastLLM正式Token/探针argmax一致",
@@ -407,6 +424,9 @@ def write_summary_reports(result_dir, summary):
         summary["production_trace_boundaries_found"],
         summary["target_backend_trace_pattern"],
         summary["vllm_first_argmax_token_id"],
+        summary["sampling_top1_trace_count"],
+        summary["sampling_top1_first_match"],
+        json.dumps(summary["sampling_top1_first"], ensure_ascii=False),
         summary["fastllm_logits_probe_argmax_token_id"],
         summary["vllm_argmax_matches_fastllm_probe"],
         summary["vllm_generation_matches_argmax"],
@@ -459,6 +479,32 @@ def production_trace(output):
     return output[begin:end], True
 
 
+def parse_sampling_top1_traces(output):
+    """解析同一份正式logits上的CUDA与CPU Top1诊断记录。"""
+    prefix = "[fastllm][sampling-top1] "
+    traces = []
+    for line in output.splitlines():
+        if not line.startswith(prefix):
+            continue
+        fields = {}
+        for item in line[len(prefix):].split():
+            key, separator, value = item.partition("=")
+            if separator:
+                fields[key] = value
+        try:
+            traces.append({
+                "cuda_token": int(fields["cuda_token"]),
+                "cpu_token": int(fields["cpu_token"]),
+                "cuda_logit": float(fields["cuda_logit"]),
+                "cpu_logit": float(fields["cpu_logit"]),
+                "match": fields["match"] == "true",
+                "batch_index": int(fields["batch_index"]),
+            })
+        except (KeyError, ValueError):
+            continue
+    return traces
+
+
 def orchestrate(args):
     result_dir = Path(args.result_dir or (REPO_DIR / "test" / "nvfp4" / "results"))
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -501,6 +547,11 @@ def orchestrate(args):
         trace_count > 0 if args.target_trace_pattern else None)
     fastllm_result["target_backend_trace_count"] = trace_count
     fastllm_result["production_trace_boundaries_found"] = boundaries_found
+    sampling_top1_traces = parse_sampling_top1_traces(request_trace)
+    fastllm_result["sampling_top1_trace_count"] = len(sampling_top1_traces)
+    fastllm_result["sampling_top1_first"] = (
+        sampling_top1_traces[0] if sampling_top1_traces else None)
+    fastllm_result["sampling_top1_traces"] = sampling_top1_traces
     write_json(fastllm_output, fastllm_result)
 
     passed, summary = compare_results(args, vllm_result, fastllm_result)
