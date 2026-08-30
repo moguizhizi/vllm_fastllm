@@ -653,6 +653,7 @@ namespace fastllm {
 
         Data cpuTopk;
         TopK(cpuLogits, cpuTopk, 1);
+        cpuTopk.ToDevice(DataDevice::CPU);
 
         const int channels = cpuLogits.dims.back();
         const float *cpuLogitsData = (const float*)cpuLogits.cpuData;
