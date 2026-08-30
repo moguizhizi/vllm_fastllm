@@ -422,7 +422,8 @@ require_model() {
 run_forward() {
     require_model
     run_logged forward_check env FASTLLM_CUDA_W8A8=1 \
-        FASTLLM_CUDA_W8A8_STRICT=1 W8A8_VLLM_PYTHON="${vllm_python}" \
+        FASTLLM_CUDA_W8A8_STRICT=1 FASTLLM_CUDA_W8A8_TRACE=1 \
+        W8A8_VLLM_PYTHON="${vllm_python}" \
         "${vllm_python}" test/w8a8/forward_check_vllm.py \
         --model "${model}" --tokens 8 --top-logprobs 10 \
         --vllm-python "${vllm_python}" \
