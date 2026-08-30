@@ -4,9 +4,7 @@
 import argparse
 import csv
 import ctypes
-import heapq
 import json
-import math
 import os
 from pathlib import Path
 import shlex
@@ -71,13 +69,6 @@ def render_prompt(tokenizer, messages):
 def write_json(path, value):
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2)
-
-
-def top_logprobs(logits, count):
-    maximum = max(logits)
-    log_norm = maximum + math.log(sum(math.exp(value - maximum) for value in logits))
-    token_ids = heapq.nlargest(count, range(len(logits)), key=logits.__getitem__)
-    return {str(token_id): logits[token_id] - log_norm for token_id in token_ids}
 
 
 def strip_trailing_eos(tokenizer, token_ids):
@@ -168,7 +159,8 @@ def generate_fastllm_token_ids(model, tokenizer, prompt, max_tokens):
 
 
 def run_fastllm(args):
-    sampling_trace = os.environ.pop("FASTLLM_SAMPLING_TOP1_TRACE", None)
+    os.environ.pop("FASTLLM_SAMPLING_TOP1_TRACE", None)
+    os.environ.pop("FASTLLM_SAMPLING_TOPK_TRACE", None)
     from transformers import AutoTokenizer
 
     # 在加载FastLLM动态库前取得同一份HF tokenizer，避免FastLLM内部
@@ -184,8 +176,10 @@ def run_fastllm(args):
     prompt = render_prompt(tokenizer, get_messages(args.case_index))
     model.direct_query = True
 
-    if sampling_trace is not None:
-        os.environ["FASTLLM_SAMPLING_TOP1_TRACE"] = sampling_trace
+    # 诊断开关在模型加载后、正式请求前启用。底层从同一次正式采样的
+    # logits副本输出Top1和TopK，不会再发起独立的诊断请求。
+    os.environ["FASTLLM_SAMPLING_TOP1_TRACE"] = "1"
+    os.environ["FASTLLM_SAMPLING_TOPK_TRACE"] = str(args.top_logprobs)
     print(FASTLLM_PRODUCTION_TRACE_BEGIN, flush=True)
     try:
         input_ids, generated_ids = generate_fastllm_token_ids(
@@ -193,23 +187,13 @@ def run_fastllm(args):
     finally:
         print(FASTLLM_PRODUCTION_TRACE_END, flush=True)
         os.environ.pop("FASTLLM_SAMPLING_TOP1_TRACE", None)
+        os.environ.pop("FASTLLM_SAMPLING_TOPK_TRACE", None)
 
-    # response_logits会令FastLLM进入完整logits返回分支，因此这里只把它
-    # 当作独立诊断探针；功能结论始终使用上面的正式生产生成结果。
-    second_request_probe_logits = model.response_logits(
-        prompt, tokenizer=tokenizer)
-    second_request_probe_argmax = max(
-        range(len(second_request_probe_logits)),
-        key=second_request_probe_logits.__getitem__)
     write_json(args.output, {
         "backend": "fastllm",
         "prompt_token_ids": input_ids,
         "generated_token_ids": strip_trailing_eos(tokenizer, generated_ids),
         "generated_text": tokenizer.decode(generated_ids, skip_special_tokens=True),
-        "second_request_logits_probe_argmax_token_id": (
-            second_request_probe_argmax),
-        "second_request_logits_probe_top_logprobs": top_logprobs(
-            second_request_probe_logits, args.top_logprobs),
     })
     model.release_memory()
 
@@ -221,7 +205,7 @@ def compare_results(args, vllm_result, fastllm_result):
     f_probs = {
         int(key): value
         for key, value in fastllm_result[
-            "second_request_logits_probe_top_logprobs"].items()
+            "first_request_top_logprobs"].items()
     }
     common = sorted(set(v_probs) & set(f_probs))
     denominator = max(1, min(args.top_logprobs, len(v_probs), len(f_probs)))
@@ -233,14 +217,13 @@ def compare_results(args, vllm_result, fastllm_result):
     first_fastllm = fastllm_result["generated_token_ids"][:1]
     first_token_match = first_vllm == first_fastllm and bool(first_vllm)
     v_argmax = vllm_result.get("first_argmax_token_id")
-    f_second_request_probe_argmax = fastllm_result.get(
-        "second_request_logits_probe_argmax_token_id")
-    second_request_probe_argmax_match = (
-        v_argmax == f_second_request_probe_argmax and v_argmax is not None)
+    f_first_request_argmax = fastllm_result.get(
+        "first_request_argmax_token_id")
+    first_request_argmax_match = (
+        v_argmax == f_first_request_argmax and v_argmax is not None)
     v_generation_matches_argmax = bool(first_vllm) and first_vllm[0] == v_argmax
-    f_production_matches_second_request_probe = (
-        bool(first_fastllm) and
-        first_fastllm[0] == f_second_request_probe_argmax)
+    f_production_matches_first_request_argmax = (
+        bool(first_fastllm) and first_fastllm[0] == f_first_request_argmax)
     target_backend_required = bool(args.target_trace_pattern)
     target_backend_confirmed = fastllm_result.get("target_backend_confirmed")
     target_backend_ok = (
@@ -252,7 +235,7 @@ def compare_results(args, vllm_result, fastllm_result):
 
     v_ranked = sorted(v_probs, key=v_probs.get, reverse=True)
     f_ranked = sorted(f_probs, key=f_probs.get, reverse=True)
-    v_token_rank_in_fastllm_second_request_probe = (
+    v_token_rank_in_fastllm_first_request = (
         f_ranked.index(first_vllm[0]) + 1
         if first_vllm and first_vllm[0] in f_probs else None)
     f_production_rank_in_vllm = (
@@ -270,8 +253,14 @@ def compare_results(args, vllm_result, fastllm_result):
         failure_class = "prompt_token_ids_mismatch"
     elif not target_backend_ok:
         failure_class = "target_backend_not_confirmed"
+    elif sampling_top1_first_match is None:
+        failure_class = "fastllm_sampling_top1_trace_missing"
     elif sampling_top1_first_match is False:
         failure_class = "fastllm_cuda_cpu_top1_mismatch"
+    elif f_first_request_argmax is None:
+        failure_class = "fastllm_sampling_topk_trace_missing"
+    elif not f_production_matches_first_request_argmax:
+        failure_class = "fastllm_token_differs_from_same_request_argmax"
     elif not v_generation_matches_argmax:
         failure_class = "vllm_generation_differs_from_reported_argmax"
     elif not first_token_match:
@@ -288,13 +277,13 @@ def compare_results(args, vllm_result, fastllm_result):
     print(f"fastllm_token_ids: {fastllm_result['generated_token_ids']}")
     print(f"first_token_match: {first_token_match}")
     print(f"vllm_first_argmax_token_id: {v_argmax}")
-    print("fastllm_second_request_logits_probe_argmax_token_id: "
-          f"{f_second_request_probe_argmax}")
-    print("vllm_argmax_matches_fastllm_second_request_probe: "
-          f"{second_request_probe_argmax_match}")
+    print("fastllm_first_request_argmax_token_id: "
+          f"{f_first_request_argmax}")
+    print("vllm_argmax_matches_fastllm_first_request: "
+          f"{first_request_argmax_match}")
     print(f"vllm_generation_matches_argmax: {v_generation_matches_argmax}")
-    print("fastllm_production_matches_second_request_probe_argmax: "
-          f"{f_production_matches_second_request_probe}")
+    print("fastllm_production_matches_first_request_argmax: "
+          f"{f_production_matches_first_request_argmax}")
     print(f"target_backend_required: {target_backend_required}")
     print(f"target_backend_confirmed: {target_backend_confirmed}")
     print("production_trace_boundaries_found: "
@@ -303,10 +292,12 @@ def compare_results(args, vllm_result, fastllm_result):
           f"{fastllm_result.get('target_backend_trace_count', 0)}")
     print("sampling_top1_trace_count: "
           f"{fastllm_result.get('sampling_top1_trace_count', 0)}")
+    print("sampling_topk_trace_count: "
+          f"{fastllm_result.get('sampling_topk_trace_count', 0)}")
     print(f"sampling_top1_first: {sampling_top1_first}")
     print(f"sampling_top1_first_match: {sampling_top1_first_match}")
-    print("vllm_token_rank_in_fastllm_second_request_probe_topk: "
-          f"{v_token_rank_in_fastllm_second_request_probe}")
+    print("vllm_token_rank_in_fastllm_first_request_topk: "
+          f"{v_token_rank_in_fastllm_first_request}")
     print("fastllm_production_rank_in_vllm_topk: "
           f"{f_production_rank_in_vllm}")
     print("first_token_logprob_diff: " + format_metric(first_token_logprob_diff))
@@ -314,12 +305,11 @@ def compare_results(args, vllm_result, fastllm_result):
     print("common_topk_max_logprob_diff: " + format_metric(max_diff))
     print(f"failure_class: {failure_class}")
 
-    # 功能结论只使用双方正式生产生成路径。FastLLM第二次请求的完整
-    # logits探针会改变其采样实现，因此其TopK、argmax和logprob差只作为
-    # 诊断项，不能代表第一次正式请求的logits。
+    # 功能结论和数值诊断全部来自双方各自唯一一次正式生成请求。
     functional_passed = (
         same_prompt and target_backend_ok and first_token_match and
-        v_generation_matches_argmax)
+        v_generation_matches_argmax and sampling_top1_first_match is True and
+        f_production_matches_first_request_argmax)
     alignment_passed = (
         first_token_logprob_diff is not None and
         first_token_logprob_diff <= args.max_first_logprob_diff)
@@ -341,13 +331,12 @@ def compare_results(args, vllm_result, fastllm_result):
         "generated_token_ids_match": same_tokens,
         "first_token_match": first_token_match,
         "vllm_first_argmax_token_id": v_argmax,
-        "fastllm_second_request_logits_probe_argmax_token_id": (
-            f_second_request_probe_argmax),
-        "vllm_argmax_matches_fastllm_second_request_probe": (
-            second_request_probe_argmax_match),
+        "fastllm_first_request_argmax_token_id": f_first_request_argmax,
+        "vllm_argmax_matches_fastllm_first_request": (
+            first_request_argmax_match),
         "vllm_generation_matches_argmax": v_generation_matches_argmax,
-        "fastllm_production_matches_second_request_probe_argmax": (
-            f_production_matches_second_request_probe),
+        "fastllm_production_matches_first_request_argmax": (
+            f_production_matches_first_request_argmax),
         "target_backend_required": target_backend_required,
         "target_backend_confirmed": target_backend_confirmed,
         "target_backend_trace_pattern": args.target_trace_pattern,
@@ -359,8 +348,10 @@ def compare_results(args, vllm_result, fastllm_result):
             "sampling_top1_trace_count", 0),
         "sampling_top1_first": sampling_top1_first,
         "sampling_top1_first_match": sampling_top1_first_match,
-        "vllm_token_rank_in_fastllm_second_request_probe_topk": (
-            v_token_rank_in_fastllm_second_request_probe),
+        "sampling_topk_trace_count": fastllm_result.get(
+            "sampling_topk_trace_count", 0),
+        "vllm_token_rank_in_fastllm_first_request_topk": (
+            v_token_rank_in_fastllm_first_request),
         "fastllm_production_rank_in_vllm_topk": (
             f_production_rank_in_vllm),
         "failure_class": failure_class,
@@ -374,8 +365,8 @@ def compare_results(args, vllm_result, fastllm_result):
             ("FAIL" if args.strict_alignment else "WARN")),
         "common_topk_max_logprob_diff": max_diff,
         "vllm_first_top_logprobs": vllm_result["first_top_logprobs"],
-        "fastllm_second_request_logits_probe_top_logprobs": (
-            fastllm_result["second_request_logits_probe_top_logprobs"]),
+        "fastllm_first_request_top_logprobs": (
+            fastllm_result["first_request_top_logprobs"]),
         "vllm_generated_token_ids": vllm_result["generated_token_ids"],
         "fastllm_generated_token_ids": fastllm_result["generated_token_ids"],
     }
@@ -393,15 +384,15 @@ def write_summary_reports(result_dir, summary):
         f"# {summary['label']} Forward Check汇总", "",
         "| 状态 | 失败分类 | 目标后端确认 | CUDA/CPU Top1一致 | "
         "Prompt一致 | 正式首Token一致 | "
-        "FastLLM正式Token/第二次请求探针argmax一致 | "
-        "第二次请求探针TopK重合率 | 第二次请求探针首Token logprob差 | "
+        "FastLLM正式Token/同请求argmax一致 | "
+        "同请求TopK重合率 | 同请求首Token logprob差 | "
         "严格对齐 |",
         "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |",
         f"| {summary['result']} | {summary['failure_class']} | "
         f"{target_backend} | {summary['sampling_top1_first_match']} | "
         f"{summary['prompt_token_ids_match']} | "
         f"{summary['first_token_match']} | "
-        f"{summary['fastllm_production_matches_second_request_probe_argmax']} | "
+        f"{summary['fastllm_production_matches_first_request_argmax']} | "
         f"{summary['topk_overlap']:.3f} | "
         f"{format_metric(summary['first_token_logprob_diff'], 3)} | "
         f"{summary['strict_alignment_result']} |",
@@ -423,16 +414,17 @@ def write_summary_reports(result_dir, summary):
         "状态", "标签", "模式", "失败分类", "Prompt一致", "生成Token一致",
         "正式首Token一致", "目标后端要求", "目标后端确认", "目标Trace次数",
         "生产Trace边界完整", "目标Trace模式", "vLLM首步argmax",
-        "采样Top1 Trace次数", "首步CUDA/CPU Top1一致", "首步Top1诊断",
-        "FastLLM第二次请求logits探针argmax",
-        "vLLM argmax/FastLLM第二次请求探针一致", "vLLM生成/argmax一致",
-        "FastLLM正式Token/第二次请求探针argmax一致",
-        "vLLM首Token在FastLLM第二次请求探针TopK排名",
+        "采样Top1 Trace次数", "采样TopK Trace次数",
+        "首步CUDA/CPU Top1一致", "首步Top1诊断",
+        "FastLLM首次正式请求argmax",
+        "vLLM argmax/FastLLM首次正式请求一致", "vLLM生成/argmax一致",
+        "FastLLM正式Token/同请求argmax一致",
+        "vLLM首Token在FastLLM首次正式请求TopK排名",
         "FastLLM正式首Token在vLLM TopK排名",
-        "第二次请求探针TopK", "第二次请求探针TopK重合率", "最低重合率",
-        "第二次请求探针首Token logprob差",
+        "首次正式请求TopK", "首次正式请求TopK重合率", "最低重合率",
+        "首次正式请求首Token logprob差",
         "首Token logprob阈值", "严格对齐结果", "共同TopK最大logprob差",
-        "vLLM首步TopK", "FastLLM第二次请求logits探针TopK", "vLLM生成Token",
+        "vLLM首步TopK", "FastLLM首次正式请求TopK", "vLLM生成Token",
         "FastLLM生成Token",
     ]
     row = [
@@ -446,13 +438,14 @@ def write_summary_reports(result_dir, summary):
         summary["target_backend_trace_pattern"],
         summary["vllm_first_argmax_token_id"],
         summary["sampling_top1_trace_count"],
+        summary["sampling_topk_trace_count"],
         summary["sampling_top1_first_match"],
         json.dumps(summary["sampling_top1_first"], ensure_ascii=False),
-        summary["fastllm_second_request_logits_probe_argmax_token_id"],
-        summary["vllm_argmax_matches_fastllm_second_request_probe"],
+        summary["fastllm_first_request_argmax_token_id"],
+        summary["vllm_argmax_matches_fastllm_first_request"],
         summary["vllm_generation_matches_argmax"],
-        summary["fastllm_production_matches_second_request_probe_argmax"],
-        summary["vllm_token_rank_in_fastllm_second_request_probe_topk"],
+        summary["fastllm_production_matches_first_request_argmax"],
+        summary["vllm_token_rank_in_fastllm_first_request_topk"],
         summary["fastllm_production_rank_in_vllm_topk"],
         summary["topk"], summary["topk_overlap"],
         summary["minimum_topk_overlap"], summary["first_token_logprob_diff"],
@@ -461,7 +454,7 @@ def write_summary_reports(result_dir, summary):
         summary["common_topk_max_logprob_diff"],
         json.dumps(summary["vllm_first_top_logprobs"], ensure_ascii=False),
         json.dumps(
-            summary["fastllm_second_request_logits_probe_top_logprobs"],
+            summary["fastllm_first_request_top_logprobs"],
             ensure_ascii=False),
         json.dumps(summary["vllm_generated_token_ids"], ensure_ascii=False),
         json.dumps(summary["fastllm_generated_token_ids"], ensure_ascii=False),
@@ -527,6 +520,37 @@ def parse_sampling_top1_traces(output):
     return traces
 
 
+def parse_sampling_topk_traces(output):
+    """解析同一次正式采样输出的TopK logits并换算为logprob。"""
+    prefix = "[fastllm][sampling-topk] "
+    traces = []
+    for line in output.splitlines():
+        if not line.startswith(prefix):
+            continue
+        fields = {}
+        for item in line[len(prefix):].split():
+            key, separator, value = item.partition("=")
+            if separator:
+                fields[key] = value
+        try:
+            token_ids = [int(value) for value in fields["token_ids"].split(",")]
+            logits = [float(value) for value in fields["logits"].split(",")]
+            logsumexp = float(fields["logsumexp"])
+            if len(token_ids) != len(logits):
+                continue
+            traces.append({
+                "batch_index": int(fields["batch_index"]),
+                "argmax_token_id": token_ids[0] if token_ids else None,
+                "top_logprobs": {
+                    str(token_id): logit - logsumexp
+                    for token_id, logit in zip(token_ids, logits)
+                },
+            })
+        except (KeyError, ValueError):
+            continue
+    return traces
+
+
 def orchestrate(args):
     result_dir = Path(args.result_dir or (REPO_DIR / "test" / "nvfp4" / "results"))
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -574,6 +598,16 @@ def orchestrate(args):
     fastllm_result["sampling_top1_first"] = (
         sampling_top1_traces[0] if sampling_top1_traces else None)
     fastllm_result["sampling_top1_traces"] = sampling_top1_traces
+    sampling_topk_traces = parse_sampling_topk_traces(request_trace)
+    fastllm_result["sampling_topk_trace_count"] = len(sampling_topk_traces)
+    fastllm_result["sampling_topk_first"] = (
+        sampling_topk_traces[0] if sampling_topk_traces else None)
+    fastllm_result["first_request_argmax_token_id"] = (
+        sampling_topk_traces[0]["argmax_token_id"]
+        if sampling_topk_traces else None)
+    fastllm_result["first_request_top_logprobs"] = (
+        sampling_topk_traces[0]["top_logprobs"]
+        if sampling_topk_traces else {})
     write_json(fastllm_output, fastllm_result)
 
     passed, summary = compare_results(args, vllm_result, fastllm_result)

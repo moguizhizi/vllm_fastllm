@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -550,6 +551,101 @@ namespace fastllm {
             std::getenv("FASTLLM_SAMPLING_TOP1_TRACE"));
     }
 
+    /**
+     * 取得同一次正式采样需要输出的TopK数量。
+     *
+     * FASTLLM_SAMPLING_TOPK_TRACE未设置或不是正整数时不输出TopK；为避免
+     * 诊断日志失控，最大只输出64项。该开关仅影响诊断副本，不改变正式
+     * logits、采样配置或Token选择结果。
+     *
+     * @return 0表示不输出TopK；正数表示每个batch输出的TopK数量。
+     */
+    static int SamplingTopKTraceCount() {
+        const char *value = std::getenv("FASTLLM_SAMPLING_TOPK_TRACE");
+        if (value == nullptr) {
+            return 0;
+        }
+
+        char *end = nullptr;
+        long count = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || count <= 0) {
+            return 0;
+        }
+        return (int)std::min(count, 64L);
+    }
+
+    /**
+     * 输出同一次正式采样logits的CPU Top1与可选TopK诊断。
+     *
+     * @param values       CPU上的完整FLOAT32 logits，按[batch, vocab]排列。
+     * @param batch        batch数量。
+     * @param vocabSize    完整词表大小。
+     * @param cudaTokens   正式CUDA采样选出的Token ID。
+     */
+    static void PrintSamplingTrace(
+            const float *values, int batch, int vocabSize,
+            const std::vector<int> &cudaTokens) {
+        const int requestedTopK = SamplingTopKTraceCount();
+        const int topK = std::min(requestedTopK, vocabSize);
+
+        for (int b = 0; b < batch; ++b) {
+            const float *row = values + (size_t)b * vocabSize;
+            int cpuToken = 0;
+            float cpuLogit = row[0];
+            for (int token = 1; token < vocabSize; ++token) {
+                if (row[token] > cpuLogit ||
+                    (row[token] == cpuLogit && token < cpuToken)) {
+                    cpuToken = token;
+                    cpuLogit = row[token];
+                }
+            }
+
+            const int cudaToken = cudaTokens[b];
+            const float cudaLogit =
+                cudaToken >= 0 && cudaToken < vocabSize
+                    ? row[cudaToken]
+                    : -std::numeric_limits<float>::infinity();
+            printf("[fastllm][sampling-top1] cuda_token=%d "
+                   "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
+                   "match=%s batch_index=%d\n",
+                   cudaToken, cpuToken, cudaLogit, cpuLogit,
+                   cudaToken == cpuToken ? "true" : "false", b);
+
+            if (topK <= 0) {
+                continue;
+            }
+
+            std::vector<int> tokenIds(vocabSize);
+            for (int token = 0; token < vocabSize; ++token) {
+                tokenIds[token] = token;
+            }
+            std::partial_sort(
+                tokenIds.begin(), tokenIds.begin() + topK, tokenIds.end(),
+                [row](int left, int right) {
+                    return row[left] > row[right] ||
+                           (row[left] == row[right] && left < right);
+                });
+
+            double exponentialSum = 0.0;
+            for (int token = 0; token < vocabSize; ++token) {
+                exponentialSum += std::exp((double)row[token] - cpuLogit);
+            }
+            const double logSumExp = cpuLogit + std::log(exponentialSum);
+
+            printf("[fastllm][sampling-topk] batch_index=%d "
+                   "logsumexp=%.17g token_ids=", b, logSumExp);
+            for (int i = 0; i < topK; ++i) {
+                printf("%s%d", i == 0 ? "" : ",", tokenIds[i]);
+            }
+            printf(" logits=");
+            for (int i = 0; i < topK; ++i) {
+                printf("%s%.9g", i == 0 ? "" : ",", row[tokenIds[i]]);
+            }
+            printf("\n");
+        }
+        fflush(stdout);
+    }
+
 #ifdef USE_CUDA
     /**
      * 比较分片CUDA采样Token与同一组分片logits的CPU argmax。
@@ -565,11 +661,9 @@ namespace fastllm {
             const Data &logits, const std::vector<int> &cudaTokens) {
         const int batch = (int)cudaTokens.size();
         const int vocabSize = logits.dims.back();
-        std::vector<int> cpuTokens(batch, -1);
-        std::vector<float> cpuScores(
-            batch, -std::numeric_limits<float>::infinity());
-        std::vector<float> cudaScores(
-            batch, -std::numeric_limits<float>::infinity());
+        std::vector<float> fullLogits(
+            (size_t)batch * vocabSize,
+            -std::numeric_limits<float>::infinity());
 
         for (const auto &deviceData : logits.multiDeviceDatas) {
             const int device = deviceData.first;
@@ -612,27 +706,13 @@ namespace fastllm {
                     const int globalId = globalIds[localId];
                     const float value =
                         values[(size_t)b * localVocab + localId];
-                    if (globalId == cudaTokens[b]) {
-                        cudaScores[b] = value;
-                    }
-                    if (value > cpuScores[b] ||
-                        (value == cpuScores[b] &&
-                         (cpuTokens[b] < 0 || globalId < cpuTokens[b]))) {
-                        cpuScores[b] = value;
-                        cpuTokens[b] = globalId;
-                    }
+                    fullLogits[(size_t)b * vocabSize + globalId] = value;
                 }
             }
         }
 
-        for (int b = 0; b < batch; ++b) {
-            printf("[fastllm][sampling-top1] cuda_token=%d "
-                   "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
-                   "match=%s batch_index=%d\n",
-                   cudaTokens[b], cpuTokens[b], cudaScores[b], cpuScores[b],
-                   cudaTokens[b] == cpuTokens[b] ? "true" : "false", b);
-        }
-        fflush(stdout);
+        PrintSamplingTrace(
+            fullLogits.data(), batch, vocabSize, cudaTokens);
     }
 #endif
 
@@ -659,29 +739,8 @@ namespace fastllm {
                         cpuLogits.Count(0) / channels >= cudaTokens.size(),
                         "Sampling Top1 trace received invalid CPU logits.\n");
 
-        for (int b = 0; b < (int)cudaTokens.size(); ++b) {
-            const float *row = cpuLogitsData + (size_t)b * channels;
-            int cpuToken = 0;
-            float cpuLogit = row[0];
-            for (int token = 1; token < channels; ++token) {
-                if (row[token] > cpuLogit) {
-                    cpuToken = token;
-                    cpuLogit = row[token];
-                }
-            }
-
-            const int cudaToken = cudaTokens[b];
-            const float cudaLogit =
-                cudaToken >= 0 && cudaToken < channels
-                    ? row[cudaToken]
-                    : -std::numeric_limits<float>::infinity();
-            printf("[fastllm][sampling-top1] cuda_token=%d "
-                   "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
-                   "match=%s batch_index=%d\n",
-                   cudaToken, cpuToken, cudaLogit, cpuLogit,
-                   cudaToken == cpuToken ? "true" : "false", b);
-        }
-        fflush(stdout);
+        PrintSamplingTrace(
+            cpuLogitsData, (int)cudaTokens.size(), channels, cudaTokens);
     }
 
     static const std::string &LogitsDumpPath() {
@@ -800,10 +859,6 @@ namespace fastllm {
                 lastRet.push_back(cudaToken);
                 topkData += topk.Count(2);
             }
-
-            if (ShouldTraceSamplingTop1()) {
-                TraceSamplingTop1(logits, lastRet);
-            }
         } else if (!needLogits && !needToolNameMask) {
             if (needRepeatPenalty) {
                 int maxTokenSetSize = 0;
@@ -880,6 +935,10 @@ namespace fastllm {
                     lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], unit));
                 }
             }
+        }
+
+        if (ShouldTraceSamplingTop1()) {
+            TraceSamplingTop1(logits, lastRet);
         }
     }
 }
