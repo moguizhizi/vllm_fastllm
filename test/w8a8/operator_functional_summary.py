@@ -31,6 +31,8 @@ FUNCTIONAL_LOG_PATTERNS = (
     re.compile(r"^sm90_tensorwise_"),
     re.compile(r"^sm90_dense_lifecycle_"),
     re.compile(r"^sm90_int8_w8a8_"),
+    re.compile(r"^sm90_fp8_grouped_moe_"),
+    re.compile(r"^sm90_block128_"),
     re.compile(r"^sm90_vllm_"),
     re.compile(r"^sm120_branch_"),
     re.compile(r"^sm120_semantics_"),
@@ -133,6 +135,10 @@ def category_from_name(name):
         return "INT8 activation quantization"
     if "azp" in name:
         return "Activation zero-point semantics"
+    if "block128" in name:
+        return "Block128 MoE coverage"
+    if "grouped_moe" in name:
+        return "Grouped MoE coverage"
     return "Functional"
 
 
@@ -160,15 +166,20 @@ def parse_fastllm_log(path, text):
         weight_layout = parameter(command_text, "scale_layout")
     if weight_layout == "perchannel":
         weight_layout = "per-channel"
+    op_name = op.group(1) if op else None
+    batch = integer_parameter(command_text, "batch")
+    topk = integer_parameter(command_text, "topk")
+    inter = integer_parameter(command_text, "inter")
+    is_moe = op_name in {"mergemoe_fp8", "fusedmoe_fp8"}
     return {
         "case": path.stem,
         "backend": "FastLLM",
         "category": category_from_name(path.stem),
         "result": result,
-        "op": op.group(1) if op else None,
-        "m": integer_parameter(command_text, "batch"),
-        "n": integer_parameter(command_text, "out") or
-             integer_parameter(command_text, "inter"),
+        "op": op_name,
+        "m": batch * topk if is_moe and batch and topk else batch,
+        "n": inter * 2 if is_moe and inter else
+             integer_parameter(command_text, "out") or inter,
         "k": integer_parameter(command_text, "in") or
              integer_parameter(command_text, "hidden"),
         "input_type": parameter(command_text, "input_type"),

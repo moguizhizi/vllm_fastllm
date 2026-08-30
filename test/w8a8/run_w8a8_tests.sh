@@ -241,6 +241,49 @@ sm90_fp8_grouped_moe_n8192_bf16 32 2048 4096 bf16 tensorwise 0
 sm90_fp8_grouped_moe_k8192_bf16 32 8192 768 bf16 perchannel 0
 sm90_fp8_grouped_moe_default_shared_bf16 128 2048 768 bf16 perchannel 1
 EOF
+
+            while read -r case_name batch input_type shared_expert; do
+                run_logged "${case_name}" env \
+                    FASTLLM_CUDA_TRITON=1 \
+                    FASTLLM_CUDA_TRITON_MERGE_MOE=1 \
+                    FASTLLM_CUDA_TRITON_PYTHON="${vllm_python}" \
+                    FASTLLM_CUDA_MOE_BLOCK128_SM90=1 \
+                    FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT=1 \
+                    FASTLLM_CUDA_W8A8_TRACE=1 \
+                    "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                    --param batch="${batch}" --param hidden=2048 \
+                    --param inter=768 --param experts=16 --param topk=4 \
+                    --param block=128 --param input_type="${input_type}" \
+                    --param weight_type=fp8 --param scale_layout=block128 \
+                    --param shared_expert="${shared_expert}" \
+                    --param path=check_block128 --warmup 0 --iters 1
+            done <<'EOF'
+sm90_block128_m4_bf16 1 bf16 0
+sm90_block128_m16_fp16 4 fp16 0
+sm90_block128_m64_bf16 16 bf16 0
+sm90_block128_m256_bf16 64 bf16 0
+sm90_block128_m512_shared_bf16 128 bf16 1
+EOF
+
+            while read -r case_name batch input_type; do
+                run_logged "${case_name}" env \
+                    FASTLLM_CUDA_TRITON=1 \
+                    FASTLLM_CUDA_TRITON_MERGE_MOE=1 \
+                    FASTLLM_CUDA_TRITON_PYTHON="${vllm_python}" \
+                    FASTLLM_CUDA_MOE_BLOCK128_SM90=1 \
+                    FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT=1 \
+                    FASTLLM_CUDA_W8A8_TRACE=1 \
+                    "${optest}" --op fusedmoe_fp8 --device cuda:0 \
+                    --param batch="${batch}" --param hidden=2048 \
+                    --param inter=768 --param experts=16 --param topk=4 \
+                    --param block=128 --param input_type="${input_type}" \
+                    --param scale_layout=block128 \
+                    --param path=check_block128 --warmup 0 --iters 1
+            done <<'EOF'
+sm90_block128_fused_m4_bf16 1 bf16
+sm90_block128_fused_m64_fp16 16 fp16
+sm90_block128_fused_m256_bf16 64 bf16
+EOF
         fi
 
         if [[ "${scope}" != int8-azp && "${scope}" != moe ]]; then
@@ -464,6 +507,45 @@ run_ops_performance() {
                 --param experts=16 --param topk=4 --param block=128 \
                 --param input_type=bf16 --param weight_type=fp8 \
                 --param scale_layout=perchannel \
+                --param path=operator --warmup 20 --iters 200
+
+            for batch in 1 16 64 256; do
+                run_logged "sm90_block128_moe_m$((batch * 4))_perf" env \
+                    FASTLLM_CUDA_TRITON=1 \
+                    FASTLLM_CUDA_TRITON_MERGE_MOE=1 \
+                    FASTLLM_CUDA_TRITON_PYTHON="${vllm_python}" \
+                    FASTLLM_CUDA_MOE_BLOCK128_SM90=1 \
+                    FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT=1 \
+                    "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                    --param batch="${batch}" --param hidden=2048 \
+                    --param inter=768 --param experts=16 --param topk=4 \
+                    --param block=128 --param input_type=bf16 \
+                    --param weight_type=fp8 --param scale_layout=block128 \
+                    --param path=operator --warmup 20 --iters 200
+            done
+
+            run_logged sm90_block128_moe_fallback_perf env \
+                FASTLLM_CUDA_TRITON=1 \
+                FASTLLM_CUDA_TRITON_MERGE_MOE=0 \
+                FASTLLM_CUDA_MOE_BLOCK128_SM90=0 \
+                FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT=0 \
+                "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                --param batch=256 --param hidden=2048 --param inter=768 \
+                --param experts=16 --param topk=4 --param block=128 \
+                --param input_type=bf16 --param weight_type=fp8 \
+                --param scale_layout=block128 \
+                --param path=operator --warmup 20 --iters 200
+
+            run_logged sm90_block128_fused_moe_perf env \
+                FASTLLM_CUDA_TRITON=1 \
+                FASTLLM_CUDA_TRITON_MERGE_MOE=1 \
+                FASTLLM_CUDA_TRITON_PYTHON="${vllm_python}" \
+                FASTLLM_CUDA_MOE_BLOCK128_SM90=1 \
+                FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT=1 \
+                "${optest}" --op fusedmoe_fp8 --device cuda:0 \
+                --param batch=256 --param hidden=2048 --param inter=768 \
+                --param experts=16 --param topk=4 --param block=128 \
+                --param input_type=bf16 --param scale_layout=block128 \
                 --param path=operator --warmup 20 --iters 200
         fi
     elif [[ "${arch}" == 120 ]]; then

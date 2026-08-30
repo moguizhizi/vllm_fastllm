@@ -18,6 +18,7 @@ SM90/SM120标准FP8 W8A8采用固定后端生命周期：每份权重在每张GP
 | SM90 standard FP8 dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16；FP8 E4M3 权重；weight `blockK=1, blockM=K` 且 scale 数为N（per-channel）或1（tensorwise）；激活动态 per-token；K%16=0、N%8=0；bias 为空或 FP32[N]；CUTLASS使用FP8 FastAccum与Persistent调度，小M按vLLM策略走SwapAB |
 | SM90 FP8 blockwise dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16；FP8 E4M3 权重；activation/weight block 都是 128x128；M/N/K 正数，K/N 为 128 倍数；bias 为空或 FP32[N] |
 | SM90 FP8 grouped MoE | 运行时精确 SM90；FP16/BF16输入输出同 dtype；SwiGLU；routed expert使用CUTLASS grouped GEMM，shared expert复用正式Dense FP8 W8A8路径后加权合并；expert为standard tensorwise/per-channel FP8 E4M3（不是blockwise）；合法route index；hidden/inter为16倍数；按vLLM对齐M<=4、M<=64、N>=8192、K>=8192和默认五档调度；不满足直接回现有MoE路径 |
+| SM90 FP8 Block128 MoE | 运行时精确 SM90；FP16/BF16输入输出同 dtype；SwiGLU；权重为FastLLM交错Block128格式，每128个FP8值后跟一个FP32 scale；激活动态量化为1x128；hidden/inter均为128倍数；同时覆盖独立expert的MergeMOE与3D gate/up/down的FusedMOE，二者复用Triton grouped路由、GEMM与归并；shared expert复用正式Dense Block128路径；失败回退已有CUDA实现 |
 | SM120 standard FP8 dense | 编译含 `120a`/`120f`，CUDA 12.9+；运行时精确 SM120，不含 SM121；FP16/BF16；FP8 E4M3 权重；weight `blockK=1, blockM=K` 且 scale 数为N（per-channel）或1（tensorwise）；激活动态 per-token；K%16=0、N%8=0；bias 为空或 FP32[N] |
 
 ## 命令
@@ -47,7 +48,8 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-azp-function" \
 ```
 
 SM90标准FP8 W8A8 grouped MoE可单独执行；该入口覆盖五档CUTLASS调度、
-FP16/BF16、tensorwise/per-channel Scale和shared expert，并生成XLSX汇总：
+FP16/BF16、tensorwise/per-channel Scale、Block128 Triton grouped路径和
+shared expert，并生成XLSX汇总：
 
 ```bash
 W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-fp8-moe-function" \

@@ -3116,7 +3116,8 @@ namespace {
                     for (int c = 0; c < block; c++) {
                         blockPtr[c] = static_cast<uint8_t>(0x20 + ((r * 131 + b * 17 + c + (int)(seed * 11.0f)) & 0x1f));
                     }
-                    float scale = 0.0125f + 0.0001f * (float)((r + b + (int)seed) % 11);
+                    float scale = 0.0125f + 0.0001f *
+                        (float)(((r / block) + b + (int)seed) % 11);
                     memcpy(blockPtr + block, &scale, sizeof(float));
                 }
             }
@@ -4847,6 +4848,22 @@ namespace {
             weight.ToDevice(fastllm::DataDevice::CUDA);
         }
 
+        /**
+         * 构造与vLLM 128x128 scale语义一致的交错FP8测试权重。
+         *
+         * @param weight 返回CPU初始化后迁移至CUDA的Block128权重。
+         * @param rows 逻辑输出行数。
+         * @param cols 逻辑输入列数，必须按128对齐。
+         * @param block scale块大小，当前必须为128。
+         * @param seed 固定测试数据的确定性种子。
+         */
+        static void InitFp8PackedBlock128Weight(
+            fastllm::Data &weight, int rows, int cols, int block, float seed) {
+            LinearFp8Block128BenchState::InitPackedWeight(
+                weight, rows, cols, block, seed);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
         static void InitFp8PerChannelWeight(fastllm::Data &weight, int rows,
                                              int cols, float seed) {
             weight.dataType = fastllm::DataType::FP8_E4M3;
@@ -4977,9 +4994,14 @@ namespace {
                         *ownedWeights[0], inter * 2, hidden, 101.0f);
                     InitFp8TensorwiseWeight(
                         *ownedWeights[1], hidden, inter, 117.0f);
+                } else if (scaleLayout == "block128") {
+                    InitFp8PackedBlock128Weight(
+                        *ownedWeights[0], inter * 2, hidden, block, 101.0f);
+                    InitFp8PackedBlock128Weight(
+                        *ownedWeights[1], hidden, inter, block, 117.0f);
                 } else {
-                    InitFp8Weight(*ownedWeights[0], inter * 2, hidden, block, 101.0f);
-                    InitFp8Weight(*ownedWeights[1], hidden, inter, block, 117.0f);
+                    throw std::runtime_error(
+                        "scale_layout must be block128, perchannel or tensorwise");
                 }
                 weights[0] = ownedWeights[0].get();
                 weights[1] = ownedWeights[1].get();
@@ -4999,8 +5021,12 @@ namespace {
                         InitFp8TensorwiseWeight(*ownedWeights[idx], inter * 2, hidden, (float)e + 0.3f);
                         InitFp8TensorwiseWeight(*ownedWeights[idx + 1], hidden, inter, (float)e + 13.7f);
                     } else if (scaleLayout == "block128") {
-                        InitFp8Weight(*ownedWeights[idx], inter * 2, hidden, block, (float)e + 0.3f);
-                        InitFp8Weight(*ownedWeights[idx + 1], hidden, inter, block, (float)e + 13.7f);
+                        InitFp8PackedBlock128Weight(
+                            *ownedWeights[idx], inter * 2, hidden, block,
+                            (float)e + 0.3f);
+                        InitFp8PackedBlock128Weight(
+                            *ownedWeights[idx + 1], hidden, inter, block,
+                            (float)e + 13.7f);
                     } else {
                         throw std::runtime_error(
                             "scale_layout must be block128, perchannel or tensorwise");
@@ -5072,7 +5098,9 @@ namespace {
 
         void CheckWarpSpecialization() {
 #ifdef USE_CUDA
-            if (weightType != "fp8" || batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
+            if (weightType != "fp8" || scaleLayout == "block128" ||
+                batch != 1 || topk != 8 || hidden != 2048 ||
+                inter != 256 || block != 128) {
                 return;
             }
             if (!RunIndexed(referenceW1, referenceOutput, false)) {
@@ -5210,6 +5238,48 @@ namespace {
                     throw std::runtime_error(
                         "SM90 grouped FP8 CUTLASS differs from CUDA fallback");
                 }
+            } else if (path == "check_block128") {
+                if (weightType != "fp8" || scaleLayout != "block128" ||
+                    (input.dataType != fastllm::DataType::FLOAT16 &&
+                     input.dataType != fastllm::DataType::BFLOAT16)) {
+                    throw std::runtime_error(
+                        "check_block128 requires fp16/bf16 + packed Block128 FP8");
+                }
+                setenv("FASTLLM_CUDA_TRITON", "1", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  sharedScale, output, 0,
+                                  fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "0", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "0", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "0", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  sharedScale, referenceOutput, 0,
+                                  fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                std::printf(
+                    "SM90 Block128 FP8 W8A8 MoE correctness: "
+                    "max_abs_diff=%.6f mean_abs_diff=%.6f "
+                    "failed_elements=%zu result=%s\n",
+                    stats.maxAbsDiff, stats.meanAbsDiff,
+                    stats.failedElements, stats.passed ? "PASS" : "FAIL");
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "SM90 Block128 Triton MoE differs from CUDA fallback");
+                }
             } else if (path == "legacy") {
                 if (!RunIndexed(w1, output, false)) {
                     throw std::runtime_error("legacy MergeMOE FP8 launch failed");
@@ -5220,7 +5290,7 @@ namespace {
                 }
             } else {
                 throw std::runtime_error(
-                    "path must be operator, check_fp8, check_nvfp4, "
+                    "path must be operator, check_fp8, check_block128, check_nvfp4, "
                     "check_nvfp4_lifecycle, legacy or warp");
             }
         }
@@ -5331,12 +5401,20 @@ namespace {
         int experts = 16;
         int block = 128;
         std::string path = "warp";
+        std::string scaleLayout = "separate";
         fastllm::Data input, index, score;
         fastllm::Data gate, up, down;
         fastllm::Data w1, output, referenceW1, referenceOutput;
 
         static void InitWeight(fastllm::Data &weight, const std::vector<int> &dims,
-                               int block, int seed) {
+                               int block, int seed, const std::string &scaleLayout) {
+            if (scaleLayout == "block128") {
+                LinearFp8Block128BenchState::InitPackedWeight(
+                    weight, dims[0] * dims[1], dims[2], block, (float)seed);
+                weight.Resize(dims);
+                weight.ToDevice(fastllm::DataDevice::CUDA);
+                return;
+            }
             weight.dataType = fastllm::DataType::FP8_E4M3;
             weight.UpdateUnitSize();
             weight.Resize(dims);
@@ -5362,6 +5440,15 @@ namespace {
         bool RunDirect(fastllm::Data &work, fastllm::Data &result,
                        bool allowWarpSpecialization) {
 #ifdef USE_CUDA
+            if (scaleLayout == "block128") {
+                return input.dataType == fastllm::DataType::FLOAT16 ?
+                    FastllmCudaHalfFusedMOEFP8E4M3Block128(
+                        input, gate, up, down, index, score, work, result,
+                        batch, topk, hidden, inter, experts, 0.0f) :
+                    FastllmCudaBFloat16FusedMOEFP8E4M3Block128(
+                        input, gate, up, down, index, score, work, result,
+                        batch, topk, hidden, inter, experts, 0.0f);
+            }
             if (input.dataType == fastllm::DataType::FLOAT16) {
                 return FastllmCudaHalfFusedMOEFP8E4M3(
                     input, gate, up, down, index, score, work, result,
@@ -5382,7 +5469,8 @@ namespace {
 
         void CheckWarpSpecialization() {
 #ifdef USE_CUDA
-            if (batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
+            if (scaleLayout == "block128" || batch != 1 || topk != 8 ||
+                hidden != 2048 || inter != 256 || block != 128) {
                 return;
             }
             if (!RunDirect(referenceW1, referenceOutput, false)) {
@@ -5418,6 +5506,7 @@ namespace {
             experts = params.GetInt("experts");
             block = params.GetInt("block");
             path = params.GetString("path");
+            scaleLayout = params.GetString("scale_layout");
             FastllmCudaSetDevice(0);
 
             fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
@@ -5451,9 +5540,9 @@ namespace {
             index.ToDevice(fastllm::DataDevice::CUDA);
             score.ToDevice(fastllm::DataDevice::CUDA);
 
-            InitWeight(gate, {experts, inter, hidden}, block, 3);
-            InitWeight(up, {experts, inter, hidden}, block, 17);
-            InitWeight(down, {experts, hidden, inter}, block, 29);
+            InitWeight(gate, {experts, inter, hidden}, block, 3, scaleLayout);
+            InitWeight(up, {experts, inter, hidden}, block, 17, scaleLayout);
+            InitWeight(down, {experts, hidden, inter}, block, 29, scaleLayout);
             ForceDeviceSync();
             CheckWarpSpecialization();
 #else
@@ -5463,7 +5552,47 @@ namespace {
         }
 
         void Run() {
-            if (path == "legacy") {
+            if (path == "operator") {
+                fastllm::FusedMOE(input, index, score, gate, up, down, w1,
+                                  output, 0, fastllm::MoeGateSwiglu, 0.0f);
+            } else if (path == "check_block128") {
+                if (scaleLayout != "block128") {
+                    throw std::runtime_error(
+                        "check_block128 requires packed Block128 FP8 weights");
+                }
+                setenv("FASTLLM_CUDA_TRITON", "1", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+                fastllm::FusedMOE(input, index, score, gate, up, down, w1,
+                                  output, 0, fastllm::MoeGateSwiglu, 0.0f);
+                ForceDeviceSync();
+
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "0", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "0", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "0", 1);
+                fastllm::FusedMOE(
+                    input, index, score, gate, up, down, referenceW1,
+                    referenceOutput, 0, fastllm::MoeGateSwiglu, 0.0f);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                std::printf(
+                    "SM90 Block128 FP8 W8A8 FusedMOE correctness: "
+                    "max_abs_diff=%.6f mean_abs_diff=%.6f "
+                    "failed_elements=%zu result=%s\n",
+                    stats.maxAbsDiff, stats.meanAbsDiff,
+                    stats.failedElements, stats.passed ? "PASS" : "FAIL");
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "SM90 Block128 Triton FusedMOE differs from CUDA fallback");
+                }
+            } else if (path == "legacy") {
                 if (!RunDirect(w1, output, false)) {
                     throw std::runtime_error("legacy FusedMOE FP8 launch failed");
                 }
@@ -5472,7 +5601,8 @@ namespace {
                     throw std::runtime_error("warp FusedMOE FP8 launch failed");
                 }
             } else {
-                throw std::runtime_error("path must be legacy or warp");
+                throw std::runtime_error(
+                    "path must be operator, check_block128, legacy or warp");
             }
         }
     };
@@ -5526,7 +5656,10 @@ namespace {
                 params.Add("topk", "8", "experts per token");
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("path", "warp", "legacy or warp");
+                params.Add("path", "warp",
+                           "operator, check_block128, legacy or warp");
+                params.Add("scale_layout", "separate",
+                           "separate or block128");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
