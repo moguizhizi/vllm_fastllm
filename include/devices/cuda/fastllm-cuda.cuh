@@ -1021,6 +1021,34 @@ inline bool TryCudaCutlassNvfp4W4A4(
 inline bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &) {
     return false;
 }
+/**
+ * 在未启用CUTLASS NVFP4时拒绝取得W4A4权重cache。
+ *
+ * 本占位实现只用于保持不同CUDA架构下的接口完整性；它不创建cache，
+ * 并清空所有可选输出，调用方应据false返回值回退或拒绝对应图路径。
+ *
+ * @param weight         未使用的逻辑权重。
+ * @param inFeatures     未使用的输入特征数。
+ * @param outFeatures    未使用的输出特征数。
+ * @param packedWeight   可选输出，存在时写为nullptr。
+ * @param scales         可选输出，存在时写为nullptr。
+ * @param alpha          可选输出，存在时写为nullptr。
+ * @return 始终返回false，表示当前构建没有CUTLASS NVFP4权重cache。
+ */
+inline bool FastllmCudaPrepareNvfp4W4A4Weight(
+        fastllm::Data &weight, int inFeatures, int outFeatures,
+        const uint8_t **packedWeight, const uint8_t **scales,
+        const float **alpha) {
+    (void)weight;
+    (void)inFeatures;
+    (void)outFeatures;
+
+    if (packedWeight != nullptr) *packedWeight = nullptr;
+    if (scales != nullptr) *scales = nullptr;
+    if (alpha != nullptr) *alpha = nullptr;
+
+    return false;
+}
 inline FastllmCudaNvfp4BackendState FastllmCudaGetNvfp4W4A4BackendState(
         const fastllm::Data &, int) {
     return FastllmCudaNvfp4BackendState::Rejected;
