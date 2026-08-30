@@ -511,7 +511,6 @@ namespace fastllm {
 
     struct LogitsDebugOptions {
         bool printLogits = false;
-        bool traceSamplingTop1 = false;
         std::string dumpPath;
     };
 
@@ -524,8 +523,6 @@ namespace fastllm {
             LogitsDebugOptions ret;
             ret.printLogits = GetFastllmEnv().printLogits ||
                               IsLogitsEnvEnabled(std::getenv("FASTLLM_PRINT_LOGITS"));
-            ret.traceSamplingTop1 = IsLogitsEnvEnabled(
-                std::getenv("FASTLLM_SAMPLING_TOP1_TRACE"));
             const char *path = std::getenv("FASTLLM_DSV4_DUMP_LOGITS");
             if (path != nullptr) {
                 ret.dumpPath = path;
@@ -549,8 +546,95 @@ namespace fastllm {
      * @return true表示输出CUDA与CPU Top1对照日志；false表示保持正式路径。
      */
     static bool ShouldTraceSamplingTop1() {
-        return GetLogitsDebugOptions().traceSamplingTop1;
+        return IsLogitsEnvEnabled(
+            std::getenv("FASTLLM_SAMPLING_TOP1_TRACE"));
     }
+
+#ifdef USE_CUDA
+    /**
+     * 比较分片CUDA采样Token与同一组分片logits的CPU argmax。
+     *
+     * 本函数只读每个设备上的词表分片，将分片逐个复制到CPU并按照
+     * tpRanges还原全局Token ID。它不汇总、不释放也不重置logits的多卡
+     * 状态，因此不会改变正式采样后的张量所有权和生命周期。
+     *
+     * @param logits       按词表维分片的FLOAT32 logits。
+     * @param cudaTokens   正式分片CUDA路径为每个batch选出的全局Token ID。
+     */
+    static void TraceTensorParallelSamplingTop1(
+            const Data &logits, const std::vector<int> &cudaTokens) {
+        const int batch = (int)cudaTokens.size();
+        const int vocabSize = logits.dims.back();
+        std::vector<int> cpuTokens(batch, -1);
+        std::vector<float> cpuScores(
+            batch, -std::numeric_limits<float>::infinity());
+        std::vector<float> cudaScores(
+            batch, -std::numeric_limits<float>::infinity());
+
+        for (const auto &deviceData : logits.multiDeviceDatas) {
+            const int device = deviceData.first;
+            const Data *local = deviceData.second;
+            auto rangesIt = logits.tpRanges.find(device);
+            AssertInFastLLM(local != nullptr && local->cudaData != nullptr &&
+                            local->dataType == DataType::FLOAT32 &&
+                            !local->dims.empty() &&
+                            rangesIt != logits.tpRanges.end(),
+                            "Tensor-parallel logits are missing a local CUDA shard.\n");
+
+            const int localVocab = local->dims.back();
+            AssertInFastLLM(localVocab > 0 &&
+                            local->Count(0) / localVocab ==
+                                (unsigned long long)batch,
+                            "Tensor-parallel logits shard shape mismatch.\n");
+
+            std::vector<int> globalIds(localVocab, -1);
+            int localOffset = 0;
+            for (const auto &range : rangesIt->second) {
+                const int len = range.second - range.first;
+                AssertInFastLLM(range.first >= 0 && range.second <= vocabSize &&
+                                len >= 0 && localOffset + len <= localVocab,
+                                "Tensor-parallel logits have an invalid shard range.\n");
+                for (int i = 0; i < len; ++i) {
+                    globalIds[localOffset + i] = range.first + i;
+                }
+                localOffset += len;
+            }
+            AssertInFastLLM(localOffset == localVocab,
+                            "Tensor-parallel logits shard size mismatch.\n");
+
+            std::vector<float> values((size_t)batch * localVocab);
+            FastllmCudaSetDevice(device);
+            FastllmCudaCopyFromDeviceToHost(
+                values.data(), local->cudaData,
+                values.size() * sizeof(float));
+            for (int b = 0; b < batch; ++b) {
+                for (int localId = 0; localId < localVocab; ++localId) {
+                    const int globalId = globalIds[localId];
+                    const float value =
+                        values[(size_t)b * localVocab + localId];
+                    if (globalId == cudaTokens[b]) {
+                        cudaScores[b] = value;
+                    }
+                    if (value > cpuScores[b] ||
+                        (value == cpuScores[b] &&
+                         (cpuTokens[b] < 0 || globalId < cpuTokens[b]))) {
+                        cpuScores[b] = value;
+                        cpuTokens[b] = globalId;
+                    }
+                }
+            }
+        }
+
+        for (int b = 0; b < batch; ++b) {
+            printf("[fastllm][sampling-top1] cuda_token=%d "
+                   "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
+                   "match=%s batch_index=%d\n",
+                   cudaTokens[b], cpuTokens[b], cudaScores[b], cpuScores[b],
+                   cudaTokens[b] == cpuTokens[b] ? "true" : "false", b);
+        }
+        fflush(stdout);
+    }
+#endif
 
     /**
      * 比较正式CUDA采样Token与同一份完整logits的CPU argmax。
@@ -665,8 +749,7 @@ namespace fastllm {
                 precomputedReadyEvents);
             if (sampled) {
                 if (ShouldTraceSamplingTop1()) {
-                    GatherTensorParallelLogitsToRoot(logits);
-                    TraceSamplingTop1(logits, lastRet);
+                    TraceTensorParallelSamplingTop1(logits, lastRet);
                 }
                 return;
             }

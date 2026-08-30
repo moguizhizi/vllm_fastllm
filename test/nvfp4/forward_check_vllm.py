@@ -168,6 +168,7 @@ def generate_fastllm_token_ids(model, tokenizer, prompt, max_tokens):
 
 
 def run_fastllm(args):
+    sampling_trace = os.environ.pop("FASTLLM_SAMPLING_TOP1_TRACE", None)
     from transformers import AutoTokenizer
 
     # 在加载FastLLM动态库前取得同一份HF tokenizer，避免FastLLM内部
@@ -183,10 +184,15 @@ def run_fastllm(args):
     prompt = render_prompt(tokenizer, get_messages(args.case_index))
     model.direct_query = True
 
+    if sampling_trace is not None:
+        os.environ["FASTLLM_SAMPLING_TOP1_TRACE"] = sampling_trace
     print(FASTLLM_PRODUCTION_TRACE_BEGIN, flush=True)
-    input_ids, generated_ids = generate_fastllm_token_ids(
-        model, tokenizer, prompt, args.tokens)
-    print(FASTLLM_PRODUCTION_TRACE_END, flush=True)
+    try:
+        input_ids, generated_ids = generate_fastllm_token_ids(
+            model, tokenizer, prompt, args.tokens)
+    finally:
+        print(FASTLLM_PRODUCTION_TRACE_END, flush=True)
+        os.environ.pop("FASTLLM_SAMPLING_TOP1_TRACE", None)
 
     # response_logits会令FastLLM进入完整logits返回分支，因此这里只把它
     # 当作独立诊断探针；功能结论始终使用上面的正式生产生成结果。
