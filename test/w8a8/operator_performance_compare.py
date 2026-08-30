@@ -179,6 +179,9 @@ def run_fastllm(args, log_dir):
 def run_vllm(args):
     import torch
     from vllm import _custom_ops as ops
+    from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+        CutlassFP8ScaledMMLinearKernel,
+    )
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         per_token_group_quant_fp8,
     )
@@ -187,6 +190,15 @@ def run_vllm(args):
     fp8 = torch.float8_e4m3fn
     for name, m, n, k in selected_cases(args):
         samples = []
+        pad_k = 0 if args.scale_layout == "block128" else (16 - k % 16) % 16
+        pad_n = 0 if args.scale_layout == "block128" else (16 - n % 16) % 16
+        dense_kernel = None
+        if args.scale_layout == "perchannel":
+            # 复用vLLM正式Linear运行入口；静态权重padding在模型加载阶段
+            # 完成，动态激活padding和输出slice由apply_scaled_mm计入延迟。
+            dense_kernel = object.__new__(CutlassFP8ScaledMMLinearKernel)
+            dense_kernel.logical_output_size = n
+
         for _ in range(args.outer_repeats):
             torch.cuda.empty_cache()
             gc.collect()
@@ -204,17 +216,28 @@ def run_vllm(args):
                 weight_scale = torch.empty(
                     (1, n), device="cuda",
                     dtype=torch.float32).uniform_(0.001, 0.01)
+                if pad_k or pad_n:
+                    weight = torch.nn.functional.pad(
+                        weight.t().contiguous(),
+                        (0, pad_k, 0, pad_n)).t()
+                    if pad_n:
+                        weight_scale = torch.nn.functional.pad(
+                            weight_scale, (0, pad_n), value=1.0)
 
             def run():
                 if args.scale_layout == "block128":
                     quantized, token_scale = per_token_group_quant_fp8(
                         source, 128, use_ue8m0=False)
+                    return ops.cutlass_scaled_mm(
+                        quantized, weight, token_scale, weight_scale,
+                        torch.bfloat16, None)
                 else:
                     quantized, token_scale = ops.scaled_fp8_quant(
                         source, scale=None, use_per_token_if_dynamic=True)
-                return ops.cutlass_scaled_mm(
-                    quantized, weight, token_scale, weight_scale,
-                    torch.bfloat16, None)
+                    return dense_kernel.apply_scaled_mm(
+                        A=quantized, B=weight, out_dtype=torch.bfloat16,
+                        As=token_scale, Bs=weight_scale, bias=None,
+                        output_shape=[m, n])
 
             for _ in range(args.warmup):
                 output = run()
@@ -235,7 +258,10 @@ def run_vllm(args):
                 "vllm", samples, m, n, k,
                 ("per_token_group_quant_fp8(128) + cutlass_scaled_mm"
                  if args.scale_layout == "block128"
-                 else "scaled_fp8_quant + cutlass_scaled_mm")),
+                 else (
+                     "scaled_fp8_quant + pad + cutlass_scaled_mm + slice"
+                     if pad_k or pad_n
+                     else "scaled_fp8_quant + cutlass_scaled_mm"))),
         })
         print(json.dumps(rows[-1]), flush=True)
     return rows
