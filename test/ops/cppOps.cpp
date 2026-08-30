@@ -111,8 +111,10 @@ namespace {
     struct ComparisonStats {
         bool passed = true;
         float maxAbsDiff = 0.0f;
+        float meanAbsDiff = 0.0f;
         float maxRelDiff = 0.0f;
         float maxToleranceExcess = 0.0f;
+        size_t failedElements = 0;
         size_t mismatchIndex = 0;
         float expected = 0.0f;
         float actual = 0.0f;
@@ -1072,8 +1074,10 @@ namespace {
         std::vector<float> actualVec = ToFloatVector(actual);
 
         ComparisonStats stats;
+        double absDiffSum = 0.0;
         for (size_t i = 0; i < expectedVec.size(); i++) {
             float absDiff = std::fabs(expectedVec[i] - actualVec[i]);
+            absDiffSum += absDiff;
             float relDiff = absDiff / std::max(std::fabs(expectedVec[i]), 1e-6f);
             stats.maxAbsDiff = std::max(stats.maxAbsDiff, absDiff);
             stats.maxRelDiff = std::max(stats.maxRelDiff, relDiff);
@@ -1086,7 +1090,13 @@ namespace {
                 stats.expected = expectedVec[i];
                 stats.actual = actualVec[i];
             }
+            if (toleranceExcess > 0.0f) {
+                stats.failedElements++;
+            }
         }
+        stats.meanAbsDiff = expectedVec.empty()
+            ? 0.0f
+            : static_cast<float>(absDiffSum / expectedVec.size());
         return stats;
     }
 
@@ -4855,6 +4865,14 @@ namespace {
             weight.ToDevice(fastllm::DataDevice::CUDA);
         }
 
+        static void InitFp8TensorwiseWeight(fastllm::Data &weight, int rows,
+                                             int cols, float seed) {
+            InitFp8PerChannelWeight(weight, rows, cols, seed);
+            weight.scales.resize(1);
+            weight.scales[0] = 0.015f +
+                0.0001f * static_cast<float>(static_cast<int>(seed) % 7);
+        }
+
         static void InitNvfp4Weight(fastllm::Data &weight, int rows, int cols, int seed) {
             weight.dataType = fastllm::DataType::NVFP4_BLOCK_16;
             weight.blockM = 16;
@@ -4949,6 +4967,16 @@ namespace {
                 if (weightType == "nvfp4") {
                     InitNvfp4Weight(*ownedWeights[0], inter * 2, hidden, 101);
                     InitNvfp4Weight(*ownedWeights[1], hidden, inter, 117);
+                } else if (scaleLayout == "perchannel") {
+                    InitFp8PerChannelWeight(
+                        *ownedWeights[0], inter * 2, hidden, 101.0f);
+                    InitFp8PerChannelWeight(
+                        *ownedWeights[1], hidden, inter, 117.0f);
+                } else if (scaleLayout == "tensorwise") {
+                    InitFp8TensorwiseWeight(
+                        *ownedWeights[0], inter * 2, hidden, 101.0f);
+                    InitFp8TensorwiseWeight(
+                        *ownedWeights[1], hidden, inter, 117.0f);
                 } else {
                     InitFp8Weight(*ownedWeights[0], inter * 2, hidden, block, 101.0f);
                     InitFp8Weight(*ownedWeights[1], hidden, inter, block, 117.0f);
@@ -4967,11 +4995,15 @@ namespace {
                     if (scaleLayout == "perchannel") {
                         InitFp8PerChannelWeight(*ownedWeights[idx], inter * 2, hidden, (float)e + 0.3f);
                         InitFp8PerChannelWeight(*ownedWeights[idx + 1], hidden, inter, (float)e + 13.7f);
+                    } else if (scaleLayout == "tensorwise") {
+                        InitFp8TensorwiseWeight(*ownedWeights[idx], inter * 2, hidden, (float)e + 0.3f);
+                        InitFp8TensorwiseWeight(*ownedWeights[idx + 1], hidden, inter, (float)e + 13.7f);
                     } else if (scaleLayout == "block128") {
                         InitFp8Weight(*ownedWeights[idx], inter * 2, hidden, block, (float)e + 0.3f);
                         InitFp8Weight(*ownedWeights[idx + 1], hidden, inter, block, (float)e + 13.7f);
                     } else {
-                        throw std::runtime_error("scale_layout must be block128 or perchannel");
+                        throw std::runtime_error(
+                            "scale_layout must be block128, perchannel or tensorwise");
                     }
                 } else {
                     throw std::runtime_error("weight_type must be fp8 or nvfp4");
@@ -5144,24 +5176,36 @@ namespace {
                         "fixed NVFP4 Legacy output changed after retry conditions recovered");
                 }
             } else if (path == "check_fp8") {
-                if (weightType != "fp8" || scaleLayout != "perchannel" ||
-                    input.dataType != fastllm::DataType::BFLOAT16) {
+                if (weightType != "fp8" ||
+                    (scaleLayout != "perchannel" &&
+                     scaleLayout != "tensorwise") ||
+                    (input.dataType != fastllm::DataType::FLOAT16 &&
+                     input.dataType != fastllm::DataType::BFLOAT16)) {
                     throw std::runtime_error(
-                        "check_fp8 requires bf16 + fp8 + perchannel scales");
+                        "check_fp8 requires fp16/bf16 + fp8 + "
+                        "perchannel/tensorwise scales");
                 }
                 setenv("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", "0", 1);
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   referenceW1, w2, w3, curInput, curOutput,
-                                  0.0f, referenceOutput, 0, fastllm::MoeGateSwiglu);
+                                  sharedScale, referenceOutput, 0,
+                                  fastllm::MoeGateSwiglu);
                 ForceDeviceSync();
                 setenv("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", "1", 1);
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
-                                  0.0f, output, 0, fastllm::MoeGateSwiglu);
+                                  sharedScale, output, 0,
+                                  fastllm::MoeGateSwiglu);
                 ForceDeviceSync();
                 ComparisonStats stats = CompareData(
                     ConvertToFloat32Data(referenceOutput),
                     ConvertToFloat32Data(output), 0.25f, 0.25f);
+                std::printf(
+                    "SM90 FP8 W8A8 grouped MoE correctness: "
+                    "max_abs_diff=%.6f mean_abs_diff=%.6f "
+                    "failed_elements=%zu result=%s\n",
+                    stats.maxAbsDiff, stats.meanAbsDiff,
+                    stats.failedElements, stats.passed ? "PASS" : "FAIL");
                 if (!stats.passed) {
                     throw std::runtime_error(
                         "SM90 grouped FP8 CUTLASS differs from CUDA fallback");
@@ -5244,7 +5288,8 @@ namespace {
                 params.Add("path", "operator",
                            "operator, check_fp8, check_nvfp4, check_nvfp4_lifecycle, legacy or warp");
                 params.Add("weight_type", "fp8", "fp8 or nvfp4");
-                params.Add("scale_layout", "block128", "FP8 scale layout: block128 or perchannel");
+                params.Add("scale_layout", "block128",
+                           "FP8 scale layout: block128, perchannel or tensorwise");
                 params.Add("gate_type", "swiglu", "swiglu or geglu");
                 params.Add("shared_expert", "0", "1 enables one separately computed shared expert");
                 return params;

@@ -54,6 +54,7 @@ ops_scope() {
         ops-dense|ops-dense-*) printf 'dense\n' ;;
         ops-block128|ops-block128-*) printf 'block128\n' ;;
         ops-int8-azp|ops-int8-azp-*) printf 'int8-azp\n' ;;
+        ops-moe|ops-moe-*) printf 'moe\n' ;;
         *) printf 'all\n' ;;
     esac
 }
@@ -217,20 +218,32 @@ EOF
                 --param input_type=bf16 --param check=1 --warmup 0 --iters 1
         fi
 
-        if [[ "${scope}" == all ]]; then
-            run_logged sm90_fp8_grouped_moe_function env \
-                FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
-                FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
-                FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=1 \
-                "${optest}" --op mergemoe_fp8 --device cuda:0 \
-                --param batch=128 --param hidden=2048 --param inter=768 \
-                --param experts=16 --param topk=4 --param block=128 \
-                --param input_type=bf16 --param weight_type=fp8 \
-                --param scale_layout=perchannel \
-                --param path=check_fp8 --warmup 0 --iters 1
+        if [[ "${scope}" == all || "${scope}" == moe ]]; then
+            while read -r case_name batch hidden inter input_type scale_layout shared_expert; do
+                run_logged "${case_name}" env \
+                    FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
+                    FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
+                    FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=1 \
+                    FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90_STRICT=1 \
+                    FASTLLM_CUDA_W8A8_TRACE=1 \
+                    FASTLLM_CUDA_TRITON_MERGE_MOE=0 \
+                    "${optest}" --op mergemoe_fp8 --device cuda:0 \
+                    --param batch="${batch}" --param hidden="${hidden}" \
+                    --param inter="${inter}" --param experts=16 --param topk=4 \
+                    --param block=128 --param input_type="${input_type}" \
+                    --param weight_type=fp8 --param scale_layout="${scale_layout}" \
+                    --param shared_expert="${shared_expert}" \
+                    --param path=check_fp8 --warmup 0 --iters 1
+            done <<'EOF'
+sm90_fp8_grouped_moe_m4_bf16 1 2048 768 bf16 perchannel 0
+sm90_fp8_grouped_moe_m64_fp16 16 2048 768 fp16 perchannel 0
+sm90_fp8_grouped_moe_n8192_bf16 32 2048 4096 bf16 tensorwise 0
+sm90_fp8_grouped_moe_k8192_bf16 32 8192 768 bf16 perchannel 0
+sm90_fp8_grouped_moe_default_shared_bf16 128 2048 768 bf16 perchannel 1
+EOF
         fi
 
-        if [[ "${scope}" != int8-azp ]]; then
+        if [[ "${scope}" != int8-azp && "${scope}" != moe ]]; then
             run_logged "sm90_vllm_official_functional_${scope}" \
                 "${vllm_python}" test/w8a8/operator_functional_vllm.py \
                 --scale-layout "${scope}"
@@ -426,11 +439,13 @@ run_ops_performance() {
                 --warmup 20 --iters 200 --outer-repeats 5
         fi
 
-        if [[ "${scope}" == all ]]; then
+        if [[ "${scope}" == all || "${scope}" == moe ]]; then
             run_logged sm90_fp8_grouped_moe_perf env \
                 FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
                 FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
                 FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=1 \
+                FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90_STRICT=1 \
+                FASTLLM_CUDA_TRITON_MERGE_MOE=0 \
                 "${optest}" --op mergemoe_fp8 --device cuda:0 \
                 --param batch=256 --param hidden=2048 --param inter=768 \
                 --param experts=16 --param topk=4 --param block=128 \
@@ -442,6 +457,8 @@ run_ops_performance() {
                 FASTLLM_CUDA_MOE_GROUPED_INDEXED=1 \
                 FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH=1 \
                 FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=0 \
+                FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90_STRICT=0 \
+                FASTLLM_CUDA_TRITON_MERGE_MOE=0 \
                 "${optest}" --op mergemoe_fp8 --device cuda:0 \
                 --param batch=256 --param hidden=2048 --param inter=768 \
                 --param experts=16 --param topk=4 --param block=128 \
@@ -513,6 +530,9 @@ case "${suite}" in
     ops-int8-azp-functional) run_ops_functional ;;
     ops-int8-azp-performance) run_ops_performance ;;
     ops-int8-azp) run_ops_functional; run_ops_performance ;;
+    ops-moe-functional) run_ops_functional ;;
+    ops-moe-performance) run_ops_performance ;;
+    ops-moe) run_ops_functional; run_ops_performance ;;
     ops-functional) run_ops_functional ;;
     ops-performance) run_ops_performance ;;
     ops-compare) run_ops_performance ;;
@@ -521,7 +541,7 @@ case "${suite}" in
     model-performance) run_model_performance ;;
     all) run_ops_functional; run_ops_performance; run_forward; run_model_performance ;;
     *)
-        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
+        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-moe-functional|ops-moe-performance|ops-moe|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
         exit 2
         ;;
 esac

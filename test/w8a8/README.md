@@ -17,7 +17,7 @@ SM90/SM120标准FP8 W8A8采用固定后端生命周期：每份权重在每张GP
 | SM90 INT8 dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16 输入输出同 dtype；2D signed-I8 权重；权重必须 symmetric、无 zero/min；每输出通道一个 FP32 scale；激活支持动态 per-token symmetric/asymmetric以及静态 tensorwise symmetric/asymmetric INT8；非对称路径在CUTLASS epilogue融合AZP修正；K%16=0、N%8=0；bias 为空或 FP32[N] |
 | SM90 standard FP8 dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16；FP8 E4M3 权重；weight `blockK=1, blockM=K` 且 scale 数为N（per-channel）或1（tensorwise）；激活动态 per-token；K%16=0、N%8=0；bias 为空或 FP32[N]；CUTLASS使用FP8 FastAccum与Persistent调度，小M按vLLM策略走SwapAB |
 | SM90 FP8 blockwise dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16；FP8 E4M3 权重；activation/weight block 都是 128x128；M/N/K 正数，K/N 为 128 倍数；bias 为空或 FP32[N] |
-| SM90 FP8 grouped MoE | 运行时精确 SM90；当前仅 BF16；SwiGLU；无 shared expert；expert 为 standard per-channel FP8 E4M3（不是 blockwise）；合法 route index；默认 batch>=16；hidden/inter 为 16 倍数；不满足直接回现有 MoE 路径 |
+| SM90 FP8 grouped MoE | 运行时精确 SM90；FP16/BF16输入输出同 dtype；SwiGLU；routed expert使用CUTLASS grouped GEMM，shared expert复用正式Dense FP8 W8A8路径后加权合并；expert为standard tensorwise/per-channel FP8 E4M3（不是blockwise）；合法route index；hidden/inter为16倍数；按vLLM对齐M<=4、M<=64、N>=8192、K>=8192和默认五档调度；不满足直接回现有MoE路径 |
 | SM120 standard FP8 dense | 编译含 `120a`/`120f`，CUDA 12.9+；运行时精确 SM120，不含 SM121；FP16/BF16；FP8 E4M3 权重；weight `blockK=1, blockM=K` 且 scale 数为N（per-channel）或1（tensorwise）；激活动态 per-token；K%16=0、N%8=0；bias 为空或 FP32[N] |
 
 ## 命令
@@ -44,6 +44,14 @@ SM90 INT8 AZP可单独执行，不混入FP8 Dense、Block128或MoE case：
 W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
 W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-azp-function" \
   test/w8a8/run_w8a8_tests.sh ops-int8-azp-functional
+```
+
+SM90标准FP8 W8A8 grouped MoE可单独执行；该入口覆盖五档CUTLASS调度、
+FP16/BF16、tensorwise/per-channel Scale和shared expert，并生成XLSX汇总：
+
+```bash
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-fp8-moe-function" \
+  test/w8a8/run_w8a8_tests.sh ops-moe-functional
 ```
 
 功能套件结束后会在`W8A8_LOG_DIR`直接生成
@@ -187,4 +195,4 @@ Nsight安装仍只生成`.qdstrm`而没有`.nsys-rep`，脚本会停止并给出
 注意：SM90 grouped CUTLASS 的目标格式是 standard per-token/per-channel FP8；Qwen3 官方 FP8 是 128x128 blockwise，不能拿它证明 standard grouped kernel 命中。
 HF Mixtral fallback 的 `config.json` 是 compressed-tensors `float-quantized`：FP8 weight 为 static symmetric channel，activation 为 dynamic symmetric token。
 
-开关：`FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=0` 可单独关闭 SM90 grouped CUTLASS，便于和原 grouped CUDA fallback 做 A/B 性能对比。
+开关：`FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90=0` 可单独关闭SM90 grouped CUTLASS，便于和原grouped CUDA fallback做A/B性能对比；`FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90_STRICT=1` 会在目标CUTLASS提交失败时直接报错，避免功能或性能测试静默回退。

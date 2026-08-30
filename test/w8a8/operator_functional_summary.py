@@ -156,6 +156,8 @@ def parse_fastllm_log(path, text):
     op = re.search(r"--op\s+([^\s]+)", command_text)
     result = result_from_log(text)
     weight_layout = parameter(command_text, "weight_layout")
+    if weight_layout is None:
+        weight_layout = parameter(command_text, "scale_layout")
     if weight_layout == "perchannel":
         weight_layout = "per-channel"
     return {
@@ -165,8 +167,10 @@ def parse_fastllm_log(path, text):
         "result": result,
         "op": op.group(1) if op else None,
         "m": integer_parameter(command_text, "batch"),
-        "n": integer_parameter(command_text, "out"),
-        "k": integer_parameter(command_text, "in"),
+        "n": integer_parameter(command_text, "out") or
+             integer_parameter(command_text, "inter"),
+        "k": integer_parameter(command_text, "in") or
+             integer_parameter(command_text, "hidden"),
         "input_type": parameter(command_text, "input_type"),
         "weight_layout": weight_layout,
         "activation_scheme": parameter(command_text, "activation_scheme"),
