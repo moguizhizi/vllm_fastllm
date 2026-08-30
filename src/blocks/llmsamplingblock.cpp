@@ -651,26 +651,35 @@ namespace fastllm {
         Data cpuLogits(logits);
         cpuLogits.ToDevice(DataDevice::CPU);
 
-        Data cpuTopk;
-        TopK(cpuLogits, cpuTopk, 1);
-        cpuTopk.ToDevice(DataDevice::CPU);
-
+        AssertInFastLLM(!cpuLogits.dims.empty(),
+                        "Sampling Top1 trace received empty CPU logits.\n");
         const int channels = cpuLogits.dims.back();
         const float *cpuLogitsData = (const float*)cpuLogits.cpuData;
-        const float *cpuTopkData = (const float*)cpuTopk.cpuData;
+        AssertInFastLLM(channels > 0 && cpuLogitsData != nullptr &&
+                        cpuLogits.Count(0) / channels >= cudaTokens.size(),
+                        "Sampling Top1 trace received invalid CPU logits.\n");
+
         for (int b = 0; b < (int)cudaTokens.size(); ++b) {
+            const float *row = cpuLogitsData + (size_t)b * channels;
+            int cpuToken = 0;
+            float cpuLogit = row[0];
+            for (int token = 1; token < channels; ++token) {
+                if (row[token] > cpuLogit) {
+                    cpuToken = token;
+                    cpuLogit = row[token];
+                }
+            }
+
             const int cudaToken = cudaTokens[b];
-            const int cpuToken = (int)(cpuTopkData[0] + 1e-3);
             const float cudaLogit =
                 cudaToken >= 0 && cudaToken < channels
-                    ? cpuLogitsData[(size_t)b * channels + cudaToken]
+                    ? row[cudaToken]
                     : -std::numeric_limits<float>::infinity();
             printf("[fastllm][sampling-top1] cuda_token=%d "
                    "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
                    "match=%s batch_index=%d\n",
-                   cudaToken, cpuToken, cudaLogit, cpuTopkData[1],
+                   cudaToken, cpuToken, cudaLogit, cpuLogit,
                    cudaToken == cpuToken ? "true" : "false", b);
-            cpuTopkData += cpuTopk.Count(2);
         }
         fflush(stdout);
     }
