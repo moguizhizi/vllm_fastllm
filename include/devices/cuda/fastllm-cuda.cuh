@@ -1706,10 +1706,26 @@ bool FastllmCudaTritonMergeMOEFP8E4M3Indexed(
     const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
     fastllm::Data **weights, int weightsBatch, const int32_t *indices, const float *scores,
     int batch, int topk, int hidden, int inter);
+bool FastllmCudaTritonMergeMOEFP8E4M3Block128Indexed(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN,
+    int groupBlockK, int groupSizeM, const fastllm::Data &input,
+    fastllm::Data &w1, fastllm::Data &output, fastllm::Data **weights,
+    int weightsBatch, const int32_t *indices, const float *scores,
+    int batch, int topk, int hidden, int inter);
 bool FastllmCudaTritonMergeMOEFP8E4M3IndexedIsPacked(
     fastllm::Data **weights, int weightsBatch, int hidden, int inter);
 
 bool FastllmCudaTritonFusedMOEFP8E4M3(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN, int groupBlockK, int groupSizeM,
+    const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up, fastllm::Data &down,
+    const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &w1, fastllm::Data &output,
+    int batch, int topk, int hidden, int inter, int experts);
+bool FastllmCudaTritonFusedMOEFP8E4M3Block128(
     const char *const *cubinPaths, const char *const *kernelNames,
     const int *numWarps, const int *shared,
     int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN, int groupBlockK, int groupSizeM,

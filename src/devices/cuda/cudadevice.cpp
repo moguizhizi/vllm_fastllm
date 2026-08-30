@@ -279,6 +279,7 @@ namespace fastllm {
         int groupBlockN = 128;
         int groupBlockK = 128;
         int groupSizeM = 32;
+        std::string weightLayout = "separate";
     };
 
     static std::string CudaTritonHomePath() {
@@ -485,12 +486,12 @@ namespace fastllm {
     }
 
     static std::string CudaTritonMergeMoeFp8BaseName(
-        const std::string &inputDtype, int arch,
+        const std::string &inputDtype, const std::string &weightLayout, int arch,
         int routeBlockT, int maxExperts, int topk, int hidden, int inter,
         int groupBlockM, int groupBlockN, int groupBlockK,
         int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages) {
         std::ostringstream os;
-        os << "merge_moe_fp8_v34_" << inputDtype
+        os << "merge_moe_fp8_v35_" << weightLayout << "_" << inputDtype
            << "_sm" << arch
            << "_rt" << routeBlockT << "_me" << maxExperts
            << "_tk" << topk
@@ -863,9 +864,14 @@ namespace fastllm {
         meta.groupBlockN = json["group_block_n"].int_value();
         meta.groupBlockK = json["group_block_k"].int_value();
         meta.groupSizeM = json["group_size_m"].int_value();
+        meta.weightLayout = json["weight_layout"].string_value();
+        if (meta.weightLayout.empty()) {
+            meta.weightLayout = "separate";
+        }
         if (meta.routeBlockT <= 0 || meta.maxExperts <= 0 ||
             meta.groupBlockM <= 0 || meta.groupBlockN <= 0 || meta.groupBlockK <= 0 ||
-            meta.groupSizeM < 0) {
+            meta.groupSizeM < 0 ||
+            (meta.weightLayout != "separate" && meta.weightLayout != "block128")) {
             return false;
         }
         json11::Json kernels = json["kernels"];
@@ -2001,7 +2007,8 @@ namespace fastllm {
     }
 
     static bool CudaTritonRequestMergeMoeFp8Kernel(
-        const std::string &cacheDir, const std::string &inputDtype, int arch,
+        const std::string &cacheDir, const std::string &inputDtype,
+        const std::string &weightLayout, int arch,
         int routeBlockT, int maxExperts, int topk, int hidden, int inter,
         int groupBlockM, int groupBlockN, int groupBlockK,
         int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages,
@@ -2014,6 +2021,7 @@ namespace fastllm {
             {"cache_dir", cacheDir},
             {"arch", arch},
             {"input_dtype", inputDtype},
+            {"weight_layout", weightLayout},
             {"route_block_t", routeBlockT},
             {"max_experts", maxExperts},
             {"topk", topk},
@@ -2049,9 +2057,10 @@ namespace fastllm {
         meta.groupBlockN = response["group_block_n"].int_value();
         meta.groupBlockK = response["group_block_k"].int_value();
         meta.groupSizeM = response["group_size_m"].int_value();
+        meta.weightLayout = response["weight_layout"].string_value();
         if (meta.routeBlockT <= 0 || meta.maxExperts <= 0 ||
             meta.groupBlockM <= 0 || meta.groupBlockN <= 0 || meta.groupBlockK <= 0 ||
-            meta.groupSizeM < 0) {
+            meta.groupSizeM < 0 || meta.weightLayout != weightLayout) {
             return false;
         }
         json11::Json kernels = response["kernels"];
@@ -2070,7 +2079,8 @@ namespace fastllm {
     }
 
     static bool CudaTritonGetMergeMoeFp8Meta(
-        const std::string &cacheDir, const std::string &base, const std::string &inputDtype, int arch,
+        const std::string &cacheDir, const std::string &base,
+        const std::string &inputDtype, const std::string &weightLayout, int arch,
         int routeBlockT, int maxExperts, int topk, int hidden, int inter,
         int groupBlockM, int groupBlockN, int groupBlockK,
         int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages,
@@ -2091,11 +2101,14 @@ namespace fastllm {
         CudaTritonMergeMoeFp8Meta loaded;
         if (!CudaTritonReadMergeMoeFp8Meta(metaPath, loaded)) {
             if (!CudaTritonRequestMergeMoeFp8Kernel(
-                    cacheDir, inputDtype, arch,
+                    cacheDir, inputDtype, weightLayout, arch,
                     routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
                     groupSizeM, routeNumWarps, groupNumWarps, numStages, loaded)) {
                 return false;
             }
+        }
+        if (loaded.weightLayout != weightLayout) {
+            return false;
         }
 
         std::lock_guard<std::mutex> guard(mutex);
@@ -3668,15 +3681,20 @@ namespace fastllm {
             weights == nullptr || weightsBatch < 4 || (weightsBatch & 1)) {
             return false;
         }
-        if (weights[0] != nullptr && sharedScale != 0.0f) {
-            return false;
-        }
-
         int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
+        const bool block128 = gateup != nullptr && down != nullptr &&
+            gateup->dataType == DataType::FP8_E4M3_BLOCK_128 &&
+            down->dataType == DataType::FP8_E4M3_BLOCK_128;
+        const bool separate = gateup != nullptr && down != nullptr &&
+            gateup->dataType == DataType::FP8_E4M3 &&
+            down->dataType == DataType::FP8_E4M3;
+        if ((!block128 && !separate) ||
+            (weights[0] != nullptr && sharedScale != 0.0f && !block128)) {
+            return false;
+        }
         if (gateup == nullptr || down == nullptr ||
-            gateup->dataType != DataType::FP8_E4M3 || down->dataType != DataType::FP8_E4M3 ||
             gateup->dims.size() != 2 || down->dims.size() != 2 ||
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
@@ -3692,9 +3710,10 @@ namespace fastllm {
             return false;
         }
         int arch = CudaTritonRuntimeArch();
-        if (arch <= 0) {
+        if (arch <= 0 || (block128 && arch != 90)) {
             return false;
         }
+        const std::string weightLayout = block128 ? "block128" : "separate";
 
         int routeBlockT = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_BLOCK_T", 1024);
         int maxExperts = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MAX_EXPERTS", 256);
@@ -3703,9 +3722,11 @@ namespace fastllm {
         int groupBlockN = 128;
         int groupBlockK = 128;
         int groupSizeM = batch <= 16 ? 1 : 32;
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
-        bool packedTableReady = FastllmCudaTritonMergeMOEFP8E4M3IndexedIsPacked(
-            weights, weightsBatch, hidden, inter);
+        int minBatch = block128 ? 1 :
+            CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
+        bool packedTableReady = !block128 &&
+            FastllmCudaTritonMergeMOEFP8E4M3IndexedIsPacked(
+                weights, weightsBatch, hidden, inter);
         if (batch < minBatch && !packedTableReady) {
             return false;
         }
@@ -3717,13 +3738,13 @@ namespace fastllm {
         }
         std::string cacheDir = CudaTritonCacheDir();
         std::string base = CudaTritonMergeMoeFp8BaseName(
-            inputDtype, arch,
+            inputDtype, weightLayout, arch,
             routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
             groupSizeM, routeNumWarps, groupNumWarps, numStages);
 
         const CudaTritonMergeMoeFp8Meta *meta = nullptr;
         if (!CudaTritonGetMergeMoeFp8Meta(
-                cacheDir, base, inputDtype, arch,
+                cacheDir, base, inputDtype, weightLayout, arch,
                 routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
                 groupSizeM, routeNumWarps, groupNumWarps, numStages, meta)) {
             if (packedTableReady) {
@@ -3747,17 +3768,115 @@ namespace fastllm {
             kernelWarps[i] = meta->kernels[i].numWarps;
             kernelShared[i] = meta->kernels[i].shared;
         }
-        bool ok = FastllmCudaTritonMergeMOEFP8E4M3Indexed(
-            cubinPaths, kernelNames, kernelWarps, kernelShared,
-            meta->routeBlockT, meta->maxExperts, meta->groupBlockM, meta->groupBlockN, meta->groupBlockK,
-            meta->groupSizeM,
-            input, w1, output, weights, weightsBatch,
-            (const int32_t*)index.cudaData, (const float*)score.cudaData,
-            batch, topk, hidden, inter);
+        bool ok = block128 ?
+            FastllmCudaTritonMergeMOEFP8E4M3Block128Indexed(
+                cubinPaths, kernelNames, kernelWarps, kernelShared,
+                meta->routeBlockT, meta->maxExperts, meta->groupBlockM,
+                meta->groupBlockN, meta->groupBlockK, meta->groupSizeM,
+                input, w1, output, weights, weightsBatch,
+                (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                batch, topk, hidden, inter) :
+            FastllmCudaTritonMergeMOEFP8E4M3Indexed(
+                cubinPaths, kernelNames, kernelWarps, kernelShared,
+                meta->routeBlockT, meta->maxExperts, meta->groupBlockM,
+                meta->groupBlockN, meta->groupBlockK, meta->groupSizeM,
+                input, w1, output, weights, weightsBatch,
+                (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                batch, topk, hidden, inter);
         if (!ok && packedTableReady) {
             ErrorInFastLLM("Fastllm Triton MergeMOE source weights have been released, but Triton launch failed.\n");
         }
         return ok;
+    }
+
+    /**
+     * 尝试执行SM90 Block128 FP8 W8A8 Triton grouped MoE正式路径。
+     *
+     * routed expert直接消费CUDA端index与score，复用通用Triton路由排序、
+     * 1x128激活量化、SwiGLU量化和输出归并，仅将权重读取切换为FastLLM
+     * 每128个FP8值紧跟一个FP32 scale的交错布局。存在shared expert时，
+     * routed结果成功后通过正式Dense Linear路径计算并累加；任一步失败返回
+     * false，由DoCudaMergeMOE继续使用已有CUDA fallback。
+     *
+     * @param input         FP16/BF16输入，逻辑形状为[batch, hidden]。
+     * @param output        MoE输出，逻辑形状为[batch, hidden]。
+     * @param index         CUDA端expert索引，形状为[batch, topk]，类型INT32。
+     * @param score         CUDA端路由权重，形状为[batch, topk]，类型FP32。
+     * @param batch         token数量，允许从1开始。
+     * @param topk          每个token选择的expert数量。
+     * @param w1            routed gate/up或shared expert复用临时张量。
+     * @param w2            shared expert门控激活复用临时张量。
+     * @param weights       Block128专家权重数组，第0对为可选shared expert。
+     * @param weightsBatch  权重数组元素数量。
+     * @param sharedScale   shared expert输出合并系数；无shared expert时为0。
+     * @param gateType      当前仅支持SwiGLU。
+     * @return true表示目标路径及可选shared expert均成功；false表示应回退。
+     */
+    static bool TryCudaMergeMOEBlock128Sm90(
+        Data &input, Data &output, Data &index, Data &score, int batch, int topk,
+        Data &w1, Data &w2, Data **weights, int weightsBatch,
+        float sharedScale, MoeGateType gateType) {
+        if (FastllmCudaRuntimeArch() != 90 || batch <= 0 || topk <= 0 ||
+            gateType != MoeGateSwiglu || weights == nullptr ||
+            weightsBatch < 4 || (weightsBatch & 1) ||
+            index.dataDevice != DataDevice::CUDA ||
+            index.dataType != DataType::INT32 || index.cudaData == nullptr ||
+            score.dataDevice != DataDevice::CUDA ||
+            score.dataType != DataType::FLOAT32 || score.cudaData == nullptr ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_MOE_BLOCK128_SM90", true)) {
+            return false;
+        }
+
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        int hidden = input.dims.empty() ? 0 : input.dims.back();
+        if (gateup == nullptr || down == nullptr || hidden <= 0 ||
+            gateup->dataType != DataType::FP8_E4M3_BLOCK_128 ||
+            down->dataType != DataType::FP8_E4M3_BLOCK_128 ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
+            down->dims[0] != hidden) {
+            return false;
+        }
+
+        const bool hasSharedExpert = weights[0] != nullptr &&
+            weights[1] != nullptr && sharedScale != 0.0f;
+        if (sharedScale != 0.0f &&
+            ((weights[0] == nullptr) != (weights[1] == nullptr))) {
+            return false;
+        }
+        if (hasSharedExpert &&
+            (weights[0]->dataType != DataType::FP8_E4M3_BLOCK_128 ||
+             weights[1]->dataType != DataType::FP8_E4M3_BLOCK_128 ||
+             weights[0]->dims.size() != 2 || weights[1]->dims.size() != 2 ||
+             weights[0]->dims[1] != hidden ||
+             weights[0]->dims[0] != weights[1]->dims[1] * 2 ||
+             weights[1]->dims[0] != hidden)) {
+            return false;
+        }
+
+        if (!TryCudaTritonMergeMOEFp8Indexed(
+                input, output, index, score, batch, topk, w1, weights,
+                weightsBatch, 0.0f, gateType)) {
+            return false;
+        }
+
+        if (hasSharedExpert) {
+            DoCudaLinearReshape(input, *weights[0], w1);
+            DoCudaLinear(input, *weights[0], *GetEmptyData(), w1);
+            ApplyCudaMoeGate(w1, w2, gateType);
+            DoCudaLinearReshape(w2, *weights[1], w1);
+            DoCudaLinear(w2, *weights[1], *GetEmptyData(), w1);
+            FastllmCudaAddTo(output, w1, sharedScale);
+        }
+
+        if (CudaEnvFlagEnabled("FASTLLM_CUDA_W8A8_TRACE")) {
+            printf("[fastllm][w8a8] path=sm90-fp8-block128-moe-triton "
+                   "reason=success m=%d n=%d k=%d sm=90\n",
+                   batch * topk, down->dims[1] * 2, hidden);
+        }
+        return true;
     }
 
     static bool TryCudaTritonFusedMOEFp8(
@@ -3772,6 +3891,14 @@ namespace fastllm {
         if (moeEnv != nullptr && moeEnv[0] != '\0' && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MERGE_MOE")) {
             return false;
         }
+        const bool block128 =
+            gate.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+            up.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+            down.dataType == DataType::FP8_E4M3_BLOCK_128;
+        const bool separate =
+            gate.dataType == DataType::FP8_E4M3 &&
+            up.dataType == DataType::FP8_E4M3 &&
+            down.dataType == DataType::FP8_E4M3;
         if (batch <= 0 || topk <= 0 || hidden <= 0 || inter <= 0 || experts <= 0 ||
             gateType != MoeGateSwiglu || swigluLimit != 0.0f ||
             input.dataDevice != DataDevice::CUDA ||
@@ -3781,9 +3908,10 @@ namespace fastllm {
             score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 || score.cudaData == nullptr ||
             index.Count(0) != (uint64_t)batch * topk || score.Count(0) != (uint64_t)batch * topk ||
             gate.dataDevice != DataDevice::CUDA || up.dataDevice != DataDevice::CUDA || down.dataDevice != DataDevice::CUDA ||
-            gate.dataType != DataType::FP8_E4M3 || up.dataType != DataType::FP8_E4M3 || down.dataType != DataType::FP8_E4M3 ||
+            (!block128 && !separate) ||
             gate.cudaData == nullptr || up.cudaData == nullptr || down.cudaData == nullptr ||
-            gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty() ||
+            (separate &&
+             (gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty())) ||
             gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3 ||
             gate.dims[0] != experts || gate.dims[1] != inter || gate.dims[2] != hidden ||
             up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
@@ -3796,9 +3924,12 @@ namespace fastllm {
             return false;
         }
         int arch = CudaTritonRuntimeArch();
-        if (arch <= 0) {
+        if (arch <= 0 || (block128 && arch != 90) ||
+            (block128 && !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_MOE_BLOCK128_SM90", true))) {
             return false;
         }
+        const std::string weightLayout = block128 ? "block128" : "separate";
 
         int routeBlockT = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_BLOCK_T", 1024);
         int maxExperts = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MAX_EXPERTS", 256);
@@ -3806,7 +3937,8 @@ namespace fastllm {
         int groupBlockN = 128;
         int groupBlockK = 128;
         int groupSizeM = batch <= 16 ? 1 : 32;
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
+        int minBatch = block128 ? 1 :
+            CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
         if (batch < minBatch) {
             return false;
         }
@@ -3818,13 +3950,13 @@ namespace fastllm {
         }
         std::string cacheDir = CudaTritonCacheDir();
         std::string base = CudaTritonMergeMoeFp8BaseName(
-            inputDtype, arch,
+            inputDtype, weightLayout, arch,
             routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
             groupSizeM, routeNumWarps, groupNumWarps, numStages);
 
         const CudaTritonMergeMoeFp8Meta *meta = nullptr;
         if (!CudaTritonGetMergeMoeFp8Meta(
-                cacheDir, base, inputDtype, arch,
+                cacheDir, base, inputDtype, weightLayout, arch,
                 routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
                 groupSizeM, routeNumWarps, groupNumWarps, numStages, meta)) {
             return false;
@@ -3842,12 +3974,25 @@ namespace fastllm {
             kernelWarps[i] = meta->kernels[i].numWarps;
             kernelShared[i] = meta->kernels[i].shared;
         }
-        return FastllmCudaTritonFusedMOEFP8E4M3(
-            cubinPaths, kernelNames, kernelWarps, kernelShared,
-            meta->routeBlockT, meta->maxExperts, meta->groupBlockM, meta->groupBlockN, meta->groupBlockK,
-            meta->groupSizeM,
-            input, gate, up, down, index, score, w1, output,
-            batch, topk, hidden, inter, experts);
+        bool ok = block128 ?
+            FastllmCudaTritonFusedMOEFP8E4M3Block128(
+                cubinPaths, kernelNames, kernelWarps, kernelShared,
+                meta->routeBlockT, meta->maxExperts, meta->groupBlockM,
+                meta->groupBlockN, meta->groupBlockK, meta->groupSizeM,
+                input, gate, up, down, index, score, w1, output,
+                batch, topk, hidden, inter, experts) :
+            FastllmCudaTritonFusedMOEFP8E4M3(
+                cubinPaths, kernelNames, kernelWarps, kernelShared,
+                meta->routeBlockT, meta->maxExperts, meta->groupBlockM,
+                meta->groupBlockN, meta->groupBlockK, meta->groupSizeM,
+                input, gate, up, down, index, score, w1, output,
+                batch, topk, hidden, inter, experts);
+        if (ok && block128 && CudaEnvFlagEnabled("FASTLLM_CUDA_W8A8_TRACE")) {
+            printf("[fastllm][w8a8] path=sm90-fp8-block128-fused-moe-triton "
+                   "reason=success m=%d n=%d k=%d sm=90\n",
+                   batch * topk, inter * 2, hidden);
+        }
+        return ok;
     }
 #else
     bool FastllmCudaTryTritonDeepSeekV4WoA(
@@ -8692,6 +8837,24 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
                 CudaEnvFlagDefaultEnabled(
                     "FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", true);
+            const bool preferSm90Fp8Block128 =
+                runtimeArch == 90 && batch > 0 &&
+                gateType == MoeGateSwiglu && firstGate != nullptr &&
+                firstGate->dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                firstGate->dims.size() == 2 && index.dims.size() >= 2 &&
+                CudaEnvFlagDefaultEnabled(
+                    "FASTLLM_CUDA_MOE_BLOCK128_SM90", true);
+
+            if (preferSm90Fp8Block128 && TryCudaMergeMOEBlock128Sm90(
+                    input, output, index, score, batch, index.dims[1], w1, w2,
+                    weights, weightsBatch, sharedScale, gateType)) {
+                return;
+            }
+            if (preferSm90Fp8Block128 && CudaEnvFlagEnabled(
+                    "FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT")) {
+                throw std::runtime_error(
+                    "strict SM90 Block128 FP8 W8A8 MoE Triton execution failed");
+            }
 
             // 已选择原生CUTLASS grouped时不再让batch-1、small-batch或
             // Triton FP8旧路径提前截获请求；五档SM90分派必须覆盖完整M范围。
@@ -9060,10 +9223,14 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         clearIfOnOtherDevice(w1);
         clearIfOnOtherDevice(output);
 
-        if (allowTriton && isFp8 &&
+        if (allowTriton && (isFp8 || isFp8Block128) &&
             TryCudaTritonFusedMOEFp8(input, output, index, score, gate, up, down, w1,
                                      batch, topk, hidden, inter, experts, gateType, swigluLimit)) {
             return;
+        }
+        if (allowTriton && isFp8Block128 &&
+            CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT")) {
+            ErrorInFastLLM("SM90 Block128 FP8 FusedMOE target path failed in strict mode.\n");
         }
 
         bool ok = false;
