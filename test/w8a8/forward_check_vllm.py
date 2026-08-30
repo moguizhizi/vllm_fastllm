@@ -14,4 +14,9 @@ import forward_check_vllm as shared_forward  # noqa: E402
 if __name__ == "__main__":
     if "--label" not in sys.argv:
         sys.argv.extend(("--label", "W8A8"))
+    if "--target-trace-pattern" not in sys.argv:
+        sys.argv.extend((
+            "--target-trace-pattern",
+            "[fastllm][w8a8] path=w8a8-cutlass",
+        ))
     raise SystemExit(shared_forward.main())
