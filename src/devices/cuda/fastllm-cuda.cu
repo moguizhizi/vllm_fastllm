@@ -3710,6 +3710,11 @@ __global__ void FastllmLayerNormKernelInner1(half *input, float *gamma, float *b
     }
 }
 
+__device__ __forceinline__ bool FastllmGreedyIsBetter(
+        float value, int id, float bestValue, int bestId) {
+    return value > bestValue ||
+           (value == bestValue && id < bestId);
+}
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int channels) {
@@ -3729,11 +3734,11 @@ __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int chan
     __syncthreads();
 
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            if (maxData[tid] < maxData[tid + s]) {
-                maxData[tid] = maxData[tid + s];
-                idData[tid] = idData[tid + s];
-            }
+        if (tid < s && FastllmGreedyIsBetter(
+                maxData[tid + s], (int)idData[tid + s],
+                maxData[tid], (int)idData[tid])) {
+            maxData[tid] = maxData[tid + s];
+            idData[tid] = idData[tid + s];
         }
         __syncthreads();
     }
@@ -13639,12 +13644,6 @@ struct FastllmGreedyPartial {
     float value;
     int id;
 };
-
-__device__ __forceinline__ bool FastllmGreedyIsBetter(
-        float value, int id, float bestValue, int bestId) {
-    return value > bestValue ||
-           (value == bestValue && id < bestId);
-}
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmGreedySamplingKernel(float *logits, int *output,
