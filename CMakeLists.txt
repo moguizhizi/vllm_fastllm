@@ -467,6 +467,12 @@ if (USE_CUDA)
         )
     endif()
 
+    if(FASTLLM_CUTLASS_W8A8_ENABLED AND FASTLLM_CUTLASS_FP8_SM90_ENABLED)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/moe/fastllm-moe-fp8-w8a8-cutlass-sm90.cu
+        )
+    endif()
+
     if(FASTLLM_CUTLASS_NVFP4_ENABLED)
         list(APPEND FASTLLM_CUDA_SOURCES
             src/devices/cuda/fp4/fastllm-nvfp4-quant.cu

@@ -1076,6 +1076,9 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
 bool FastllmCudaW4A8QuantizeActivationPerToken(
     const fastllm::Data &input, int n, int m,
     void *fp8Data, float *tokenScales);
+bool FastllmCudaW4A8QuantizeActivationPerTokenStream(
+    const fastllm::Data &input, int n, int m,
+    void *fp8Data, float *tokenScales, void *stream);
 bool FastllmCudaW4A8PrepareWeightCache(
     fastllm::Data &weight, int inChannels, int outChannels);
 bool FastllmCudaInspectW4A8Activation(
@@ -1083,13 +1086,6 @@ bool FastllmCudaInspectW4A8Activation(
     std::vector<uint8_t> &fp8Bytes, std::vector<float> &tokenScales);
 void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight);
 bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
-    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
-    fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
-    const int *routeRows, const float *routeScales,
-    const int *routePositions, const int *expertStarts,
-    const int *expertCounts, int batch, int topk, int totalTasks,
-    int hidden, int inter);
-bool FastllmCudaBFloat16MergeMOEFp8CutlassSm90(
     const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
     fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
     const int *routeRows, const float *routeScales,
@@ -1111,7 +1107,18 @@ inline bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
     const int *, const int *, const int *, int, int, int, int, int) {
     return false;
 }
-inline bool FastllmCudaBFloat16MergeMOEFp8CutlassSm90(
+#endif
+#if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && \
+    defined(FASTLLM_CUTLASS_W8A8_SM90)
+bool FastllmCudaMergeMOEFp8W8A8CutlassSm90(
+    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
+    fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const int *routeRows, const float *routeScales,
+    const int *routePositions, const int *expertStarts,
+    const int *expertCounts, int batch, int topk, int totalTasks,
+    int hidden, int inter);
+#else
+inline bool FastllmCudaMergeMOEFp8W8A8CutlassSm90(
     const fastllm::Data &, fastllm::Data &, fastllm::Data &,
     fastllm::Data &, fastllm::Data **, int, const int *, const float *,
     const int *, const int *, const int *, int, int, int, int, int) {

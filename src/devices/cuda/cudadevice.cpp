@@ -8388,20 +8388,23 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
     static bool TryCudaMergeMOELargeBatchFp8Grouped(
         Data &input, Data &output, const int32_t *indexData, const float *scoreData, int batch, int topk,
         Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
-        int minGroupedBatch = CudaEnvInt("FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH", 16);
+        int minGroupedBatch = CudaEnvInt(
+            "FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH", 1);
         if (batch < minGroupedBatch || gateType != MoeGateSwiglu ||
             !IsCudaMergeMoeFp16Bf16InputType(input.dataType) || input.dims.size() == 0 ||
             weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
             indexData == nullptr || scoreData == nullptr) {
             return false;
         }
-        if (weights[0] != nullptr && sharedScale != 0.0f) {
-            return false;
-        }
-
         const int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
+        const bool hasSharedExpert = weights[0] != nullptr &&
+            weights[1] != nullptr && sharedScale != 0.0f;
+        if (sharedScale != 0.0f &&
+            ((weights[0] == nullptr) != (weights[1] == nullptr))) {
+            return false;
+        }
         if (gateup == nullptr || down == nullptr ||
             gateup->dataType != DataType::FP8_E4M3 ||
             down->dataType != DataType::FP8_E4M3 ||
@@ -8409,6 +8412,20 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
             return false;
+        }
+
+        if (hasSharedExpert) {
+            Data *sharedGateup = weights[0];
+            Data *sharedDown = weights[1];
+            if (sharedGateup->dataType != DataType::FP8_E4M3 ||
+                sharedDown->dataType != DataType::FP8_E4M3 ||
+                sharedGateup->dims.size() != 2 ||
+                sharedDown->dims.size() != 2 ||
+                sharedGateup->dims[1] != hidden ||
+                sharedGateup->dims[0] != sharedDown->dims[1] * 2 ||
+                sharedDown->dims[0] != hidden) {
+                return false;
+            }
         }
 
         int inter = down->dims[1];
@@ -8453,15 +8470,35 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 routePositions[b * topk + j] = pos;
             }
         }
-        if (FastllmCudaRuntimeArch() == 90 &&
-            CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", true) &&
-            input.dataType == DataType::BFLOAT16 &&
-            FastllmCudaBFloat16MergeMOEFp8CutlassSm90(
+        const bool fp8CutlassEnabled = FastllmCudaRuntimeArch() == 90 &&
+            CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", true);
+        if (fp8CutlassEnabled && FastllmCudaMergeMOEFp8W8A8CutlassSm90(
                 input, w1, w2, output, weights, weightsBatch,
                 routeRows.data(), routeScales.data(), routePositions.data(),
                 expertStarts.data(), expertCounts.data(), batch, topk,
                 totalTasks, hidden, inter)) {
+            if (hasSharedExpert) {
+                Data *sharedGateup = weights[0];
+                Data *sharedDown = weights[1];
+                DoCudaLinearReshape(input, *sharedGateup, w1);
+                DoCudaLinear(input, *sharedGateup, *GetEmptyData(), w1);
+                ApplyCudaMoeGate(w1, w2, gateType);
+                DoCudaLinearReshape(w2, *sharedDown, w1);
+                DoCudaLinear(w2, *sharedDown, *GetEmptyData(), w1);
+                FastllmCudaAddTo(output, w1, sharedScale);
+            }
+            if (CudaEnvFlagEnabled("FASTLLM_CUDA_W8A8_TRACE")) {
+                printf("[fastllm][w8a8] path=sm90-fp8-grouped-moe-cutlass "
+                       "reason=success m=%d n=%d k=%d sm=90\n",
+                       totalTasks, inter * 2, hidden);
+            }
             return true;
+        }
+        if (fp8CutlassEnabled && CudaEnvFlagEnabled(
+                "FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90_STRICT")) {
+            throw std::runtime_error(
+                "strict SM90 FP8 W8A8 grouped MoE CUTLASS execution failed");
         }
         if (input.dataType == DataType::FLOAT16) {
             return FastllmCudaHalfMergeMOEFP8E4M3GroupedIndexed(
@@ -8646,10 +8683,19 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 runtimeArch >= 100 && runtimeArch < 130 &&
                 (runtimeArch < 120 || input.dataType == DataType::BFLOAT16) &&
                 nvfp4BackendMayUseCutlass;
+            const bool preferSm90Fp8W8A8Grouped =
+                runtimeArch == 90 && batch > 0 &&
+                gateType == MoeGateSwiglu && firstGate != nullptr &&
+                firstGate->dataType == DataType::FP8_E4M3 &&
+                firstGate->dims.size() == 2 && firstGate->blockK == 1 &&
+                firstGate->blockM == firstGate->dims[1] &&
+                CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
+                CudaEnvFlagDefaultEnabled(
+                    "FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", true);
 
-            // 只有未选择NVFP4 W4A4时才探测旧后端，避免small-batch INT4或
-            // large-batch Triton FP8在未来扩展格式后意外截获NVFP4请求。
-            if (!preferNvfp4W4A4) {
+            // 已选择原生CUTLASS grouped时不再让batch-1、small-batch或
+            // Triton FP8旧路径提前截获请求；五档SM90分派必须覆盖完整M范围。
+            if (!preferNvfp4W4A4 && !preferSm90Fp8W8A8Grouped) {
                 int legacyTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
                 if (TryCudaMergeMOEInt4GroupMarlinIndexed(
                         input, output, index, score, batch, legacyTopk, w1, w2,
@@ -8711,7 +8757,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             int n = index.dims[0];
             int topk = index.dims[1];
             
-            if (!preferNvfp4W4A4) {
+            if (!preferNvfp4W4A4 && !preferSm90Fp8W8A8Grouped) {
                 if (batch == 1) {
                     if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
                         TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
@@ -8730,6 +8776,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             float *scoreData = (float*)score.cpuData;
 
             if (TryCudaMergeMOEW4A8Grouped(
+                    input, output, indexData, scoreData, batch, topk,
+                    w1, w2, weights, weightsBatch, sharedScale, gateType)) {
+                return;
+            }
+
+            if (CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
+                TryCudaMergeMOELargeBatchFp8Grouped(
                     input, output, indexData, scoreData, batch, topk,
                     w1, w2, weights, weightsBatch, sharedScale, gateType)) {
                 return;
@@ -8788,12 +8841,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     FastllmCudaMemset0(output.cudaData, output.GetBytes());
                 }
             } else {
-
-                if (CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
-                    TryCudaMergeMOELargeBatchFp8Grouped(input, output, indexData, scoreData, batch, topk,
-                                                        w1, w2, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
-                }
 
                 FastllmCudaMemset0(output.cudaData, output.GetBytes());
                 
