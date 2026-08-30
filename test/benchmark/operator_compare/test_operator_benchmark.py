@@ -42,6 +42,7 @@ class OperatorBenchmarkTest(unittest.TestCase):
             self.assertAlmostEqual(
                 selected["selected_speedup_vs_reference"], 1.2)
             self.assertTrue(Path(str(prefix) + ".md").is_file())
+            self.assertTrue(Path(str(prefix) + ".xlsx").is_file())
             self.assertTrue(prefix.with_name("report-results.csv").is_file())
             self.assertTrue(prefix.with_name("report-comparison.csv").is_file())
             self.assertTrue(prefix.with_name("report-selection.csv").is_file())

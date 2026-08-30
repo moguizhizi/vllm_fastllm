@@ -7,6 +7,8 @@ import re
 import shlex
 from pathlib import Path
 
+from xlsx_report import write_xlsx
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="汇总NVFP4算子性能日志")
@@ -104,9 +106,13 @@ def main():
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
+    xlsx_path = prefix.with_suffix(".xlsx")
+    write_xlsx(xlsx_path, [("算子性能", columns,
+                            [[row[column] for column in columns] for row in rows])])
     print(md_text)
     print(f"Markdown: {md_path}")
     print(f"CSV: {csv_path}")
+    print(f"Excel: {xlsx_path}")
 
 
 if __name__ == "__main__":

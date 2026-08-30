@@ -15,6 +15,10 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+TEST_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(TEST_DIR / "nvfp4"))
+from xlsx_report import write_xlsx  # noqa: E402
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="通用算子性能对比框架")
@@ -511,6 +515,7 @@ def write_reports(config, config_path, output_prefix, results, implementations,
     comparison_csv = output_prefix.with_name(output_prefix.name + "-comparison.csv")
     selection_csv = output_prefix.with_name(output_prefix.name + "-selection.csv")
     md_path = Path(str(output_prefix) + ".md")
+    xlsx_path = Path(str(output_prefix) + ".xlsx")
 
     payload = {
         "name": config["name"],
@@ -575,6 +580,30 @@ def write_reports(config, config_path, output_prefix, results, implementations,
     markdown = make_markdown(
         config, comparisons, selections, dimensions, repeat, method)
     md_path.write_text(markdown, encoding="utf-8")
+    result_rows = []
+    for result in results:
+        for implementation, item in result["implementations"].items():
+            if not item["metrics"]:
+                result_rows.append([
+                    result["case"], *[result["dimensions"].get(key) for key in dimensions],
+                    implementation, item["status"], None, None, None, None, None, None])
+            for metric, values in item["metrics"].items():
+                result_rows.append([
+                    result["case"], *[result["dimensions"].get(key) for key in dimensions],
+                    implementation, item["status"], metric, values["value"],
+                    values["min"], values["max"], values["stdev"],
+                    json.dumps(values["samples"])])
+    sheets = [("测试明细", result_columns, result_rows),
+              ("性能对比", comparison_columns,
+               [[row.get(column) for column in comparison_columns]
+                for row in comparisons])]
+    if selections:
+        sheets.append(("选优结果", selection_columns,
+                       [[json.dumps(row.get(column), ensure_ascii=False)
+                         if isinstance(row.get(column), (dict, list))
+                         else row.get(column) for column in selection_columns]
+                        for row in selections]))
+    write_xlsx(xlsx_path, sheets)
     print(markdown)
     print(f"JSON: {json_path}")
     print(f"CSV明细: {results_csv}")
@@ -582,6 +611,7 @@ def write_reports(config, config_path, output_prefix, results, implementations,
     if selections:
         print(f"CSV选优: {selection_csv}")
     print(f"Markdown: {md_path}")
+    print(f"Excel: {xlsx_path}")
 
 
 def main():

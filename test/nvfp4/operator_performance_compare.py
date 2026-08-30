@@ -14,6 +14,7 @@ import time
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
+from xlsx_report import write_xlsx  # noqa: E402
 
 
 def parse_args():
@@ -424,10 +425,18 @@ def make_report(prefix, cases, vllm_results):
         "rows": long_rows,
         "summary": summary_rows,
     })
+    write_xlsx(prefix.with_suffix(".xlsx"), [
+        ("性能明细", columns,
+         [[row.get(column) for column in columns] for row in long_rows]),
+        ("性能对比", list(summary_rows[0]) if summary_rows else ["case"],
+         [[row.get(column) for column in list(summary_rows[0])]
+          for row in summary_rows] if summary_rows else []),
+    ])
     print("\n".join(lines))
     print(f"Markdown: {prefix.with_suffix('.md')}")
     print(f"CSV: {prefix.with_suffix('.csv')}")
     print(f"JSON: {prefix.with_suffix('.json')}")
+    print(f"Excel: {prefix.with_suffix('.xlsx')}")
 
 
 def orchestrate(args):
