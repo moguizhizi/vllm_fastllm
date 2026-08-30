@@ -130,8 +130,11 @@ def check_unaligned_case(m, n, k, per_token, per_channel, use_bias):
 def main():
     args = parse_args()
 
-    if torch.cuda.get_device_capability() != (12, 0):
-        raise RuntimeError("本测试要求SM120 GPU")
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((9, 0), (12, 0)):
+        major, minor = capability
+        raise RuntimeError(
+            f"本测试要求SM90或SM120 GPU，当前为SM{major}{minor}")
 
     total = 0
 
