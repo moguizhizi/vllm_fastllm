@@ -69,8 +69,9 @@
 
 ### 结果输出
 
-- 功能和性能测试应生成结构化报告，至少包含 Markdown、CSV 和 JSON；需要
-  表格查看时可同时生成 XLSX。
+- 功能和性能测试应生成结构化报告，至少包含 Markdown、CSV 和 JSON。
+- 测试用例结果只要以表格形式保存，就必须生成 XLSX 文件；Markdown、CSV
+  和 JSON 可以作为补充格式，但不得替代 XLSX。
 - Markdown、CSV 和 XLSX 中的浮点展示值统一保留小数点后 3 位；JSON
   保留原始精度，供后续复算。
 - Batch、M/N/K、调用次数等离散值保持整数。
