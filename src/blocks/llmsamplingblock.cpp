@@ -6,6 +6,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -551,6 +552,44 @@ namespace fastllm {
         return GetLogitsDebugOptions().traceSamplingTop1;
     }
 
+    /**
+     * 比较正式CUDA采样Token与同一份完整logits的CPU argmax。
+     *
+     * 调用方必须先保证logits已经汇总为根设备上的完整FLOAT32张量。
+     * 本函数复制logits到CPU并计算Top1，只输出诊断信息，不修改正式采样
+     * Token。该过程包含同步和整张量拷贝，只能在诊断开关启用时调用。
+     *
+     * @param logits       根设备上的完整FLOAT32 logits，最后一维为词表。
+     * @param cudaTokens   正式CUDA路径为每个batch选出的全局Token ID。
+     */
+    static void TraceSamplingTop1(
+            Data &logits, const std::vector<int> &cudaTokens) {
+        Data cpuLogits(logits);
+        cpuLogits.ToDevice(DataDevice::CPU);
+
+        Data cpuTopk;
+        TopK(cpuLogits, cpuTopk, 1);
+
+        const int channels = cpuLogits.dims.back();
+        const float *cpuLogitsData = (const float*)cpuLogits.cpuData;
+        const float *cpuTopkData = (const float*)cpuTopk.cpuData;
+        for (int b = 0; b < (int)cudaTokens.size(); ++b) {
+            const int cudaToken = cudaTokens[b];
+            const int cpuToken = (int)(cpuTopkData[0] + 1e-3);
+            const float cudaLogit =
+                cudaToken >= 0 && cudaToken < channels
+                    ? cpuLogitsData[(size_t)b * channels + cudaToken]
+                    : -std::numeric_limits<float>::infinity();
+            printf("[fastllm][sampling-top1] cuda_token=%d "
+                   "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
+                   "match=%s batch_index=%d\n",
+                   cudaToken, cpuToken, cudaLogit, cpuTopkData[1],
+                   cudaToken == cpuToken ? "true" : "false", b);
+            cpuTopkData += cpuTopk.Count(2);
+        }
+        fflush(stdout);
+    }
+
     static const std::string &LogitsDumpPath() {
         return GetLogitsDebugOptions().dumpPath;
     }
@@ -619,12 +658,18 @@ namespace fastllm {
                 generationConfigs[b].output_token_least <= 0 &&
                 !generationConfigs[b].output_logits;
         }
-        if (canUseShardedGreedy &&
-            SampleTensorParallelGreedyLogits(
+        if (canUseShardedGreedy) {
+            bool sampled = SampleTensorParallelGreedyLogits(
                 logits, batch, lastRet,
                 precomputedGreedyIds, precomputedGreedyScores,
-                precomputedReadyEvents)) {
-            return;
+                precomputedReadyEvents);
+            if (sampled) {
+                if (ShouldTraceSamplingTop1()) {
+                    GatherTensorParallelLogitsToRoot(logits);
+                    TraceSamplingTop1(logits, lastRet);
+                }
+                return;
+            }
         }
         GatherTensorParallelLogitsToRoot(logits);
 #endif
@@ -654,35 +699,17 @@ namespace fastllm {
         if (allSimple && !needLogits) {
             Data topk;
             TopK(logits, topk, 1);
-
-            Data cpuTopk;
-            if (ShouldTraceSamplingTop1()) {
-                Data cpuLogits(logits);
-                cpuLogits.ToDevice(DataDevice::CPU);
-                TopK(cpuLogits, cpuTopk, 1);
-            }
-
             topk.ToDevice(DataDevice::CPU);
             float *topkData = (float*)topk.cpuData;
-            float *cpuTopkData = ShouldTraceSamplingTop1()
-                ? (float*)cpuTopk.cpuData : nullptr;
 
             for (int b = 0; b < batch; b++) {
                 const int cudaToken = (int)(topkData[0] + 1e-3);
                 lastRet.push_back(cudaToken);
-
-                if (cpuTopkData != nullptr) {
-                    const int cpuToken = (int)(cpuTopkData[0] + 1e-3);
-                    printf("[fastllm][sampling-top1] cuda_token=%d "
-                           "cpu_token=%d cuda_logit=%.9g cpu_logit=%.9g "
-                           "match=%s batch_index=%d\n",
-                           cudaToken, cpuToken, topkData[1], cpuTopkData[1],
-                           cudaToken == cpuToken ? "true" : "false", b);
-                    fflush(stdout);
-                    cpuTopkData += cpuTopk.Count(2);
-                }
-
                 topkData += topk.Count(2);
+            }
+
+            if (ShouldTraceSamplingTop1()) {
+                TraceSamplingTop1(logits, lastRet);
             }
         } else if (!needLogits && !needToolNameMask) {
             if (needRepeatPenalty) {
