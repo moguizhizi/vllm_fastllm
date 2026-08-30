@@ -671,6 +671,10 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     dst.isModelWeight = src.isModelWeight;
     dst.weightType = src.weightType;
     dst.linearQuantScheme = src.linearQuantScheme;
+    dst.w8a8InputDynamic = src.w8a8InputDynamic;
+    dst.w8a8InputSymmetric = src.w8a8InputSymmetric;
+    dst.w8a8InputScale = src.w8a8InputScale;
+    dst.w8a8InputZeroPoint = src.w8a8InputZeroPoint;
     dst.directMemory = src.directMemory;
     dst.group = src.group;
     dst.groupCnt = src.groupCnt;

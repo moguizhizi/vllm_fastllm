@@ -487,6 +487,10 @@ namespace fastllm {
         view.lockInCPU = source.lockInCPU;
         view.weightType = source.weightType;
         view.linearQuantScheme = source.linearQuantScheme;
+        view.w8a8InputDynamic = source.w8a8InputDynamic;
+        view.w8a8InputSymmetric = source.w8a8InputSymmetric;
+        view.w8a8InputScale = source.w8a8InputScale;
+        view.w8a8InputZeroPoint = source.w8a8InputZeroPoint;
 
         if (source.dataType == DataType::DATA_GGUF_FORMAT) {
             const uint64_t sourceBytes = source.GetBytes();

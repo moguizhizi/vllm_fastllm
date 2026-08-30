@@ -515,6 +515,12 @@ namespace fastllm {
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
         // 模型配置确定的Linear量化语义；硬件后端生命周期由CUDA侧独立管理。
         LinearQuantScheme linearQuantScheme = LinearQuantScheme::LEGACY_AUTO;
+        // INT8 W8A8激活量化语义。动态方案在每个token上生成scale/zero-point；
+        // 静态方案使用checkpoint随Linear保存的tensorwise参数。
+        bool w8a8InputDynamic = true;
+        bool w8a8InputSymmetric = true;
+        float w8a8InputScale = 0.0f;
+        int w8a8InputZeroPoint = 0;
 
         DataType dataType = DataType::FLOAT32; // 数据类型
         int unitSize, unitSizeDiv = 1; // 单个元素的字节数 = unitSIze / unitSizeDiv

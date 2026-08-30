@@ -2669,6 +2669,10 @@ namespace fastllm {
                 local->isModelWeight = data.isModelWeight;
                 local->weightType = data.weightType;
                 local->linearQuantScheme = data.linearQuantScheme;
+                local->w8a8InputDynamic = data.w8a8InputDynamic;
+                local->w8a8InputSymmetric = data.w8a8InputSymmetric;
+                local->w8a8InputScale = data.w8a8InputScale;
+                local->w8a8InputZeroPoint = data.w8a8InputZeroPoint;
                 local->dataDevice = DataDevice::CUDA;
                 local->dataDeviceIds = {device};
                 if (local->Count(0) > 0) {
@@ -2744,6 +2748,10 @@ namespace fastllm {
                 local->isModelWeight = weight.isModelWeight;
                 local->weightType = weight.weightType;
                 local->linearQuantScheme = weight.linearQuantScheme;
+                local->w8a8InputDynamic = weight.w8a8InputDynamic;
+                local->w8a8InputSymmetric = weight.w8a8InputSymmetric;
+                local->w8a8InputScale = weight.w8a8InputScale;
+                local->w8a8InputZeroPoint = weight.w8a8InputZeroPoint;
                 local->dataDevice = DataDevice::CUDA;
                 local->dataDeviceIds = {device};
                 if (local->Count(0) > 0) {

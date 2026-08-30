@@ -436,6 +436,10 @@ namespace fastllm {
         loaded->isModelWeight = false;
         loaded->weightType = weight->weightType;
         loaded->linearQuantScheme = weight->linearQuantScheme;
+        loaded->w8a8InputDynamic = weight->w8a8InputDynamic;
+        loaded->w8a8InputSymmetric = weight->w8a8InputSymmetric;
+        loaded->w8a8InputScale = weight->w8a8InputScale;
+        loaded->w8a8InputZeroPoint = weight->w8a8InputZeroPoint;
         loaded->tpLinearType = weight->tpLinearType;
         loaded->tpPackType = weight->tpPackType;
         loaded->perChannelAxis = weight->perChannelAxis;

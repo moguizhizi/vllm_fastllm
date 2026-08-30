@@ -1567,34 +1567,10 @@ namespace fastllm {
         return foundLinearW4A8;
     }
 
-    static bool IsCompressedTensorsInt8W8A8Config(const json11::Json &config) {
-        const auto &quant = config["quantization_config"];
-        if (quant.is_null() || quant["quant_method"].string_value() != "compressed-tensors" ||
-            quant["format"].string_value() != "int-quantized") return false;
-        bool found = false;
-        for (const auto &entry : quant["config_groups"].object_items()) {
-            const auto &group = entry.second;
-            if (!HasJsonString(group["targets"], "Linear")) continue;
-            const auto &weight = group["weights"];
-            const auto &input = group["input_activations"];
-            bool supported = weight["type"].string_value() == "int" &&
-                weight["num_bits"].int_value() == 8 &&
-                weight["strategy"].string_value() == "channel" &&
-                weight["symmetric"].bool_value() && !weight["dynamic"].bool_value() &&
-                weight["actorder"].is_null() &&
-                input["type"].string_value() == "int" &&
-                input["num_bits"].int_value() == 8 &&
-                input["strategy"].string_value() == "token" &&
-                input["symmetric"].bool_value() && input["dynamic"].bool_value() &&
-                input["actorder"].is_null();
-            if (!supported) return false;
-            found = true;
-        }
-        return found;
-    }
-
     struct CompressedTensorsLinearSchemeGroup {
         LinearQuantScheme scheme = LinearQuantScheme::NONE;
+        bool inputDynamic = true;
+        bool inputSymmetric = true;
         std::vector<std::string> targets;
     };
 
@@ -1631,21 +1607,28 @@ namespace fastllm {
             }
         }
 
-        LinearQuantScheme Resolve(const std::string &weightName,
-                                  WeightType weightType) const {
-            if (!configured) return LinearQuantScheme::LEGACY_AUTO;
-            if (weightType != WeightType::LINEAR) return LinearQuantScheme::NONE;
+        const CompressedTensorsLinearSchemeGroup *ResolveGroup(
+                const std::string &weightName, WeightType weightType) const {
+            if (!configured || weightType != WeightType::LINEAR) return nullptr;
             for (const auto &rule : ignore) {
-                if (MatchNameRule(weightName, rule)) return LinearQuantScheme::NONE;
+                if (MatchNameRule(weightName, rule)) return nullptr;
             }
             for (const auto &group : groups) {
                 for (const auto &target : group.targets) {
                     if (target == "Linear" || MatchNameRule(weightName, target)) {
-                        return group.scheme;
+                        return &group;
                     }
                 }
             }
-            return LinearQuantScheme::NONE;
+            return nullptr;
+        }
+
+        LinearQuantScheme Resolve(const std::string &weightName,
+                                  WeightType weightType) const {
+            const auto *group = ResolveGroup(weightName, weightType);
+            if (group != nullptr) return group->scheme;
+            return configured ? LinearQuantScheme::NONE :
+                                LinearQuantScheme::LEGACY_AUTO;
         }
     };
 
@@ -1700,8 +1683,10 @@ namespace fastllm {
         }
         if (weightType == "int" && weightBits == 8 &&
             inputType == "int" && inputBits == 8 &&
-            weightStrategy == "channel" && inputStrategy == "token" &&
-            !weight["dynamic"].bool_value() && input["dynamic"].bool_value()) {
+            weightStrategy == "channel" && weight["symmetric"].bool_value() &&
+            !weight["dynamic"].bool_value() &&
+            ((inputStrategy == "token" && input["dynamic"].bool_value()) ||
+             (inputStrategy == "tensor" && !input["dynamic"].bool_value()))) {
             return LinearQuantScheme::INT8_W8A8;
         }
         if (weightType == "int" && weightBits == 4 &&
@@ -1759,6 +1744,9 @@ namespace fastllm {
         for (const auto &entry : quant["config_groups"].object_items()) {
             CompressedTensorsLinearSchemeGroup parsed;
             parsed.scheme = ParseCompressedTensorsLinearScheme(entry.second, globalFormat);
+            const auto &input = entry.second["input_activations"];
+            parsed.inputDynamic = input.is_null() || input["dynamic"].bool_value();
+            parsed.inputSymmetric = input.is_null() || input["symmetric"].bool_value();
             for (const auto &target : entry.second["targets"].array_items()) {
                 if (!target.string_value().empty()) parsed.targets.push_back(target.string_value());
             }
@@ -1811,6 +1799,19 @@ namespace fastllm {
                 if (weight.dataType != DataType::INT8_W8A8 || weight.dims.size() != 2 ||
                     weight.scales.size() != (size_t)weight.dims[0]) {
                     fail("INT8 W8A8 requires signed I8 [N,K] and N channel scales");
+                }
+                if (!weight.w8a8InputDynamic &&
+                    (!(weight.w8a8InputScale > 0.0f) ||
+                     !std::isfinite(weight.w8a8InputScale))) {
+                    fail("static INT8 W8A8 requires a positive finite input scale");
+                }
+                if (weight.w8a8InputZeroPoint < -128 ||
+                    weight.w8a8InputZeroPoint > 127) {
+                    fail("INT8 W8A8 input zero-point is outside INT8 range");
+                }
+                if (weight.w8a8InputSymmetric &&
+                    weight.w8a8InputZeroPoint != 0) {
+                    fail("symmetric INT8 W8A8 requires input zero-point 0");
                 }
                 break;
             case LinearQuantScheme::INT4_W4A8: {
@@ -2731,6 +2732,12 @@ namespace fastllm {
         mergeData.linearQuantScheme = firstInput == weights.end()
             ? LinearQuantScheme::LEGACY_AUTO
             : firstInput->second.linearQuantScheme;
+        if (firstInput != weights.end()) {
+            mergeData.w8a8InputDynamic = firstInput->second.w8a8InputDynamic;
+            mergeData.w8a8InputSymmetric = firstInput->second.w8a8InputSymmetric;
+            mergeData.w8a8InputScale = firstInput->second.w8a8InputScale;
+            mergeData.w8a8InputZeroPoint = firstInput->second.w8a8InputZeroPoint;
+        }
         mergeData.scales.clear();
         mergeData.mins.clear();
         mergeData.zeros.clear();
@@ -3616,6 +3623,10 @@ namespace fastllm {
                                         mergeData.weightType = WeightType::LINEAR;
                                         mergeData.linearQuantScheme =
                                             model->weight[input0].linearQuantScheme;
+                                        mergeData.w8a8InputDynamic = model->weight[input0].w8a8InputDynamic;
+                                        mergeData.w8a8InputSymmetric = model->weight[input0].w8a8InputSymmetric;
+                                        mergeData.w8a8InputScale = model->weight[input0].w8a8InputScale;
+                                        mergeData.w8a8InputZeroPoint = model->weight[input0].w8a8InputZeroPoint;
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
                                         mergeData.group = model->weight[input0].group;
                                         mergeData.groupCnt = model->weight[input0].groupCnt;
@@ -3856,7 +3867,6 @@ namespace fastllm {
         auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
         bool isAwqModel = false;
         bool isCompressedW4A8Model = false;
-        bool isCompressedInt8W8A8Model = false;
         CompressedTensorsLinearSchemePlan linearSchemePlan;
         int awqGroupCnt = 128;
         std::string modelType = "";
@@ -3893,7 +3903,6 @@ namespace fastllm {
                 printf("[Fastllm] AWQ: keep unquantized floating-point tensors in source dtype.\n");
             }
             isCompressedW4A8Model = IsCompressedTensorsW4A8Config(config);
-            isCompressedInt8W8A8Model = IsCompressedTensorsInt8W8A8Config(config);
             linearSchemePlan = BuildCompressedTensorsLinearSchemePlan(config);
         }
         basellm *model = CreateModelWithType(modelType);
@@ -4274,6 +4283,8 @@ namespace fastllm {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
                         if (w4a8CompanionTensorNames.find(tensorName) != w4a8CompanionTensorNames.end() ||
+                            StringEndWith(tensorName, ".input_scale") ||
+                            StringEndWith(tensorName, ".input_zero_point") ||
                             IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             printLoadingProgress(tensor.bytes);
@@ -4291,8 +4302,15 @@ namespace fastllm {
                             int ggmlType = -1;
                             const WeightType logicalWeightType =
                                 model->weight.GetWeightType(weightName);
-                            model->weight[weightName].linearQuantScheme =
+                            Data &logicalWeight = model->weight[weightName];
+                            logicalWeight.linearQuantScheme =
                                 linearSchemePlan.Resolve(weightName, logicalWeightType);
+                            const auto *schemeGroup =
+                                linearSchemePlan.ResolveGroup(weightName, logicalWeightType);
+                            if (schemeGroup != nullptr) {
+                                logicalWeight.w8a8InputDynamic = schemeGroup->inputDynamic;
+                                logicalWeight.w8a8InputSymmetric = schemeGroup->inputSymmetric;
+                            }
 
                             bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
                             // With no explicit --moe_dtype, AWQ experts inherit the global
@@ -4302,7 +4320,9 @@ namespace fastllm {
                             int curGroupCnt = isMoeLinear
                                     ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
                                     : groupCnt;
-                            if (isCompressedInt8W8A8Model && tensor.dtype == "I8" &&
+                            if (logicalWeight.linearQuantScheme ==
+                                    LinearQuantScheme::INT8_W8A8 &&
+                                tensor.dtype == "I8" &&
                                 StringEndWith(tensorName, ".weight")) {
                                 std::string candidate = tensorName + "_scale";
                                 auto scaleIt = safeTensors.itmeDict.find(candidate);
@@ -4566,6 +4586,53 @@ namespace fastllm {
                                         model->weight[weightName].nvfp4GlobalScale = tensor.nvfp4GlobalScale;
                                     }
                                 }
+                                if (model->weight[weightName].linearQuantScheme ==
+                                        LinearQuantScheme::INT8_W8A8 &&
+                                    !model->weight[weightName].w8a8InputDynamic) {
+                                    const std::string prefix = tensorName.substr(
+                                        0, tensorName.size() - strlen(".weight"));
+                                    auto inputScaleIt = safeTensors.itmeDict.find(
+                                        prefix + ".input_scale");
+                                    AssertInFastLLM(
+                                        inputScaleIt != safeTensors.itmeDict.end(),
+                                        "Static INT8_W8A8 is missing input_scale: " +
+                                            tensorName + "\n");
+                                    inputScaleIt->second.CreateBuffer(DataType::FLOAT32);
+                                    AssertInFastLLM(inputScaleIt->second.len == 1,
+                                                    "Static INT8_W8A8 input_scale must be tensorwise.\n");
+                                    model->weight[weightName].w8a8InputScale =
+                                        ((float*)inputScaleIt->second.buffer)[0];
+                                    inputScaleIt->second.ClearBuffer();
+
+                                    auto inputZeroIt = safeTensors.itmeDict.find(
+                                        prefix + ".input_zero_point");
+                                    if (model->weight[weightName].w8a8InputSymmetric) {
+                                        model->weight[weightName].w8a8InputZeroPoint = 0;
+                                    } else {
+                                        AssertInFastLLM(
+                                            inputZeroIt != safeTensors.itmeDict.end(),
+                                            "Asymmetric static INT8_W8A8 is missing input_zero_point: " +
+                                                tensorName + "\n");
+                                        AssertInFastLLM(inputZeroIt->second.len == 1,
+                                                        "Static INT8_W8A8 input_zero_point must be tensorwise.\n");
+                                        if (inputZeroIt->second.dtype == "I8") {
+                                            inputZeroIt->second.CreateBuffer(DataType::INT8_W8A8);
+                                            model->weight[weightName].w8a8InputZeroPoint =
+                                                (int)((int8_t*)inputZeroIt->second.buffer)[0];
+                                        } else {
+                                            AssertInFastLLM(inputZeroIt->second.dtype == "I32",
+                                                            "Static INT8_W8A8 input_zero_point must be I8 or I32.\n");
+                                            inputZeroIt->second.CreateBuffer(DataType::INT32);
+                                            model->weight[weightName].w8a8InputZeroPoint =
+                                                ((int32_t*)inputZeroIt->second.buffer)[0];
+                                        }
+                                        AssertInFastLLM(
+                                            model->weight[weightName].w8a8InputZeroPoint >= -128 &&
+                                            model->weight[weightName].w8a8InputZeroPoint <= 127,
+                                            "Static INT8_W8A8 input_zero_point is outside INT8 range.\n");
+                                        inputZeroIt->second.ClearBuffer();
+                                    }
+                                }
                                 ValidateConfiguredLinearQuantScheme(
                                     weightName, model->weight[weightName]);
                                 if (isW4A8PackedTensor) {
@@ -4625,7 +4692,15 @@ namespace fastllm {
                                             if (model->weight[input].dataType != model->weight[it.inputs[0]].dataType ||
                                                 model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1] ||
                                                 model->weight[input].linearQuantScheme !=
-                                                    model->weight[it.inputs[0]].linearQuantScheme) {
+                                                    model->weight[it.inputs[0]].linearQuantScheme ||
+                                                model->weight[input].w8a8InputDynamic !=
+                                                    model->weight[it.inputs[0]].w8a8InputDynamic ||
+                                                model->weight[input].w8a8InputSymmetric !=
+                                                    model->weight[it.inputs[0]].w8a8InputSymmetric ||
+                                                model->weight[input].w8a8InputScale !=
+                                                    model->weight[it.inputs[0]].w8a8InputScale ||
+                                                model->weight[input].w8a8InputZeroPoint !=
+                                                    model->weight[it.inputs[0]].w8a8InputZeroPoint) {
                                                 canMerge = false;
                                                 break;
                                             }
@@ -4681,6 +4756,10 @@ namespace fastllm {
                                         mergeData.weightType = WeightType::LINEAR;
                                         mergeData.linearQuantScheme =
                                             model->weight[input0].linearQuantScheme;
+                                        mergeData.w8a8InputDynamic = model->weight[input0].w8a8InputDynamic;
+                                        mergeData.w8a8InputSymmetric = model->weight[input0].w8a8InputSymmetric;
+                                        mergeData.w8a8InputScale = model->weight[input0].w8a8InputScale;
+                                        mergeData.w8a8InputZeroPoint = model->weight[input0].w8a8InputZeroPoint;
                                         if (mergeData.dataType == DataType::INT4_W4A8) {
                                             for (const auto &input : it.inputs) {
                                                 std::string reason;

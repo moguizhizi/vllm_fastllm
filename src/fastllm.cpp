@@ -951,6 +951,10 @@ namespace fastllm {
 #endif
         this->dataType = ori.dataType;
         this->linearQuantScheme = ori.linearQuantScheme;
+        this->w8a8InputDynamic = ori.w8a8InputDynamic;
+        this->w8a8InputSymmetric = ori.w8a8InputSymmetric;
+        this->w8a8InputScale = ori.w8a8InputScale;
+        this->w8a8InputZeroPoint = ori.w8a8InputZeroPoint;
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
@@ -980,6 +984,10 @@ namespace fastllm {
         this->ToDevice(ori.dataDevice);
         this->name = ori.name;
         this->linearQuantScheme = ori.linearQuantScheme;
+        this->w8a8InputDynamic = ori.w8a8InputDynamic;
+        this->w8a8InputSymmetric = ori.w8a8InputSymmetric;
+        this->w8a8InputScale = ori.w8a8InputScale;
+        this->w8a8InputZeroPoint = ori.w8a8InputZeroPoint;
         this->isKVCache = ori.isKVCache;
         this->isLinearAttention = ori.isLinearAttention;
         this->isLinearAttentionTransposed = ori.isLinearAttentionTransposed;

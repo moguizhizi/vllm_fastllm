@@ -5042,8 +5042,9 @@ namespace fastllm {
         // 直接报错，禁止错误地落入普通Linear路径。
         if (weight.dataType == DataType::INT8_W8A8) {
             ErrorInFastLLM(
-                "Linear error: symmetric INT8 W8A8 requires an SM90 CUTLASS build, "
-                "signed I8 [N,K] weights, FP32 per-channel scales, K%16=0 and N%8=0.\n");
+                "Linear error: INT8 W8A8 requires an SM90 CUTLASS build, symmetric "
+                "signed I8 [N,K] weights, FP32 per-channel weight scales, supported "
+                "activation scale/zero-point metadata, K%16=0 and N%8=0.\n");
         }
         if (weight.dataType == DataType::INT4_W4A8) {
             int runtimeArch = FastllmCudaRuntimeArch();

@@ -1,7 +1,7 @@
 // Apache-2.0. Native FastLLM adaptation of vLLM scaled_mm SM90 INT8/FP8 and
 // SM120 FP8 kernels.  The public wrappers intentionally reject every layout
-// except dynamic per-token activation scale + symmetric per-output-channel or
-// tensorwise weight scale.
+// except INT8/FP8 W8A8 activation quantization + symmetric per-output-channel
+// or tensorwise weight scale.
 #include "fastllm-cuda.cuh"
 
 #include <cuda_bf16.h>
@@ -10,6 +10,7 @@
 #include <cub/block/block_reduce.cuh>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -41,39 +42,43 @@ using BackendState = FastllmCudaFp8W8A8BackendState;
 /**
  * Dense W8A8执行阶段按GPU复用的临时显存。
  *
- * FP8权重已经是CUTLASS直接消费的[N,K]格式，不需要像NVFP4一样保留
- * 第二份重排权重。本结构只缓存动态量化激活、per-token scale和可能
- * 存在的CUTLASS workspace；融合epilogue直接写最终输出，各缓冲区只
- * 扩容、不缩小。
+ * INT8/FP8权重已经是CUTLASS直接消费的[N,K]格式，不保留
+ * 第二份重排权重。本结构缓存量化激活、per-token scale、可选
+ * zero-point和CUTLASS workspace；融合epilogue直接写最终输出，各缓冲区
+ * 只扩容、不缩小。
  */
 struct ExecutionScratch {
     void *quantized = nullptr;
     float *tokenScales = nullptr;
+    int32_t *tokenZeroPoints = nullptr;
     void *workspace = nullptr;
     size_t quantizedBytes = 0;
     size_t tokenScaleBytes = 0;
+    size_t tokenZeroPointBytes = 0;
     size_t workspaceBytes = 0;
 };
 
 /**
- * 缓存标准FP8权重供CUTLASS epilogue直接消费的稳定设备参数。
+ * 缓存Dense INT8/FP8权重供CUTLASS直接消费的稳定设备参数。
  *
- * FP8权重本身已经是CUTLASS所需的[N,K]物理布局，因此本缓存不复制权重，
- * 只记录原权重指针、设备端scale，并保存由FastLLM FP32 bias一次性转换出的
- * FP16/BF16 bias。缓存按权重、bias、GPU和输出类型隔离，保证CUDA Graph
- * 重放期间所有地址保持稳定。
+ * 权重本身已经是CUTLASS所需的[N,K]物理布局，因此不复制权重。
+ * 缓存记录原权重指针、设备端scale、INT8 AZP所需的权重行和，并
+ * 保存由FastLLM FP32 bias一次性转换出的FP16/BF16 bias。缓存按
+ * 权重、bias、GPU和输出类型隔离，保证CUDA Graph重放期间地址稳定。
  */
 struct WeightCache {
     const void *weight = nullptr;
     const float *scales = nullptr;
+    int32_t *azpAdj = nullptr;
     void *bias = nullptr;
     const void *biasSource = nullptr;
     int scaleCount = 0;
     int n = 0;
+    int32_t azpMultiplier = 1;
 };
 
 /**
- * 按权重和GPU保存CUTLASS使用的设备端权重scale。
+ * 按Dense INT8/FP8权重和GPU保存CUTLASS使用的设备端scale。
  *
  * scale源保留在Data::scales主机数组中；权重迁移GPU时销毁旧设备副本，
  * 再从主机源直接在目标GPU创建，禁止复用Data::extraCudaData中的旧卡地址。
@@ -145,6 +150,7 @@ static void SetBackendState(const fastllm::Data &weight, int device,
 static void ReleaseScratch(ExecutionScratch &scratch) {
     if (scratch.quantized != nullptr) FastllmCudaFree(scratch.quantized);
     if (scratch.tokenScales != nullptr) FastllmCudaFree(scratch.tokenScales);
+    if (scratch.tokenZeroPoints != nullptr) FastllmCudaFree(scratch.tokenZeroPoints);
     if (scratch.workspace != nullptr) FastllmCudaFree(scratch.workspace);
     scratch = ExecutionScratch();
 }
@@ -155,12 +161,15 @@ static void ReleaseScratch(ExecutionScratch &scratch) {
  * 首次GEMM会完成分配，后续正式推理直接复用稳定地址；CUDA Graph捕获
  * 期间禁止扩容。申请新空间失败时保留原临时区，避免破坏其他调用。
  *
- * @param quantizedBytes   FP8动态量化激活所需字节数。
+ * @param quantizedBytes   INT8/FP8量化激活所需字节数。
  * @param tokenScaleBytes  per-token FP32 scale所需字节数。
+ * @param tokenZeroPointBytes per-token INT32 zero-point所需字节数；
+ *                            对称量化传0。
  * @return 容量足够时返回当前GPU临时区，否则返回nullptr。
  */
 static ExecutionScratch *GetExecutionScratch(size_t quantizedBytes,
-                                             size_t tokenScaleBytes) {
+                                             size_t tokenScaleBytes,
+                                             size_t tokenZeroPointBytes = 0) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
 
@@ -168,8 +177,10 @@ static ExecutionScratch *GetExecutionScratch(size_t quantizedBytes,
     ExecutionScratch &scratch = executionScratch[device];
 
     if (scratch.quantized != nullptr && scratch.tokenScales != nullptr &&
+        (tokenZeroPointBytes == 0 || scratch.tokenZeroPoints != nullptr) &&
         scratch.quantizedBytes >= quantizedBytes &&
-        scratch.tokenScaleBytes >= tokenScaleBytes) {
+        scratch.tokenScaleBytes >= tokenScaleBytes &&
+        scratch.tokenZeroPointBytes >= tokenZeroPointBytes) {
         return &scratch;
     }
 
@@ -179,14 +190,20 @@ static ExecutionScratch *GetExecutionScratch(size_t quantizedBytes,
     replacement.quantized = FastllmCudaMalloc(quantizedBytes);
     replacement.tokenScales = static_cast<float *>(
         FastllmCudaMalloc(tokenScaleBytes));
+    if (tokenZeroPointBytes != 0) {
+        replacement.tokenZeroPoints = static_cast<int32_t *>(
+            FastllmCudaMalloc(tokenZeroPointBytes));
+    }
 
-    if (replacement.quantized == nullptr || replacement.tokenScales == nullptr) {
+    if (replacement.quantized == nullptr || replacement.tokenScales == nullptr ||
+        (tokenZeroPointBytes != 0 && replacement.tokenZeroPoints == nullptr)) {
         ReleaseScratch(replacement);
         return nullptr;
     }
 
     replacement.quantizedBytes = quantizedBytes;
     replacement.tokenScaleBytes = tokenScaleBytes;
+    replacement.tokenZeroPointBytes = tokenZeroPointBytes;
 
     ReleaseScratch(scratch);
     scratch = replacement;
@@ -233,6 +250,12 @@ __device__ __forceinline__ Quant QuantizeValue(float value, float scale) {
 struct QuantizeMaxOp {
     __device__ __forceinline__ float operator()(float lhs, float rhs) const {
         return fmaxf(lhs, rhs);
+    }
+};
+
+struct QuantizeMinOp {
+    __device__ __forceinline__ float operator()(float lhs, float rhs) const {
+        return fminf(lhs, rhs);
     }
 };
 
@@ -302,6 +325,127 @@ __global__ void QuantizePerToken(const Input *input, Quant *quant,
     }
 }
 
+/**
+ * 将FP16/BF16激活逐token动态非对称量化为有符号INT8。
+ *
+ * 每行独立归约真实min/max，与vLLM一致地计算
+ * scale=(max-min)/255和zeroPoint=round(-128-min/scale)，再写出
+ * q=clamp(round(x/scale)+zeroPoint,-128,127)。修正项由CUTLASS epilogue处理。
+ *
+ * @param input       FP16或BF16输入，逻辑形状为[rows, cols]。
+ * @param quant       INT8输出，逻辑形状为[rows, cols]。
+ * @param scales      每行一个FP32激活scale，长度为rows。
+ * @param zeroPoints  每行一个INT32激活zero-point，长度为rows。
+ * @param rows        token行数。
+ * @param cols        每个token的特征数，必须为16的倍数。
+ */
+template <typename Input>
+__global__ void QuantizePerTokenAsymmetric(
+        const Input *input, int8_t *quant, float *scales,
+        int32_t *zeroPoints, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    float localMin = FLT_MAX;
+    float localMax = -FLT_MAX;
+    for (int index = threadIdx.x; index < cols; index += blockDim.x) {
+        const float value = ToFloat(input[(size_t)row * cols + index]);
+        localMin = fminf(localMin, value);
+        localMax = fmaxf(localMax, value);
+    }
+
+    using BlockReduce = cub::BlockReduce<float, 256>;
+    __shared__ typename BlockReduce::TempStorage reductionStorage;
+    const float minimum = BlockReduce(reductionStorage).Reduce(
+        localMin, QuantizeMinOp{});
+    __syncthreads();
+    const float maximum = BlockReduce(reductionStorage).Reduce(
+        localMax, QuantizeMaxOp{});
+
+    __shared__ float rowScale;
+    __shared__ int32_t rowZeroPoint;
+    if (threadIdx.x == 0) {
+        rowScale = (maximum - minimum) / 255.0f;
+        rowZeroPoint = __float2int_rn(-128.0f - minimum / rowScale);
+        scales[row] = rowScale;
+        zeroPoints[row] = rowZeroPoint;
+    }
+    __syncthreads();
+
+    for (int index = threadIdx.x; index < cols; index += blockDim.x) {
+        const float value = ToFloat(input[(size_t)row * cols + index]);
+        const int q = max(-128, min(127,
+            __float2int_rn(value / rowScale) + rowZeroPoint));
+        quant[(size_t)row * cols + index] = static_cast<int8_t>(q);
+    }
+}
+
+/**
+ * 使用checkpoint给定的tensorwise参数量化INT8 W8A8激活。
+ *
+ * @param input      FP16或BF16输入，逻辑形状为[rows, cols]。
+ * @param quant      INT8输出，逻辑形状为[rows, cols]。
+ * @param scale      正的tensorwise FP32激活scale。
+ * @param zeroPoint  tensorwise INT8 zero-point，以INT32传递。
+ * @param elements   输入元素总数。
+ */
+template <typename Input>
+__global__ void QuantizePerTensorStatic(
+        const Input *input, int8_t *quant, float scale,
+        int32_t zeroPoint, size_t elements) {
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (size_t)blockDim.x * gridDim.x) {
+        const int q = max(-128, min(127,
+            __float2int_rn(ToFloat(input[index]) / scale) + zeroPoint));
+        quant[index] = static_cast<int8_t>(q);
+    }
+}
+
+/**
+ * 预计算每个INT8输出通道的K维和，供AZP epilogue复用。
+ *
+ * @param weight 对称INT8权重，逻辑形状为[rows, cols]。
+ * @param sums   INT32行和输出，长度为rows。
+ * @param rows   输出通道数。
+ * @param cols   K维长度。
+ * @param multiplier 动态AZP传1；静态AZP传checkpoint zero-point，
+ *                   直接缓存zeroPoint*sumB。
+ */
+__global__ void SumInt8WeightRows(const int8_t *weight, int32_t *sums,
+                                  int rows, int cols, int32_t multiplier) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int local = 0;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        local += (int)weight[(size_t)row * cols + col];
+    }
+
+    using BlockReduce = cub::BlockReduce<int, 256>;
+    __shared__ typename BlockReduce::TempStorage reductionStorage;
+    const int sum = BlockReduce(reductionStorage).Sum(local);
+    if (threadIdx.x == 0) sums[row] = sum * multiplier;
+}
+
+/**
+ * 将静态tensorwise激活量化参数展开到按token复用的稳定缓冲区。
+ *
+ * @param scales      FP32 per-token scale输出，长度为rows。
+ * @param zeroPoints  可选INT32 per-token zero-point输出，对称路径为nullptr。
+ * @param rows        token数。
+ * @param scale       checkpoint中的tensorwise scale。
+ * @param zeroPoint   checkpoint中的tensorwise zero-point。
+ */
+__global__ void FillStaticQuantParams(float *scales, int32_t *zeroPoints,
+                                      int rows, float scale,
+                                      int32_t zeroPoint) {
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < rows; row += blockDim.x * gridDim.x) {
+        scales[row] = scale;
+        if (zeroPoints != nullptr) zeroPoints[row] = zeroPoint;
+    }
+}
+
 template <typename Output>
 __global__ void ConvertBias(const float *source, Output *target, int count) {
     for (int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -312,6 +456,7 @@ __global__ void ConvertBias(const float *source, Output *target, int count) {
 
 static void ReleaseWeightCache(WeightCache &cache) {
     if (cache.bias != nullptr) FastllmCudaFree(cache.bias);
+    if (cache.azpAdj != nullptr) FastllmCudaFree(cache.azpAdj);
     cache = WeightCache();
 }
 
@@ -380,7 +525,7 @@ static void ReleaseWeightCacheForDevice(const fastllm::Data *weight,
 }
 
 /**
- * 取得标准FP8权重对应的CUTLASS参数缓存。
+ * 取得Dense INT8/FP8权重对应的CUTLASS参数缓存。
  *
  * 权重和scale沿用模型上传后的设备表示，不创建第二份权重。FastLLM的
  * Linear bias固定为FP32，而vLLM SM120 scaled-mm要求bias与输出同类型；
@@ -392,12 +537,17 @@ static void ReleaseWeightCacheForDevice(const fastllm::Data *weight,
  * @param bias    可选FP32 bias，逻辑形状为[N]。
  * @param device  当前CUDA设备编号。
  * @param n       输出特征数。
+ * @param k       输入特征数。
+ * @param needAzpAdj true表示需要缓存每个INT8权重行的K维和。
+ * @param azpMultiplier 动态AZP传1；静态AZP传激活zero-point。
  * @return 成功时返回地址稳定的参数缓存；失败时返回nullptr。
  */
 template <typename Output>
 static WeightCache *GetWeightCache(fastllm::Data &weight,
                                    const fastllm::Data &bias,
-                                   int device, int n) {
+                                   int device, int n, int k,
+                                   bool needAzpAdj = false,
+                                   int32_t azpMultiplier = 1) {
     const fastllm::DataType outputType =
         std::is_same_v<Output, cutlass::half_t>
             ? fastllm::DataType::FLOAT16
@@ -411,7 +561,9 @@ static WeightCache *GetWeightCache(fastllm::Data &weight,
         WeightCache &cache = found->second;
 
         if (cache.weight == weight.cudaData && cache.n == n &&
-            cache.biasSource == bias.cudaData) {
+            cache.biasSource == bias.cudaData &&
+            (!needAzpAdj || (cache.azpAdj != nullptr &&
+                             cache.azpMultiplier == azpMultiplier))) {
             return &cache;
         }
 
@@ -432,10 +584,31 @@ static WeightCache *GetWeightCache(fastllm::Data &weight,
     cache.scaleCount = scaleCache->count;
     cache.n = n;
     cache.biasSource = bias.cudaData;
+    cache.azpMultiplier = azpMultiplier;
+
+    if (needAzpAdj) {
+        cache.azpAdj = static_cast<int32_t *>(
+            FastllmCudaMalloc((size_t)n * sizeof(int32_t)));
+        if (cache.azpAdj == nullptr) {
+            ReleaseWeightCache(cache);
+            return nullptr;
+        }
+
+        SumInt8WeightRows<<<n, 256>>>(
+            static_cast<const int8_t *>(weight.cudaData), cache.azpAdj,
+            n, k, azpMultiplier);
+        if (cudaGetLastError() != cudaSuccess) {
+            ReleaseWeightCache(cache);
+            return nullptr;
+        }
+    }
 
     if (!bias.dims.empty()) {
         cache.bias = FastllmCudaMalloc((size_t)n * sizeof(Output));
-        if (cache.bias == nullptr) return nullptr;
+        if (cache.bias == nullptr) {
+            ReleaseWeightCache(cache);
+            return nullptr;
+        }
 
         const int threads = 256;
         const int blocks = std::min(4096, (n + threads - 1) / threads);
@@ -543,6 +716,84 @@ struct FusedScaledEpilogue {
     }
 };
 
+/**
+ * 融合执行SM90 INT8激活zero-point修正、反量化与bias。
+ *
+ * 动态模式计算accum-zpA[M]*sumB[N]；静态模式接收已经乘过标量zpA的
+ * azpWithAdj[N]。修正后的INT32累加值依次乘权重scale和激活scale，最后
+ * 加可选bias并直接写FP16/BF16，避免物化[M,N]修正矩阵。
+ */
+template <typename ElementAcc, typename ElementD, typename TileShape,
+          bool PerToken>
+struct FusedScaledAzpEpilogue {
+    using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+    using ScaleAStride = Stride<bool, _0, _0>;
+    using ScaleBStride = Stride<_0, bool, _0>;
+    using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+        0, TileShape, float, float, ScaleAStride, 4, false>;
+    using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, float, float, ScaleBStride, 4, false>;
+    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, ElementD, ElementD, Stride<_0, _1, _0>,
+        128 / sizeof_bits_v<ElementD>, true>;
+    using AzpAdj = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, int32_t, int32_t, Stride<_0, _1, _0>, 4, false>;
+    using Azp = cutlass::epilogue::fusion::Sm90ColBroadcast<
+        0, TileShape, int32_t, int32_t, Stride<_1, _0, _0>, 4, false>;
+
+    using MultiplyAzp = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::multiplies, int32_t, int32_t,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+    using AzpProduct = cutlass::epilogue::fusion::Sm90EVT<
+        MultiplyAzp, Azp, AzpAdj>;
+    using Subtract = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::minus, float, int32_t,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+    using CorrectedDynamic = cutlass::epilogue::fusion::Sm90EVT<
+        Subtract, Accum, AzpProduct>;
+    using CorrectedStatic = cutlass::epilogue::fusion::Sm90EVT<
+        Subtract, Accum, AzpAdj>;
+    using Corrected = std::conditional_t<PerToken,
+        CorrectedDynamic, CorrectedStatic>;
+
+    using MultiplyB = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::multiplies, float, float,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+    using ScaledB = cutlass::epilogue::fusion::Sm90EVT<
+        MultiplyB, ScaleB, Corrected>;
+    using FinalCompute = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::homogeneous_multiply_add, ElementD, float,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVTCompute = cutlass::epilogue::fusion::Sm90EVT<
+        FinalCompute, ScaleA, ScaledB, Bias>;
+    using Arguments = typename EVTCompute::Arguments;
+
+    static Arguments Prepare(const float *scaleA, bool perTokenScale,
+                             const float *scaleB, bool perChannel,
+                             const int32_t *azpAdj, const int32_t *azp,
+                             const ElementD *bias) {
+        typename ScaleA::Arguments aArgs{
+            scaleA, 0.0f, ScaleAStride{perTokenScale, _0{}, _0{}}};
+        typename ScaleB::Arguments bArgs{
+            scaleB, 0.0f, ScaleBStride{_0{}, perChannel, _0{}}};
+        typename Bias::Arguments biasArgs{bias, ElementD(0), {}};
+        typename AzpAdj::Arguments adjArgs{azpAdj, int32_t(0), {}};
+
+        if constexpr (PerToken) {
+            typename Azp::Arguments azpArgs{azp, int32_t(0), {}};
+            typename AzpProduct::Arguments productArgs{azpArgs, adjArgs, {}};
+            typename CorrectedDynamic::Arguments correctedArgs{
+                {}, productArgs, {}};
+            typename ScaledB::Arguments scaledArgs{bArgs, correctedArgs, {}};
+            return Arguments{aArgs, scaledArgs, biasArgs, {}};
+        } else {
+            typename CorrectedStatic::Arguments correctedArgs{{}, adjArgs, {}};
+            typename ScaledB::Arguments scaledArgs{bArgs, correctedArgs, {}};
+            return Arguments{aArgs, scaledArgs, biasArgs, {}};
+        }
+    }
+};
+
 template <
     typename Element,
     typename Output,
@@ -617,6 +868,40 @@ struct DenseKernel {
         EnableSm120Only<Base>>;
 
     struct GemmKernel : EnabledKernel {};
+};
+
+template <typename Output, typename Tile, typename Cluster,
+          typename MainloopSchedule, bool PerToken>
+struct Sm90Int8AzpDenseKernel {
+    using ElementA = int8_t;
+    using ElementB = int8_t;
+    using ElementD = Output;
+    using ElementAccumulator = int32_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+    static constexpr int Alignment = 16;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<Output>::value;
+
+    using EpilogueOperation = FusedScaledAzpEpilogue<
+        ElementAccumulator, Output, Tile, PerToken>;
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, Tile, Cluster,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, float, void, LayoutD, AlignmentD,
+        Output, LayoutD, AlignmentD,
+        cutlass::epilogue::TmaWarpSpecialized,
+        typename EpilogueOperation::EVTCompute>::CollectiveOp;
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+        int8_t, LayoutA, Alignment, int8_t, LayoutB, Alignment,
+        ElementAccumulator, Tile, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+        MainloopSchedule>::CollectiveOp;
+    using Base = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, Mainloop, Epilogue>;
+    struct GemmKernel : EnableSm90Only<Base> {};
 };
 
 #if defined(FASTLLM_CUTLASS_W8A8_SM90)
@@ -788,6 +1073,104 @@ bool Run(typename Definition::ElementA const *a,
 
     cutlass::Status status = gemm.run(args, workspace, stream);
     return status == cutlass::Status::kSuccess && cudaGetLastError() == cudaSuccess;
+}
+
+/**
+ * 构造AZP CUTLASS参数并提交一次SM90 INT8 GEMM。
+ *
+ * @return true表示形状可实现、workspace可用且kernel成功提交。
+ */
+template <typename Definition>
+bool RunAzp(const int8_t *a, const int8_t *b,
+            typename Definition::ElementD *d,
+            const float *scaleA, bool perTokenScale,
+            const float *scaleB, bool perChannel,
+            const int32_t *azpAdj, const int32_t *azp,
+            const typename Definition::ElementD *bias,
+            int m, int n, int k, cudaStream_t stream,
+            ExecutionScratch &scratch) {
+    using Kernel = typename Definition::GemmKernel;
+    using Adapter = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+    using StrideA = typename Kernel::StrideA;
+    using StrideB = typename Kernel::StrideB;
+    using StrideD = typename Kernel::StrideD;
+
+    StrideA strideA = cutlass::make_cute_packed_stride(
+        StrideA{}, make_shape(m, k, 1));
+    StrideB strideB = cutlass::make_cute_packed_stride(
+        StrideB{}, make_shape(n, k, 1));
+    StrideD strideD = cutlass::make_cute_packed_stride(
+        StrideD{}, make_shape(m, n, 1));
+    typename Kernel::MainloopArguments mainloop{a, strideA, b, strideB};
+    auto callbackArgs = Definition::EpilogueOperation::Prepare(
+        scaleA, perTokenScale, scaleB, perChannel,
+        azpAdj, azp, bias);
+    typename Kernel::EpilogueArguments epilogue{
+        callbackArgs, d, strideD, d, strideD};
+
+    cutlass::KernelHardwareInfo hw;
+    hw.device_id = FastllmCudaGetDevice();
+    hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+        hw.device_id);
+    typename Kernel::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        make_shape(m, n, k, 1), mainloop, epilogue, hw};
+
+    Adapter gemm;
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
+    const size_t workspaceBytes = Adapter::get_workspace_size(args);
+    void *workspace = GetWorkspace(scratch, workspaceBytes);
+    if (workspaceBytes != 0 && workspace == nullptr) return false;
+    const cutlass::Status status = gemm.run(args, workspace, stream);
+    return status == cutlass::Status::kSuccess &&
+           cudaGetLastError() == cudaSuccess;
+}
+
+/**
+ * 按M/N边界选择与vLLM SM90 INT8相同的tile和warp调度。
+ *
+ * @return true表示选中的AZP kernel已成功提交。
+ */
+template <typename Output, bool PerToken>
+bool DispatchAzp(const int8_t *a, const int8_t *b, Output *d,
+                 const float *scaleA, bool perTokenScale,
+                 const float *scaleB, bool perChannel,
+                 const int32_t *azpAdj, const int32_t *azp,
+                 const Output *bias, int m, int n, int k,
+                 cudaStream_t stream, ExecutionScratch &scratch) {
+    if (m <= 32 && n < 8192) {
+        using D = Sm90Int8AzpDenseKernel<Output,
+            Shape<_64,_64,_256>, Shape<_1,_8,_1>,
+            cutlass::gemm::KernelTmaWarpSpecialized, PerToken>;
+        return RunAzp<D>(a, b, d, scaleA, perTokenScale, scaleB,
+            perChannel, azpAdj, azp, bias, m, n, k, stream, scratch);
+    }
+    if (m <= 32) {
+        using D = Sm90Int8AzpDenseKernel<Output,
+            Shape<_64,_128,_256>, Shape<_1,_4,_1>,
+            cutlass::gemm::KernelTmaWarpSpecialized, PerToken>;
+        return RunAzp<D>(a, b, d, scaleA, perTokenScale, scaleB,
+            perChannel, azpAdj, azp, bias, m, n, k, stream, scratch);
+    }
+    if (m <= 64) {
+        using D = Sm90Int8AzpDenseKernel<Output,
+            Shape<_64,_64,_256>, Shape<_1,_1,_1>,
+            cutlass::gemm::KernelTmaWarpSpecialized, PerToken>;
+        return RunAzp<D>(a, b, d, scaleA, perTokenScale, scaleB,
+            perChannel, azpAdj, azp, bias, m, n, k, stream, scratch);
+    }
+    if (m <= 128) {
+        using D = Sm90Int8AzpDenseKernel<Output,
+            Shape<_64,_128,_128>, Shape<_2,_1,_1>,
+            cutlass::gemm::KernelTmaWarpSpecializedPingpong, PerToken>;
+        return RunAzp<D>(a, b, d, scaleA, perTokenScale, scaleB,
+            perChannel, azpAdj, azp, bias, m, n, k, stream, scratch);
+    }
+    using D = Sm90Int8AzpDenseKernel<Output,
+        Shape<_128,_128,_128>, Shape<_2,_1,_1>,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpong, PerToken>;
+    return RunAzp<D>(a, b, d, scaleA, perTokenScale, scaleB,
+        perChannel, azpAdj, azp, bias, m, n, k, stream, scratch);
 }
 
 #if defined(FASTLLM_CUTLASS_W8A8_SM90)
@@ -1071,7 +1454,7 @@ bool Execute(const fastllm::Data &input, fastllm::Data &weight,
         (size_t)m * k * sizeof(Quant), (size_t)m * sizeof(float));
 
     const int device = FastllmCudaGetDevice();
-    WeightCache *cache = GetWeightCache<Output>(weight, bias, device, n);
+    WeightCache *cache = GetWeightCache<Output>(weight, bias, device, n, k);
 
     if (scratch == nullptr || cache == nullptr || cache->weight == nullptr ||
         cache->scales == nullptr) return false;
@@ -1101,15 +1484,106 @@ bool Execute(const fastllm::Data &input, fastllm::Data &weight,
               tokenScales, true, channelScales, perChannel, biasData,
               m, n, k, stream, *scratch);
 }
+
+/**
+ * 执行SM90 INT8 W8A8，并按模型元数据选择对称/非对称和动态/静态激活量化。
+ *
+ * 权重始终为对称per-channel INT8。非对称激活额外生成zero-point，并在
+ * CUTLASS epilogue中用预缓存的权重行和完成修正。静态tensorwise参数会
+ * 展开到可复用的per-token临时区，以保持所有kernel参数地址可被CUDA Graph
+ * 稳定捕获。
+ *
+ * @return true表示激活量化、AZP参数准备和CUTLASS GEMM均成功。
+ */
+template <typename Input, typename Output>
+bool ExecuteInt8(const fastllm::Data &input, fastllm::Data &weight,
+                 const fastllm::Data &bias, fastllm::Data &output,
+                 int m, int k, int n) {
+    const bool asymmetric = !weight.w8a8InputSymmetric;
+    const bool staticAzp = asymmetric && !weight.w8a8InputDynamic;
+    ExecutionScratch *scratch = GetExecutionScratch(
+        (size_t)m * k, (size_t)m * sizeof(float),
+        asymmetric && weight.w8a8InputDynamic
+            ? (size_t)m * sizeof(int32_t) : 0);
+    const int device = FastllmCudaGetDevice();
+    WeightCache *cache = GetWeightCache<Output>(
+        weight, bias, device, n, k, asymmetric,
+        staticAzp ? weight.w8a8InputZeroPoint : 1);
+    if (scratch == nullptr || cache == nullptr || cache->weight == nullptr ||
+        cache->scales == nullptr || (asymmetric && cache->azpAdj == nullptr)) {
+        return false;
+    }
+
+    auto *quant = static_cast<int8_t *>(scratch->quantized);
+    float *tokenScales = scratch->tokenScales;
+    int32_t *tokenZeroPoints = scratch->tokenZeroPoints;
+    cudaStream_t stream = 0;
+
+    if (weight.w8a8InputDynamic) {
+        if (asymmetric) {
+            QuantizePerTokenAsymmetric<Input><<<m, 256, 0, stream>>>(
+                static_cast<const Input *>(input.cudaData), quant,
+                tokenScales, tokenZeroPoints, m, k);
+        } else {
+            QuantizePerToken<Input, int8_t, 127><<<m, 256, 0, stream>>>(
+                static_cast<const Input *>(input.cudaData), quant,
+                tokenScales, m, k);
+        }
+    } else {
+        if (!(weight.w8a8InputScale > 0.0f) ||
+            !std::isfinite(weight.w8a8InputScale)) return false;
+        const size_t elements = (size_t)m * k;
+        const int blocks = std::min<size_t>(4096, (elements + 255) / 256);
+        QuantizePerTensorStatic<Input><<<blocks, 256, 0, stream>>>(
+            static_cast<const Input *>(input.cudaData), quant,
+            weight.w8a8InputScale, weight.w8a8InputZeroPoint, elements);
+        const int paramBlocks = std::min(4096, (m + 255) / 256);
+        FillStaticQuantParams<<<paramBlocks, 256, 0, stream>>>(
+            tokenScales, nullptr, m,
+            weight.w8a8InputScale, weight.w8a8InputZeroPoint);
+    }
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    Output *outputData = static_cast<Output *>(output.cudaData);
+    const auto *weightData = static_cast<const int8_t *>(cache->weight);
+    const bool perChannel = cache->scaleCount != 1;
+    const Output *biasData = static_cast<const Output *>(cache->bias);
+    if (asymmetric) {
+        const bool success = staticAzp
+            ? DispatchAzp<Output, false>(
+                  quant, weightData, outputData, tokenScales, true,
+                  cache->scales, perChannel, cache->azpAdj,
+                  nullptr, biasData, m, n, k, stream, *scratch)
+            : DispatchAzp<Output, true>(
+                  quant, weightData, outputData, tokenScales, true,
+                  cache->scales, perChannel, cache->azpAdj,
+                  tokenZeroPoints, biasData, m, n, k, stream, *scratch);
+        Trace(success ? "w8a8-int8-azp-cutlass" : "fallback",
+              success ? "success" : "INT8 AZP GEMM failed", m, n, k);
+        return success;
+    }
+    const bool success = biasData == nullptr
+        ? Dispatch<int8_t, Output, false>(
+              90, quant, weightData, outputData, tokenScales, true,
+              cache->scales, perChannel, nullptr,
+              m, n, k, stream, *scratch)
+        : Dispatch<int8_t, Output, true>(
+              90, quant, weightData, outputData, tokenScales, true,
+              cache->scales, perChannel, biasData,
+              m, n, k, stream, *scratch);
+    Trace(success ? "w8a8-int8-cutlass" : "fallback",
+          success ? "success" : "INT8 GEMM failed", m, n, k);
+    return success;
+}
 } // namespace fastllm_w8a8_dense_detail
 #endif
 
 /**
- * 清除指定FP8权重记录的W8A8固定后端状态。
+ * 清除指定Dense INT8/FP8权重记录的W8A8设备缓存。
  *
- * FP8权重本身不需要额外的CUTLASS重排副本，但设备scale、类型化bias和
- * 后端选择状态均按Data地址与GPU缓存。张量销毁、覆盖或迁移设备前必须
- * 删除全部对应记录，防止目标GPU复用旧卡地址或继承旧后端状态。
+ * Dense权重不需要额外的CUTLASS重排副本，但设备scale、类型化bias、
+ * INT8权重行和与FP8后端选择状态均按Data地址和GPU缓存。张量销毁、
+ * 覆盖或迁移设备前必须删除对应记录，防止复用旧卡地址。
  *
  * @param weight 即将销毁、覆盖或迁移的权重；nullptr表示无需处理。
  */
@@ -1154,8 +1628,7 @@ void FastllmCudaReleaseFp8W8A8BackendState(const fastllm::Data *weight) {
 #else
     (void)weight;
 #endif
-    // 标准per-channel/tensorwise和Blockwise共用Data生命周期入口；
-    // 覆盖、迁移或析构任一FP8权重时同时清理两类后端状态。
+    // Dense INT8/FP8和Blockwise FP8共用Data生命周期入口。
     FastllmCudaReleaseFp8W8A8Block128BackendState(weight);
 }
 
@@ -1245,25 +1718,46 @@ bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight) {
 #endif
 }
 
+/**
+ * 在SM90上执行Dense INT8 W8A8 CUTLASS线性计算。
+ *
+ * 权重固定为对称per-channel INT8。激活量化语义由权重携带的
+ * compressed-tensors元数据决定，支持动态per-token和静态tensorwise的
+ * 对称/非对称INT8；非对称路径在CUTLASS epilogue中融合zero-point修正。
+ *
+ * @param input  CUDA上的FP16或BF16激活，逻辑形状为[m, k]。
+ * @param weight CUDA上的对称INT8权重，逻辑形状为[n, k]，带n个FP32 scale。
+ * @param bias   可选CUDA FP32偏置，逻辑形状为[n]。
+ * @param output CUDA上的FP16或BF16输出，逻辑形状为[m, n]。
+ * @param m      token数。
+ * @param k      输入特征数，必须按16对齐。
+ * @param n      输出特征数，必须按8对齐。
+ * @return true表示量化和CUTLASS GEMM已成功提交；false表示语义不支持
+ *         或资源/kernel提交失败。
+ */
 bool FastllmCudaCutlassLinearInt8W8A8Sm90(
     const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output, int m, int k, int n) {
 #if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && defined(FASTLLM_CUTLASS_W8A8_SM90)
     using namespace fastllm_w8a8_dense_detail;
-    if (FastllmCudaRuntimeArch() != 90 || m <= 0 || k <= 0 || n <= 0 ||
+    if (!Enabled() || FastllmCudaRuntimeArch() != 90 ||
+        m <= 0 || k <= 0 || n <= 0 ||
         k % 16 || n % 8 || input.cudaData == nullptr || weight.cudaData == nullptr ||
         output.cudaData == nullptr || weight.dataType != fastllm::DataType::INT8_W8A8 ||
         weight.dims != std::vector<int>({n, k}) || weight.perChannelAxis != 0 ||
         !weight.mins.empty() || !weight.zeros.empty() || weight.scales.size() != (size_t)n ||
+        (weight.w8a8InputSymmetric && weight.w8a8InputZeroPoint != 0) ||
+        (!weight.w8a8InputDynamic && (!(weight.w8a8InputScale > 0.0f) ||
+                                     !std::isfinite(weight.w8a8InputScale))) ||
         (input.dataType != fastllm::DataType::FLOAT16 && input.dataType != fastllm::DataType::BFLOAT16) ||
         output.dataType != input.dataType ||
         (!bias.dims.empty() && (bias.dataType != fastllm::DataType::FLOAT32 ||
                                bias.cudaData == nullptr || bias.Count(0) != n))) return false;
     if (input.dataType == fastllm::DataType::FLOAT16)
-        return Execute<half, int8_t, cutlass::half_t, 127>(
-            input, weight, bias, output, m, k, n, 90);
-    return Execute<__nv_bfloat16, int8_t, cutlass::bfloat16_t, 127>(
-        input, weight, bias, output, m, k, n, 90);
+        return ExecuteInt8<half, cutlass::half_t>(
+            input, weight, bias, output, m, k, n);
+    return ExecuteInt8<__nv_bfloat16, cutlass::bfloat16_t>(
+        input, weight, bias, output, m, k, n);
 #else
     (void)input; (void)weight; (void)bias; (void)output; (void)m; (void)k; (void)n;
     return false;
