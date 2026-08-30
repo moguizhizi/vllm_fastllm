@@ -14,7 +14,7 @@ SM90/SM120标准FP8 W8A8采用固定后端生命周期：每份权重在每张GP
 
 | 路径 | 条件 |
 |---|---|
-| SM90 INT8 dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16 输入输出同 dtype；2D signed-I8 权重；权重 symmetric、无 zero/min；每输出通道一个 FP32 scale；激活动态 per-token symmetric INT8；K%16=0、N%8=0；bias 为空或 FP32[N] |
+| SM90 INT8 dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16 输入输出同 dtype；2D signed-I8 权重；权重必须 symmetric、无 zero/min；每输出通道一个 FP32 scale；激活支持动态 per-token symmetric/asymmetric以及静态 tensorwise symmetric/asymmetric INT8；非对称路径在CUTLASS epilogue融合AZP修正；K%16=0、N%8=0；bias 为空或 FP32[N] |
 | SM90 standard FP8 dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16；FP8 E4M3 权重；weight `blockK=1, blockM=K` 且 scale 数为N（per-channel）或1（tensorwise）；激活动态 per-token；K%16=0、N%8=0；bias 为空或 FP32[N]；CUTLASS使用FP8 FastAccum与Persistent调度，小M按vLLM策略走SwapAB |
 | SM90 FP8 blockwise dense | 编译含 `90a`，CUDA 12.3+；运行时精确 SM90；FP16/BF16；FP8 E4M3 权重；activation/weight block 都是 128x128；M/N/K 正数，K/N 为 128 倍数；bias 为空或 FP32[N] |
 | SM90 FP8 grouped MoE | 运行时精确 SM90；当前仅 BF16；SwiGLU；无 shared expert；expert 为 standard per-channel FP8 E4M3（不是 blockwise）；合法 route index；默认 batch>=16；hidden/inter 为 16 倍数；不满足直接回现有 MoE 路径 |
@@ -38,9 +38,19 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-function" \
   test/w8a8/run_w8a8_tests.sh ops-functional
 ```
 
+SM90 INT8 AZP可单独执行，不混入FP8 Dense、Block128或MoE case：
+
+```bash
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-azp-function" \
+  test/w8a8/run_w8a8_tests.sh ops-int8-azp-functional
+```
+
 功能套件结束后会在`W8A8_LOG_DIR`直接生成
 `operator-functional-summary.{md,csv,json,xlsx}`。表格逐项记录后端、类别、
-M/N/K、输入类型、权重scale布局、bias、检查编号、误差和PASS/FAIL结果；
+M/N/K、输入类型、权重scale布局、激活量化、实际后端路径、bias、
+检查编号、误差和PASS/FAIL结果；同时保存GPU、CC、CUDA、编译架构、
+Git提交、完整命令及warmup/iters；
 若某个case失败导致套件提前退出，退出钩子仍会汇总已经执行的case及失败项。
 
 其中SM120生命周期包含四类用例：首次GEMM故障后固定为`Rejected`且
@@ -55,6 +65,14 @@ M/N/K、输入类型、权重scale布局、bias、检查编号、误差和PASS/F
 W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
 W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-perf" \
   test/w8a8/run_w8a8_tests.sh ops-performance
+```
+
+SM90 INT8 AZP独立性能对比：
+
+```bash
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-azp-perf" \
+  test/w8a8/run_w8a8_tests.sh ops-int8-azp-performance
 ```
 
 性能报告中的`fastllm_speedup_vs_vllm_x`按

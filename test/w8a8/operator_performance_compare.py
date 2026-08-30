@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""比较FastLLM与vLLM的动态FP8 W8A8线性算子性能。"""
+"""比较FastLLM与vLLM的Dense W8A8线性算子性能。"""
 
 import argparse
 import csv
@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -66,6 +67,12 @@ BLOCK128_CASES = [
     if name.startswith("vllm_") and n % 128 == 0 and k % 128 == 0
 ]
 
+# vLLM SM90 INT8 AZP入口要求B的K、N均按16对齐。只保留双方能
+# 直接调用CUTLASS的共同形状，不将padding开销混入AZP对比。
+INT8_AZP_CASES = [
+    case for case in CASES if case[2] % 16 == 0 and case[3] % 16 == 0
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -81,11 +88,16 @@ def parse_args():
         "--scale-layout", choices=("perchannel", "block128"),
         default="perchannel",
         help="双方共同使用的权重/激活scale语义")
+    parser.add_argument(
+        "--quantization", choices=("fp8", "int8-azp"), default="fp8",
+        help="fp8为现有Dense/Block128路径；int8-azp为SM90动态非对称INT8")
     return parser.parse_args()
 
 
 def selected_cases(args):
     """按scale布局返回合法且覆盖正式分派边界的测试形状。"""
+    if args.quantization == "int8-azp":
+        return INT8_AZP_CASES
     return BLOCK128_CASES if args.scale_layout == "block128" else CASES
 
 
@@ -128,6 +140,28 @@ def display_value(value):
     return value
 
 
+def runtime_metadata(args):
+    """采集性能报告的硬件、构建和完整执行参数。"""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_DIR, text=True,
+        stdout=subprocess.PIPE, check=True).stdout.strip()
+    return {
+        "gpu": torch.cuda.get_device_name(),
+        "compute_capability": f"{major}.{minor}",
+        "cuda_version": torch.version.cuda,
+        "compile_arch": "90a" if (major, minor) == (9, 0)
+                        else f"{major}{minor}",
+        "git_commit": commit,
+        "command": shlex.join([sys.executable, *sys.argv]),
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "outer_repeats": args.outer_repeats,
+    }
+
+
 def run_fastllm(args, log_dir):
     pattern = re.compile(r"latency:\s+avg_ms=([0-9.eE+-]+)")
     rows = []
@@ -137,14 +171,19 @@ def run_fastllm(args, log_dir):
         "FASTLLM_CUDA_W8A8_STRICT": "1",
         "FASTLLM_CUDA_W8A8_TRACE": "0",
     })
-    weight_layout = (
-        "separate" if args.scale_layout == "block128" else "perchannel")
-    op_name = (
-        "linear_fp8_block128"
-        if args.scale_layout == "block128" else "linear_fp8_w8a8")
-    backend_path = (
-        "w8a8-block128-cutlass (strict)"
-        if args.scale_layout == "block128" else "w8a8-cutlass (strict)")
+    if args.quantization == "int8-azp":
+        weight_layout = None
+        op_name = "linear_int8_w8a8"
+        backend_path = "w8a8-int8-azp-cutlass (strict)"
+    else:
+        weight_layout = (
+            "separate" if args.scale_layout == "block128" else "perchannel")
+        op_name = (
+            "linear_fp8_block128"
+            if args.scale_layout == "block128" else "linear_fp8_w8a8")
+        backend_path = (
+            "w8a8-block128-cutlass (strict)"
+            if args.scale_layout == "block128" else "w8a8-cutlass (strict)")
 
     for name, m, n, k in selected_cases(args):
         samples = []
@@ -153,10 +192,13 @@ def run_fastllm(args, log_dir):
                 args.optest, "--op", op_name, "--device", "cuda:0",
                 "--param", f"batch={m}", "--param", f"in={k}",
                 "--param", f"out={n}",
-                "--param", f"weight_layout={weight_layout}",
                 "--param", "input_type=bf16", "--param", "has_bias=0",
                 "--warmup", str(args.warmup), "--iters", str(args.iters),
             ]
+            if args.quantization == "int8-azp":
+                command.extend(["--param", "activation_scheme=azp_dynamic"])
+            else:
+                command.extend(["--param", f"weight_layout={weight_layout}"])
             result = subprocess.run(
                 command, cwd=REPO_DIR, env=env, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
@@ -168,7 +210,9 @@ def run_fastllm(args, log_dir):
             samples.append(float(matches[-1]))
         rows.append({
             "case": name, "m": m, "n": n, "k": k,
-            "scale_layout": args.scale_layout,
+            "scale_layout": (
+                "per-token AZP/per-channel" if args.quantization == "int8-azp"
+                else args.scale_layout),
             **summarize_samples(
                 "fastllm", samples, m, n, k, backend_path),
         })
@@ -190,6 +234,54 @@ def run_vllm(args):
     fp8 = torch.float8_e4m3fn
     for name, m, n, k in selected_cases(args):
         samples = []
+        if args.quantization == "int8-azp":
+            for _ in range(args.outer_repeats):
+                torch.cuda.empty_cache()
+                gc.collect()
+                indices = torch.arange(
+                    m * k, device="cuda", dtype=torch.int32)
+                source = (((indices * 37) % 501 - 100) * 0.001).to(
+                    torch.bfloat16).view(m, k)
+                k_indices = torch.arange(
+                    k, device="cuda", dtype=torch.int32).view(k, 1)
+                n_indices = torch.arange(
+                    n, device="cuda", dtype=torch.int32).view(1, n)
+                weight = ((n_indices * 17 + k_indices * 13) % 255 - 127).to(
+                    torch.int8)
+                weight_scale = (
+                    0.0025 + 0.00001 * (n_indices % 31)).to(torch.float32)
+                del indices, k_indices, n_indices
+                azp_adj = weight.sum(dim=0, keepdim=True, dtype=torch.int32)
+
+                def run_int8_azp():
+                    quantized, token_scale, token_azp = ops.scaled_int8_quant(
+                        source, None, None, symmetric=False)
+                    return ops.cutlass_scaled_mm_azp(
+                        quantized, weight, token_scale, weight_scale,
+                        torch.bfloat16, azp_adj, token_azp, None)
+
+                for _ in range(args.warmup):
+                    output = run_int8_azp()
+                torch.cuda.synchronize()
+                begin = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                begin.record()
+                for _ in range(args.iters):
+                    output = run_int8_azp()
+                end.record()
+                end.synchronize()
+                samples.append(begin.elapsed_time(end) / args.iters)
+                del source, weight, weight_scale, azp_adj, output
+            rows.append({
+                "case": name, "m": m, "n": n, "k": k,
+                "scale_layout": "per-token AZP/per-channel",
+                **summarize_samples(
+                    "vllm", samples, m, n, k,
+                    "scaled_int8_quant(asymmetric) + cutlass_scaled_mm_azp"),
+            })
+            print(json.dumps(rows[-1]), flush=True)
+            continue
+
         pad_k = 0 if args.scale_layout == "block128" else (16 - k % 16) % 16
         pad_n = 0 if args.scale_layout == "block128" else (16 - n % 16) % 16
         dense_kernel = None
@@ -267,7 +359,8 @@ def run_vllm(args):
     return rows
 
 
-def write_reports(output_dir, fastllm_rows, vllm_rows, scale_layout):
+def write_reports(output_dir, fastllm_rows, vllm_rows, scale_layout,
+                  quantization, metadata):
     vllm = {row["case"]: row for row in vllm_rows}
     combined = []
     for row in fastllm_rows:
@@ -276,6 +369,7 @@ def write_reports(output_dir, fastllm_rows, vllm_rows, scale_layout):
         vl_ms = other["vllm_latency_median_ms"]
         combined.append({
             "result": "PASS",
+            **metadata,
             **row,
             **{key: value for key, value in other.items()
                if key.startswith("vllm_")},
@@ -296,12 +390,19 @@ def write_reports(output_dir, fastllm_rows, vllm_rows, scale_layout):
         [("算子性能", headers,
           [[display_value(row[key]) for key in headers] for row in combined])])
     lines = [
-        f"# SM90/SM120 W8A8算子性能对比（{scale_layout}）", "",
-        ("> 双方都计入BF16激活动态per-group(1,128) FP8量化、"
-         "block(128,128)权重"
-         if scale_layout == "block128"
-         else "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重"),
-        "> CUTLASS GEMM及输出；无bias。每项使用独立重复样本计算统计值。", "",
+        f"# SM90/SM120 W8A8算子性能对比（{quantization}/{scale_layout}）", "",
+        f"> GPU: {metadata['gpu']}；CC: {metadata['compute_capability']}；"
+        f"CUDA: {metadata['cuda_version']}；编译架构: {metadata['compile_arch']}；"
+        f"Git: {metadata['git_commit']}。", "",
+        f"> 命令: `{metadata['command']}`", "",
+        ("> 双方都计入BF16激活动态per-token非对称INT8量化、"
+         "per-channel对称INT8权重、AZP融合CUTLASS GEMM及输出；无bias。"
+         if quantization == "int8-azp" else
+         ("> 双方都计入BF16激活动态per-group(1,128) FP8量化、"
+          "block(128,128)权重"
+          if scale_layout == "block128"
+          else "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重")),
+        "> 每项使用独立重复样本计算统计值。", "",
         "> 加速比 = vLLM耗时 / FastLLM耗时；大于1表示FastLLM更快，",
         "> 小于1表示FastLLM更慢。", "",
         "> Effective TOPS由`2*M*N*K/Median延迟`推导；CV越小表示重复测试越稳定。", "",
@@ -337,7 +438,10 @@ def main():
     fastllm_rows = run_fastllm(args, output_dir)
     # FastLLM均在子进程中运行并退出，父进程此时才加载vLLM，避免显存共存。
     vllm_rows = run_vllm(args)
-    write_reports(output_dir, fastllm_rows, vllm_rows, args.scale_layout)
+    metadata = runtime_metadata(args)
+    write_reports(
+        output_dir, fastllm_rows, vllm_rows,
+        args.scale_layout, args.quantization, metadata)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ ops_scope() {
     case "${suite}" in
         ops-dense|ops-dense-*) printf 'dense\n' ;;
         ops-block128|ops-block128-*) printf 'block128\n' ;;
+        ops-int8-azp|ops-int8-azp-*) printf 'int8-azp\n' ;;
         *) printf 'all\n' ;;
     esac
 }
@@ -102,7 +103,7 @@ run_ops_functional_cases() {
     scope=$(ops_scope)
 
     if [[ "${arch}" == 90 ]]; then
-        if [[ "${scope}" != block128 ]]; then
+        if [[ "${scope}" == all || "${scope}" == dense ]]; then
             # vLLM SM90标准FP8分派边界：小M走SwapAB，并按N=1280分支；
             # 64/128是SwapAB、Pingpong和默认Persistent配置的边界。
             while read -r m n; do
@@ -148,15 +149,66 @@ EOF
             done
         fi
 
-        if [[ "${scope}" == all ]]; then
-            run_logged sm90_int8_w8a8_function \
+        if [[ "${scope}" == all || "${scope}" == int8-azp ]]; then
+            for activation_scheme in symmetric symmetric_static azp_dynamic azp_static; do
+                for dtype in fp16 bf16; do
+                    for bias in 0 1; do
+                        run_logged "sm90_int8_w8a8_${activation_scheme}_${dtype}_bias${bias}" env \
+                            FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+                            FASTLLM_CUDA_W8A8_TRACE=1 \
+                            "${optest}" --op linear_int8_w8a8 --device cuda:0 \
+                            --param batch=17 --param in=4096 --param out=4096 \
+                            --param input_type="${dtype}" --param has_bias="${bias}" \
+                            --param activation_scheme="${activation_scheme}" \
+                            --param check=1 --warmup 0 --iters 1
+                    done
+                done
+            done
+            while read -r name m n; do
+                run_logged "sm90_int8_w8a8_azp_${name}" env \
+                    FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+                    FASTLLM_CUDA_W8A8_TRACE=1 \
+                    "${optest}" --op linear_int8_w8a8 --device cuda:0 \
+                    --param batch="${m}" --param in=128 --param out="${n}" \
+                    --param input_type=bf16 --param has_bias=1 \
+                    --param activation_scheme=azp_dynamic \
+                    --param check=1 --warmup 0 --iters 1
+            done <<'EOF'
+branch_m1_n4096 1 4096
+branch_m32_n4096 32 4096
+branch_m33_n4096 33 4096
+branch_m64_n4096 64 4096
+branch_m65_n4096 65 4096
+branch_m128_n4096 128 4096
+branch_m129_n4096 129 4096
+branch_m17_n8176 17 8176
+branch_m17_n8192 17 8192
+EOF
+            run_logged sm90_int8_w8a8_reject_weight_zero_point env \
+                FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+                FASTLLM_CUDA_W8A8_TRACE=1 \
                 "${optest}" --op linear_int8_w8a8 --device cuda:0 \
                 --param batch=17 --param in=4096 --param out=4096 \
-                --param input_type=bf16 --param has_bias=1 --param check=1 \
-                --warmup 0 --iters 1
+                --param input_type=bf16 --param has_bias=1 \
+                --param activation_scheme=azp_dynamic \
+                --param check=2 --warmup 0 --iters 1
+            run_logged sm90_int8_w8a8_reject_static_scale env \
+                FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+                "${optest}" --op linear_int8_w8a8 --device cuda:0 \
+                --param batch=17 --param in=4096 --param out=4096 \
+                --param input_type=bf16 --param has_bias=1 \
+                --param activation_scheme=azp_static \
+                --param check=3 --warmup 0 --iters 1
+            run_logged sm90_int8_w8a8_reject_symmetric_zero_point env \
+                FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+                "${optest}" --op linear_int8_w8a8 --device cuda:0 \
+                --param batch=17 --param in=4096 --param out=4096 \
+                --param input_type=bf16 --param has_bias=1 \
+                --param activation_scheme=symmetric \
+                --param check=4 --warmup 0 --iters 1
         fi
 
-        if [[ "${scope}" != dense ]]; then
+        if [[ "${scope}" == all || "${scope}" == block128 ]]; then
             run_logged sm90_fp8_blockwise_function env \
                 FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
                 "${optest}" --op linear_fp8_block128 --device cuda:0 \
@@ -178,11 +230,13 @@ EOF
                 --param path=check_fp8 --warmup 0 --iters 1
         fi
 
-        run_logged "sm90_vllm_official_functional_${scope}" \
-            "${vllm_python}" test/w8a8/operator_functional_vllm.py \
-            --scale-layout "${scope}"
+        if [[ "${scope}" != int8-azp ]]; then
+            run_logged "sm90_vllm_official_functional_${scope}" \
+                "${vllm_python}" test/w8a8/operator_functional_vllm.py \
+                --scale-layout "${scope}"
+        fi
     elif [[ "${arch}" == 120 ]]; then
-        if [[ "${scope}" != block128 ]]; then
+        if [[ "${scope}" == all || "${scope}" == dense ]]; then
             # 16/32/256是SM120 CUTLASS tile选择的三个边界；
             # 两侧值用于确认每个条件分支都被执行。
         for m in 1 16 17 32 33 256 257; do
@@ -334,7 +388,7 @@ run_ops_performance() {
     scope=$(ops_scope)
 
     if [[ "${arch}" == 90 ]]; then
-        if [[ "${scope}" != block128 ]]; then
+        if [[ "${scope}" == all || "${scope}" == dense ]]; then
             run_logged sm90_w8a8_perchannel_operator_compare \
                 "${vllm_python}" test/w8a8/operator_performance_compare.py \
                 --optest "${optest}" \
@@ -343,16 +397,17 @@ run_ops_performance() {
                 --warmup 20 --iters 200 --outer-repeats 5
         fi
 
-        for batch in 1 16 64 256 1024; do
-            if [[ "${scope}" == all ]]; then
-                run_logged "sm90_int8_w8a8_m${batch}_perf" \
-                    "${optest}" --op linear_int8_w8a8 --device cuda:0 \
-                    --param batch="${batch}" --param in=4096 \
-                    --param out=4096 --param input_type=bf16 \
-                    --param has_bias=1 --warmup 20 --iters 200
-            fi
+        if [[ "${scope}" == all || "${scope}" == int8-azp ]]; then
+            run_logged sm90_int8_azp_operator_compare \
+                "${vllm_python}" test/w8a8/operator_performance_compare.py \
+                --optest "${optest}" \
+                --output-dir "${log_dir}/operator-compare/int8-azp" \
+                --quantization int8-azp --scale-layout perchannel \
+                --warmup 20 --iters 200 --outer-repeats 5
+        fi
 
-            if [[ "${scope}" != dense ]]; then
+        for batch in 1 16 64 256 1024; do
+            if [[ "${scope}" == all || "${scope}" == block128 ]]; then
                 run_logged "sm90_fp8_blockwise_m${batch}_perf" env \
                     FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
                     "${optest}" --op linear_fp8_block128 --device cuda:0 \
@@ -362,7 +417,7 @@ run_ops_performance() {
             fi
         done
 
-        if [[ "${scope}" != dense ]]; then
+        if [[ "${scope}" == all || "${scope}" == block128 ]]; then
             run_logged sm90_w8a8_block128_operator_compare \
                 "${vllm_python}" test/w8a8/operator_performance_compare.py \
                 --optest "${optest}" \
@@ -455,6 +510,9 @@ case "${suite}" in
     ops-block128-functional) run_ops_functional ;;
     ops-block128-performance) run_ops_performance ;;
     ops-block128) run_ops_functional; run_ops_performance ;;
+    ops-int8-azp-functional) run_ops_functional ;;
+    ops-int8-azp-performance) run_ops_performance ;;
+    ops-int8-azp) run_ops_functional; run_ops_performance ;;
     ops-functional) run_ops_functional ;;
     ops-performance) run_ops_performance ;;
     ops-compare) run_ops_performance ;;
@@ -463,7 +521,7 @@ case "${suite}" in
     model-performance) run_model_performance ;;
     all) run_ops_functional; run_ops_performance; run_forward; run_model_performance ;;
     *)
-        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
+        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
         exit 2
         ;;
 esac

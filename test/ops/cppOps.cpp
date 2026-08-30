@@ -11,6 +11,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -4601,12 +4602,19 @@ namespace {
     }
 
     struct LinearInt8W8A8State {
-        int batch, in, out;
+        int batch, in, out, check;
+        std::string activationScheme;
         fastllm::Data input, weight, bias, output;
         void Init(const OpTestParams &params) {
 #ifdef USE_CUDA
             batch = params.GetInt("batch"); in = params.GetInt("in"); out = params.GetInt("out");
-            fastllm::Data fp32 = MakeTensor({batch, in}, 0.23f, 0.2f);
+            check = params.GetInt("check");
+            std::vector<float> inputValues((size_t)batch * in);
+            for (size_t i = 0; i < inputValues.size(); ++i) {
+                inputValues[i] = ((int)(i * 37 % 501) - 100) * 0.001f;
+            }
+            fastllm::Data fp32(
+                fastllm::DataType::FLOAT32, {batch, in}, inputValues);
             input.CopyFrom(fp32);
             fastllm::ToDataType(input, params.GetString("input_type") == "fp16"
                 ? fastllm::DataType::FLOAT16 : fastllm::DataType::BFLOAT16);
@@ -4614,6 +4622,23 @@ namespace {
             weight.dataType = fastllm::DataType::INT8_W8A8;
             weight.UpdateUnitSize(); weight.Resize({out, in}); weight.Allocate(false);
             weight.weightType = fastllm::WeightType::LINEAR;
+            weight.linearQuantScheme = fastllm::LinearQuantScheme::INT8_W8A8;
+            activationScheme = params.GetString("activation_scheme");
+            if (activationScheme != "symmetric" &&
+                activationScheme != "symmetric_static" &&
+                activationScheme != "azp_dynamic" &&
+                activationScheme != "azp_static") {
+                throw std::runtime_error(
+                    "activation_scheme must be symmetric, symmetric_static, "
+                    "azp_dynamic or azp_static");
+            }
+            weight.w8a8InputDynamic = activationScheme != "symmetric_static" &&
+                                      activationScheme != "azp_static";
+            weight.w8a8InputSymmetric =
+                activationScheme == "symmetric" ||
+                activationScheme == "symmetric_static";
+            weight.w8a8InputScale = 0.01f;
+            weight.w8a8InputZeroPoint = weight.w8a8InputSymmetric ? 0 : -3;
             weight.perChannelAxis = 0; weight.scales.resize(out);
             int8_t *q = (int8_t*)weight.cpuData;
             for (int row = 0; row < out; ++row) {
@@ -4640,31 +4665,85 @@ namespace {
                 throw std::runtime_error("SM90 INT8 W8A8 path rejected the test case");
         }
         void Check() {
+            if (check >= 2 && check <= 4) {
+                const char *reason = nullptr;
+                if (check == 2) {
+                    weight.zeros.assign(out, 1);
+                    reason = "asymmetric weight zero-points";
+                } else if (check == 3) {
+                    weight.w8a8InputDynamic = false;
+                    weight.w8a8InputScale = 0.0f;
+                    reason = "non-positive static activation scale";
+                } else {
+                    weight.w8a8InputSymmetric = true;
+                    weight.w8a8InputZeroPoint = 1;
+                    reason = "non-zero symmetric activation zero-point";
+                }
+                if (FastllmCudaCutlassLinearInt8W8A8Sm90(
+                        input, weight, bias, output, batch, in, out)) {
+                    throw std::runtime_error(
+                        std::string("SM90 INT8 W8A8 accepted ") + reason);
+                }
+                std::cout << "linear_int8_w8a8 rejected " << reason << "\n";
+                return;
+            }
             Run(); ForceDeviceSync();
             std::vector<float> x = ToFloatVector(ConvertToFloat32Data(input));
             std::vector<float> y = ToFloatVector(ConvertToFloat32Data(output));
             const int8_t *q = (const int8_t*)weight.cpuData;
             const float *b = bias.dims.empty() ? nullptr : (const float*)bias.cpuData;
-            float maxDiff = 0.0f;
+            float maxDiff = 0.0f, sumDiff = 0.0f;
+            int failures = 0;
             for (int r = 0; r < batch; ++r) {
-                float maxInput = 0.0f;
-                for (int p = 0; p < in; ++p)
-                    maxInput = std::max(maxInput, std::fabs(x[(size_t)r * in + p]));
-                float tokenScale = maxInput == 0.0f ? 1.0f : maxInput / 127.0f;
-                for (int c = 0; c < out; ++c) {
-                    int32_t dot = 0;
+                float tokenScale = weight.w8a8InputScale;
+                int zeroPoint = weight.w8a8InputZeroPoint;
+                if (weight.w8a8InputDynamic && weight.w8a8InputSymmetric) {
+                    float maxInput = 0.0f;
+                    for (int p = 0; p < in; ++p)
+                        maxInput = std::max(maxInput, std::fabs(x[(size_t)r * in + p]));
+                    tokenScale = std::max(maxInput / 127.0f, 1.1920928955078125e-7f);
+                    zeroPoint = 0;
+                } else if (weight.w8a8InputDynamic) {
+                    float minimum = std::numeric_limits<float>::max();
+                    float maximum = std::numeric_limits<float>::lowest();
                     for (int p = 0; p < in; ++p) {
-                        int value = (int)std::nearbyint(x[(size_t)r * in + p] / tokenScale);
-                        value = std::max(-127, std::min(127, value));
-                        dot += value * (int)q[(size_t)c * in + p];
+                        float value = x[(size_t)r * in + p];
+                        minimum = std::min(minimum, value);
+                        maximum = std::max(maximum, value);
                     }
-                    float ref = (float)dot * tokenScale * weight.scales[c] +
+                    tokenScale = (maximum - minimum) / 255.0f;
+                    zeroPoint = (int)std::nearbyint(
+                        -128.0f - minimum / tokenScale);
+                }
+                for (int c = 0; c < out; ++c) {
+                    int32_t dot = 0, weightSum = 0;
+                    for (int p = 0; p < in; ++p) {
+                        int value = (int)std::nearbyint(
+                            x[(size_t)r * in + p] / tokenScale) + zeroPoint;
+                        const int qmin = weight.w8a8InputDynamic &&
+                                         weight.w8a8InputSymmetric ? -127 : -128;
+                        value = std::max(qmin, std::min(127, value));
+                        const int weightValue = (int)q[(size_t)c * in + p];
+                        dot += value * weightValue;
+                        weightSum += weightValue;
+                    }
+                    int32_t corrected = dot - zeroPoint * weightSum;
+                    float ref = (float)corrected * tokenScale * weight.scales[c] +
                                 (b ? b[c] : 0.0f);
-                    maxDiff = std::max(maxDiff, std::fabs(ref - y[(size_t)r * out + c]));
+                    float diff = std::fabs(ref - y[(size_t)r * out + c]);
+                    maxDiff = std::max(maxDiff, diff);
+                    sumDiff += diff;
+                    failures += diff > 0.75f;
                 }
             }
-            std::cout << "linear_int8_w8a8 check max_abs_diff=" << maxDiff << "\n";
-            if (!std::isfinite(maxDiff) || maxDiff > 0.75f)
+            const float meanDiff = sumDiff / std::max(1, batch * out);
+            std::cout << "linear_int8_w8a8 check max_abs_diff=" << maxDiff
+                      << " mean_abs_diff=" << meanDiff
+                      << " failed_elements=" << failures
+                      << " activation_scheme="
+                      << activationScheme
+                      << "\n";
+            if (!std::isfinite(maxDiff) || failures != 0)
                 throw std::runtime_error("SM90 INT8 W8A8 output mismatch");
         }
     };
@@ -4695,10 +4774,12 @@ namespace {
     }
 
     static OpCase MakeLinearInt8W8A8Case() {
-        return {"linear_int8_w8a8", "SM90 symmetric INT8 W8A8 dense",
+        return {"linear_int8_w8a8", "SM90 symmetric/asymmetric INT8 W8A8 dense",
             [](){ OpTestParams p; p.Add("batch","16","rows"); p.Add("in","4096","K");
                   p.Add("out","4096","N"); p.Add("input_type","bf16","fp16 or bf16");
-                  p.Add("has_bias","1","FP32 bias"); p.Add("check","0","1 functional check"); return p; },
+                  p.Add("has_bias","1","FP32 bias");
+                  p.Add("activation_scheme","symmetric","symmetric, symmetric_static, azp_dynamic or azp_static");
+                  p.Add("check","0","1 functional, 2 reject weight zero-points, 3 reject static scale, 4 reject symmetric zero-point"); return p; },
             [](const OpTestParams&, const std::string &device) {
 #ifdef USE_CUDA
                 if (device.rfind("cuda",0) != 0) return false;
