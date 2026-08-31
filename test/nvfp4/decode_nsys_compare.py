@@ -88,6 +88,10 @@ def parse_args():
     parser.add_argument("--nsys", default="nsys")
     parser.add_argument("--top-kernels", type=int, default=20)
     parser.add_argument(
+        "--keep-nsys-reports", action="store_true",
+        help=("保留每个Batch的nsys-rep、SQLite及导出CSV；默认在统计完成后"
+              "立即删除这些大体积中间文件"))
+    parser.add_argument(
         "--cpu-trace", action="store_true",
         help=("在同一次Nsight采集中增加OS Runtime，并汇总稳定Decode区间的"
               "CUDA API、Kernel提交、GPU排队及TPOT未解释时间"))
@@ -935,6 +939,36 @@ def summarize_report(args, report, output_base):
     }
 
 
+def cleanup_nsys_artifacts(case_dir, output_base, summary=None):
+    """删除单个Batch已经解析完成的Nsight原始报告和导出明细。"""
+    patterns = (
+        output_base.name + "*.nsys-rep",
+        output_base.name + "*.qdstrm",
+        output_base.name + "*.sqlite",
+        output_base.name + "-*.csv",
+    )
+    deleted = []
+    for pattern in patterns:
+        for path in sorted(case_dir.glob(pattern)):
+            if not path.is_file():
+                continue
+            path.unlink()
+            deleted.append(str(path))
+
+    if summary is not None:
+        for key in ("report", "kernel_csv", "cuda_api_csv", "memory_csv",
+                    "timeline_csv"):
+            summary[key] = None
+        cpu_trace = summary.get("cpu_trace")
+        if cpu_trace is not None:
+            for key in ("kernel_exec_csv", "api_trace_csv", "osrt_csv",
+                        "nvtx_csv"):
+                cpu_trace[key] = None
+        summary["nsys_artifacts_retained"] = False
+        summary["deleted_nsys_artifact_count"] = len(deleted)
+    return deleted
+
+
 def profile_backend(args, backend, batches, prompts, result_dir):
     backend_dir = result_dir / backend
     backend_dir.mkdir(parents=True, exist_ok=True)
@@ -994,6 +1028,11 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                     f"{actual}，最低要求{minimum_cache_ratio:.1%}；"
                     "请检查Cache页大小和Warmup Prompt。")
             summary = summarize_report(args, report, output_base)
+            if args.keep_nsys_reports:
+                summary["nsys_artifacts_retained"] = True
+                summary["deleted_nsys_artifact_count"] = 0
+            else:
+                cleanup_nsys_artifacts(case_dir, output_base, summary)
             # 第一个输出Token属于Prefill结束点；之后每个Token才对应一次稳定
             # Decode迭代。按decode步数归一化后，才能比较不同batch下每步的
             # kernel数量与GPU时间，而不会把请求长度误认为算子变慢。
@@ -1102,6 +1141,9 @@ def profile_backend(args, backend, batches, prompts, result_dir):
         if server is not None:
             shutdown_session(args, server["session"], server["launcher"])
             server["log_handle"].close()
+        if not args.keep_nsys_reports:
+            for case_dir in backend_dir.glob("batch-*"):
+                cleanup_nsys_artifacts(case_dir, case_dir / "decode")
     return rows
 
 
@@ -1118,6 +1160,7 @@ def make_excel_report(result_dir, rows, top_count, chart_paths,
         ["计时范围", "GPU Trace中首Token之后的稳定Decode阶段"],
         ["Decode步数", "第一个输出Token属于Prefill，按output_tokens - 1归一化"],
         ["注意", "Nsight会扰动绝对延迟，正式TPOT以非Profiler性能脚本为准"],
+        ["原始文件", "默认按Batch汇总后删除；使用--keep-nsys-reports显式保留"],
         ["类别限制", "同名GEMM无法仅凭符号区分o_proj与MLP Linear"],
     ]))
 
@@ -1411,6 +1454,8 @@ def make_report(result_dir, rows, top_count):
         "> 会扰动绝对延迟，正式TPOT仍应以非Profiler性能脚本为准。",
         "> GPU时间线空闲只统计首个与最后一个GPU事件之间的内部空隙；",
         "> 第一个输出Token属于Prefill，逐步指标按`output_tokens - 1`归一化。", "",
+        "> `.nsys-rep`、SQLite和导出CSV默认在每个Batch汇总后删除；",
+        "> 只有指定`--keep-nsys-reports`才会保留。", "",
         "## 引擎指标", "",
         "| 状态 | Batch | 后端 | 请求Attention后端 | 实际Attention后端 | 后端确认 | "
         "平均TPOT(ms) | 请求TPOT P50(ms) | 请求TPOT P95(ms) | "
