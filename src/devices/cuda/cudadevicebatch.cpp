@@ -477,7 +477,7 @@ namespace fastllm {
         invocation.phase = qs[0]->dims[1] == 1
             ? CudaAttentionPhase::DECODE : CudaAttentionPhase::PREFILL;
         invocation.dataType = qs[0]->dataType;
-        cudaGetDevice(&invocation.deviceId);
+        invocation.deviceId = FastllmCudaGetDevice();
         invocation.batch = batch;
         invocation.group = group;
         invocation.headDim = qs[0]->dims[2];

@@ -9914,7 +9914,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         invocation.phase = q.dims.size() >= 2 && q.dims[1] == batch
             ? CudaAttentionPhase::DECODE : CudaAttentionPhase::PREFILL;
         invocation.dataType = q.dataType;
-        cudaGetDevice(&invocation.deviceId);
+        invocation.deviceId = FastllmCudaGetDevice();
         invocation.batch = batch;
         invocation.group = group;
         invocation.headDim = q.dims.size() >= 3 ? q.dims[2] : 0;
