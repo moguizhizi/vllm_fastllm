@@ -842,11 +842,18 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                     "加长后的Prefix Cache Warmup超过max-model-len："
                     f"{len(cache_warmup_prompt)} + "
                     f"{args.warmup_output_tokens} > {args.max_model_len}")
-            # Warmup Prompt把正式Prompt作为完整前缀，并在末尾追加一个Cache
-            # 页。FastLLM为了重新产生首Token logits，会按主流程主动退掉正式
-            # Prompt的最后一个Cache页；该Prefill尾部随后由GPU Trace边界裁掉。
+            # 先用单请求把加长Prompt写入Prefix Cache，避免目标Batch
+            # 同时提交多个尚未缓存的长Prefill。再用正式Prompt在目标
+            # Batch下预热调度、CUDA Graph和缓存命中路径，两步都在
+            # Nsight采集之前完成。FastLLM为了重新产生首Token logits，
+            # 会按主流程主动退掉正式Prompt的最后一个Cache页；该
+            # Prefill尾部随后由GPU Trace边界裁掉。
             run_decode_batch(
                 server, cache_warmup_prompt,
+                args.warmup_output_tokens, 1, args,
+                "prefix_cache_seed")
+            run_decode_batch(
+                server, prompt,
                 args.warmup_output_tokens, batch, args,
                 "warmup")
             output_base = case_dir / "decode"
