@@ -4096,6 +4096,22 @@ namespace fastllm {
                 allWeightNames.insert(weightName);
                 auto dataType = it.second;
                 int ggmlType = -1;
+                const WeightType logicalWeightType =
+                    model->weight.GetWeightType(weightName);
+                const LinearQuantScheme configuredScheme =
+                    linearSchemePlan.Resolve(weightName, logicalWeightType);
+                if (configuredScheme == LinearQuantScheme::INT8_W8A8 &&
+                    tensor.dtype == "I8" &&
+                    StringEndWith(tensorName, ".weight")) {
+                    const std::string scaleTensorName = tensorName + "_scale";
+                    AssertInFastLLM(
+                        safeTensors.itmeDict.find(scaleTensorName) !=
+                            safeTensors.itmeDict.end(),
+                        "INT8_W8A8 weight is missing weight_scale: " +
+                            tensorName + "\n");
+                    dataType = DataType::INT8_W8A8;
+                }
+
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
