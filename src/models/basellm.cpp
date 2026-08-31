@@ -2901,6 +2901,11 @@ namespace fastllm {
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
                                 lenSum += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                            }
+                            // Prefix Cache恢复会在首次Prefill前创建KV，但该
+                            // 请求尚未占用调度Batch名额。只有已处理过Token
+                            // 的未结束请求才是活动请求，与新调度器语义一致。
+                            if (!it.second->isEnding && it.second->preTokens > 0) {
                                 currentActivate++;
                             }
                         }
@@ -2931,19 +2936,8 @@ namespace fastllm {
                                     // TODO: multicuda支持多prompt一起推理
                                     continue;
                                 }
-                                if (isPrompt) {
-                                    int alive = 0;
-                                    for (auto &it: model->responseContextDict.dicts) {
-                                        if (it.second->isEnding) {
-                                            continue;
-                                        }
-                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                                            alive++;
-                                        }
-                                    }
-                                    if (alive >= maxBatch) {
-                                        continue;
-                                    }
+                                if (isPrompt && currentActivate >= maxBatch) {
+                                    continue;
                                 }
 
                                 if (it.second->isEnding) {
