@@ -1464,6 +1464,13 @@ def make_report(result_dir, rows, top_count):
         nsys = row["nsys"]
         timeline = nsys["timeline"]
         cpu = nsys.get("cpu_trace") or {}
+        launch_count = cpu.get("launch_api_count")
+        decode_steps = nsys["decode_steps"]
+        submit_count_per_step = (
+            None if launch_count is None else launch_count / decode_steps)
+        kernels_per_submission = (
+            None if not launch_count else
+            cpu["kernel_execution_count"] / launch_count)
         chart_rows.append({
             "batch": row["batch"],
             "backend": row["backend"],
@@ -1476,6 +1483,8 @@ def make_report(result_dir, rows, top_count):
             "gpu_idle_pct": (None if timeline["idle_ratio"] is None else
                              timeline["idle_ratio"] * 100.0),
             "submit_ms_per_step": cpu.get("launch_api_union_ms_per_decode_step"),
+            "submit_count_per_step": submit_count_per_step,
+            "kernels_per_submission": kernels_per_submission,
         })
     image_dir = result_dir / "images"
     chart_paths = [
@@ -1493,6 +1502,13 @@ def make_report(result_dir, rows, top_count):
                 ChartSpec("GPU IDLE RATIO", "gpu_idle_pct", "%"),
                 ChartSpec("SUBMIT API", "submit_ms_per_step", "ms/step"),
             ), "DECODE NSYS BOTTLENECK TRENDS"),
+        write_dashboard(
+            image_dir / "decode-nsys-submission-trends.png", chart_rows, (
+                ChartSpec("KERNEL EXECUTIONS", "kernel_count_per_step", "count/step"),
+                ChartSpec("KERNEL SUBMISSIONS", "submit_count_per_step", "count/step"),
+                ChartSpec("KERNELS PER SUBMISSION", "kernels_per_submission", "ratio"),
+                ChartSpec("SUBMIT API TIME", "submit_ms_per_step", "ms/step"),
+            ), "DECODE NSYS CPU SUBMISSION TRENDS"),
     ]
     lines.extend(markdown_images(chart_paths))
 
