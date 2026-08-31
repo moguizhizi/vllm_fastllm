@@ -53,6 +53,7 @@ ops_scope() {
     case "${suite}" in
         ops-dense|ops-dense-*) printf 'dense\n' ;;
         ops-block128|ops-block128-*) printf 'block128\n' ;;
+        ops-int8-symmetric|ops-int8-symmetric-*) printf 'int8-symmetric\n' ;;
         ops-int8-azp|ops-int8-azp-*) printf 'int8-azp\n' ;;
         ops-moe|ops-moe-*) printf 'moe\n' ;;
         *) printf 'all\n' ;;
@@ -150,8 +151,13 @@ EOF
             done
         fi
 
-        if [[ "${scope}" == all || "${scope}" == int8-azp ]]; then
-            for activation_scheme in symmetric symmetric_static azp_dynamic azp_static; do
+        if [[ "${scope}" == all || "${scope}" == int8-azp ||
+              "${scope}" == int8-symmetric ]]; then
+            local -a activation_schemes=(symmetric)
+            if [[ "${scope}" == all || "${scope}" == int8-azp ]]; then
+                activation_schemes=(symmetric symmetric_static azp_dynamic azp_static)
+            fi
+            for activation_scheme in "${activation_schemes[@]}"; do
                 for dtype in fp16 bf16; do
                     for bias in 0 1; do
                         run_logged "sm90_int8_w8a8_${activation_scheme}_${dtype}_bias${bias}" env \
@@ -165,6 +171,9 @@ EOF
                     done
                 done
             done
+        fi
+
+        if [[ "${scope}" == all || "${scope}" == int8-azp ]]; then
             while read -r name m n; do
                 run_logged "sm90_int8_w8a8_azp_${name}" env \
                     FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
@@ -462,6 +471,15 @@ run_ops_performance() {
                 --warmup 20 --iters 200 --outer-repeats 5
         fi
 
+        if [[ "${scope}" == all || "${scope}" == int8-symmetric ]]; then
+            run_logged sm90_int8_symmetric_operator_compare \
+                "${vllm_python}" test/w8a8/operator_performance_compare.py \
+                --optest "${optest}" \
+                --output-dir "${log_dir}/operator-compare/int8-symmetric" \
+                --quantization int8-symmetric --scale-layout perchannel \
+                --warmup 20 --iters 200 --outer-repeats 5
+        fi
+
         for batch in 1 16 64 256 1024; do
             if [[ "${scope}" == all || "${scope}" == block128 ]]; then
                 run_logged "sm90_fp8_blockwise_m${batch}_perf" env \
@@ -609,6 +627,9 @@ case "${suite}" in
     ops-block128-functional) run_ops_functional ;;
     ops-block128-performance) run_ops_performance ;;
     ops-block128) run_ops_functional; run_ops_performance ;;
+    ops-int8-symmetric-functional) run_ops_functional ;;
+    ops-int8-symmetric-performance) run_ops_performance ;;
+    ops-int8-symmetric) run_ops_functional; run_ops_performance ;;
     ops-int8-azp-functional) run_ops_functional ;;
     ops-int8-azp-performance) run_ops_performance ;;
     ops-int8-azp) run_ops_functional; run_ops_performance ;;
@@ -623,7 +644,7 @@ case "${suite}" in
     model-performance) run_model_performance ;;
     all) run_ops_functional; run_ops_performance; run_forward; run_model_performance ;;
     *)
-        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-moe-functional|ops-moe-performance|ops-moe|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
+        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-symmetric-functional|ops-int8-symmetric-performance|ops-int8-symmetric|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-moe-functional|ops-moe-performance|ops-moe|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
         exit 2
         ;;
 esac

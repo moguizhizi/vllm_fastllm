@@ -67,9 +67,9 @@ BLOCK128_CASES = [
     if name.startswith("vllm_") and n % 128 == 0 and k % 128 == 0
 ]
 
-# vLLM SM90 INT8 AZP入口要求B的K、N均按16对齐。只保留双方能
-# 直接调用CUTLASS的共同形状，不将padding开销混入AZP对比。
-INT8_AZP_CASES = [
+# vLLM SM90 INT8入口要求B的K、N均按16对齐。只保留双方能直接
+# 调用CUTLASS的共同形状，不将padding开销混入INT8对比。
+INT8_CASES = [
     case for case in CASES if case[2] % 16 == 0 and case[3] % 16 == 0
 ]
 
@@ -89,15 +89,17 @@ def parse_args():
         default="perchannel",
         help="双方共同使用的权重/激活scale语义")
     parser.add_argument(
-        "--quantization", choices=("fp8", "int8-azp"), default="fp8",
-        help="fp8为现有Dense/Block128路径；int8-azp为SM90动态非对称INT8")
+        "--quantization",
+        choices=("fp8", "int8-symmetric", "int8-azp"), default="fp8",
+        help=("fp8为现有Dense/Block128路径；int8-symmetric为SM90动态"
+              "对称INT8；int8-azp为SM90动态非对称INT8"))
     return parser.parse_args()
 
 
 def selected_cases(args):
     """按scale布局返回合法且覆盖正式分派边界的测试形状。"""
-    if args.quantization == "int8-azp":
-        return INT8_AZP_CASES
+    if args.quantization.startswith("int8-"):
+        return INT8_CASES
     return BLOCK128_CASES if args.scale_layout == "block128" else CASES
 
 
@@ -171,10 +173,13 @@ def run_fastllm(args, log_dir):
         "FASTLLM_CUDA_W8A8_STRICT": "1",
         "FASTLLM_CUDA_W8A8_TRACE": "0",
     })
-    if args.quantization == "int8-azp":
+    if args.quantization.startswith("int8-"):
         weight_layout = None
         op_name = "linear_int8_w8a8"
-        backend_path = "w8a8-int8-azp-cutlass (strict)"
+        backend_path = (
+            "w8a8-int8-azp-cutlass (strict)"
+            if args.quantization == "int8-azp"
+            else "w8a8-int8-cutlass (strict)")
     else:
         weight_layout = (
             "separate" if args.scale_layout == "block128" else "perchannel")
@@ -195,8 +200,12 @@ def run_fastllm(args, log_dir):
                 "--param", "input_type=bf16", "--param", "has_bias=0",
                 "--warmup", str(args.warmup), "--iters", str(args.iters),
             ]
-            if args.quantization == "int8-azp":
-                command.extend(["--param", "activation_scheme=azp_dynamic"])
+            if args.quantization.startswith("int8-"):
+                activation_scheme = (
+                    "azp_dynamic" if args.quantization == "int8-azp"
+                    else "symmetric")
+                command.extend([
+                    "--param", f"activation_scheme={activation_scheme}"])
             else:
                 command.extend(["--param", f"weight_layout={weight_layout}"])
             result = subprocess.run(
@@ -211,8 +220,11 @@ def run_fastllm(args, log_dir):
         rows.append({
             "case": name, "m": m, "n": n, "k": k,
             "scale_layout": (
-                "per-token AZP/per-channel" if args.quantization == "int8-azp"
-                else args.scale_layout),
+                "per-token AZP/per-channel"
+                if args.quantization == "int8-azp"
+                else ("per-token symmetric/per-channel"
+                      if args.quantization == "int8-symmetric"
+                      else args.scale_layout)),
             **summarize_samples(
                 "fastllm", samples, m, n, k, backend_path),
         })
@@ -234,7 +246,8 @@ def run_vllm(args):
     fp8 = torch.float8_e4m3fn
     for name, m, n, k in selected_cases(args):
         samples = []
-        if args.quantization == "int8-azp":
+        if args.quantization.startswith("int8-"):
+            asymmetric = args.quantization == "int8-azp"
             for _ in range(args.outer_repeats):
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -251,33 +264,44 @@ def run_vllm(args):
                 weight_scale = (
                     0.0025 + 0.00001 * (n_indices % 31)).to(torch.float32)
                 del indices, k_indices, n_indices
-                azp_adj = weight.sum(dim=0, keepdim=True, dtype=torch.int32)
+                azp_adj = (weight.sum(dim=0, keepdim=True, dtype=torch.int32)
+                           if asymmetric else None)
 
-                def run_int8_azp():
+                def run_int8():
                     quantized, token_scale, token_azp = ops.scaled_int8_quant(
-                        source, None, None, symmetric=False)
-                    return ops.cutlass_scaled_mm_azp(
+                        source, None, None, symmetric=not asymmetric)
+                    if asymmetric:
+                        return ops.cutlass_scaled_mm_azp(
+                            quantized, weight, token_scale, weight_scale,
+                            torch.bfloat16, azp_adj, token_azp, None)
+                    return ops.cutlass_scaled_mm(
                         quantized, weight, token_scale, weight_scale,
-                        torch.bfloat16, azp_adj, token_azp, None)
+                        torch.bfloat16, None)
 
                 for _ in range(args.warmup):
-                    output = run_int8_azp()
+                    output = run_int8()
                 torch.cuda.synchronize()
                 begin = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 begin.record()
                 for _ in range(args.iters):
-                    output = run_int8_azp()
+                    output = run_int8()
                 end.record()
                 end.synchronize()
                 samples.append(begin.elapsed_time(end) / args.iters)
-                del source, weight, weight_scale, azp_adj, output
+                del source, weight, weight_scale, output
+                if azp_adj is not None:
+                    del azp_adj
             rows.append({
                 "case": name, "m": m, "n": n, "k": k,
-                "scale_layout": "per-token AZP/per-channel",
+                "scale_layout": (
+                    "per-token AZP/per-channel" if asymmetric
+                    else "per-token symmetric/per-channel"),
                 **summarize_samples(
                     "vllm", samples, m, n, k,
-                    "scaled_int8_quant(asymmetric) + cutlass_scaled_mm_azp"),
+                    ("scaled_int8_quant(asymmetric) + "
+                     "cutlass_scaled_mm_azp" if asymmetric else
+                     "scaled_int8_quant(symmetric) + cutlass_scaled_mm")),
             })
             print(json.dumps(rows[-1]), flush=True)
             continue
@@ -398,10 +422,13 @@ def write_reports(output_dir, fastllm_rows, vllm_rows, scale_layout,
         ("> 双方都计入BF16激活动态per-token非对称INT8量化、"
          "per-channel对称INT8权重、AZP融合CUTLASS GEMM及输出；无bias。"
          if quantization == "int8-azp" else
+         ("> 双方都计入BF16激活动态per-token对称INT8量化、"
+          "per-channel对称INT8权重、CUTLASS GEMM及输出；无bias。"
+          if quantization == "int8-symmetric" else
          ("> 双方都计入BF16激活动态per-group(1,128) FP8量化、"
           "block(128,128)权重"
           if scale_layout == "block128"
-          else "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重")),
+          else "> 双方都计入BF16激活动态per-token FP8量化、per-channel权重"))),
         "> 每项使用独立重复样本计算统计值。", "",
         "> 加速比 = vLLM耗时 / FastLLM耗时；大于1表示FastLLM更快，",
         "> 小于1表示FastLLM更慢。", "",

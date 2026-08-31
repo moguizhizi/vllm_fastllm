@@ -47,6 +47,14 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-azp-function" \
   test/w8a8/run_w8a8_tests.sh ops-int8-azp-functional
 ```
 
+SM90动态per-token对称INT8 W8A8也可单独执行：
+
+```bash
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-symmetric-function" \
+  test/w8a8/run_w8a8_tests.sh ops-int8-symmetric-functional
+```
+
 SM90标准FP8 W8A8 grouped MoE可单独执行；该入口覆盖五档CUTLASS调度、
 FP16/BF16、tensorwise/per-channel Scale、Block128 Triton grouped路径和
 shared expert，并生成XLSX汇总：
@@ -83,6 +91,15 @@ SM90 INT8 AZP独立性能对比：
 W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
 W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-azp-perf" \
   test/w8a8/run_w8a8_tests.sh ops-int8-azp-performance
+```
+
+SM90对称INT8独立性能对比；FastLLM与vLLM使用完全相同的BF16激活、
+INT8权重和per-channel权重scale，并都把动态per-token激活量化计入延迟：
+
+```bash
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm90-int8-symmetric-perf" \
+  test/w8a8/run_w8a8_tests.sh ops-int8-symmetric-performance
 ```
 
 性能报告中的`fastllm_speedup_vs_vllm_x`按
