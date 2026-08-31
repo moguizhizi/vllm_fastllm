@@ -220,9 +220,10 @@ def summarize_requests(backend, mode, scenario, workload, batch, input_tokens,
 
 def run_http_request(base_url, model_name, input_tokens, output_tokens,
                      request_timeout, request_id):
+    expected_prompt_ids = list(input_tokens)
     payload = {
         "model": model_name,
-        "prompt": input_tokens,
+        "prompt": expected_prompt_ids,
         "add_special_tokens": False,
         "max_tokens": output_tokens,
         "temperature": 0,
@@ -261,8 +262,34 @@ def run_http_request(base_url, model_name, input_tokens, output_tokens,
         now = time.perf_counter()
         token_times.extend([now] * len(delta_ids))
     end_time = time.perf_counter()
-    if returned_prompt_ids != input_tokens:
-        raise RuntimeError(f"请求{request_id}返回的Prompt Token ID不一致")
+    if returned_prompt_ids is None:
+        raise RuntimeError(
+            f"请求{request_id}未返回Prompt Token ID；"
+            f"流式收到{len(token_times)}个输出Token，"
+            f"usage={usage or 'n/a'}")
+    if not isinstance(returned_prompt_ids, list):
+        raise RuntimeError(
+            f"请求{request_id}返回的Prompt Token ID格式错误；"
+            f"期望list，实际{type(returned_prompt_ids).__name__}")
+    if returned_prompt_ids != expected_prompt_ids:
+        common_length = min(
+            len(expected_prompt_ids), len(returned_prompt_ids))
+        mismatch_index = next(
+            (index for index in range(common_length)
+             if expected_prompt_ids[index] != returned_prompt_ids[index]),
+            common_length)
+        expected_token = (
+            expected_prompt_ids[mismatch_index]
+            if mismatch_index < len(expected_prompt_ids) else "<end>")
+        returned_token = (
+            returned_prompt_ids[mismatch_index]
+            if mismatch_index < len(returned_prompt_ids) else "<end>")
+        raise RuntimeError(
+            f"请求{request_id}返回的Prompt Token ID不一致；"
+            f"期望长度={len(expected_prompt_ids)}，"
+            f"实际长度={len(returned_prompt_ids)}，"
+            f"首个差异位置={mismatch_index}，"
+            f"期望Token={expected_token}，实际Token={returned_token}")
     output_count = int(usage.get("completion_tokens") or len(token_times))
     if output_count != len(token_times) or output_count != output_tokens:
         raise RuntimeError(

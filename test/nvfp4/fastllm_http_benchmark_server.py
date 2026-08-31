@@ -98,8 +98,21 @@ def make_handler(model):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
+                # Prompt回显独立于生成Token发送。即使后端在首Token前结束，
+                # 客户端也能区分Prompt不一致与零Token提前结束；空token_ids
+                # 不进入TTFT、ITL和输出吞吐计数。
+                stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
+                write_sse(self, {
+                    "choices": [{
+                        "index": 0,
+                        "token_ids": [],
+                        "text": "",
+                        "prompt_token_ids": input_tokens,
+                    }],
+                })
+                if trace_cpu:
+                    sse_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
                 generated = 0
-                first = True
                 statistics = {}
                 while True:
                     stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
@@ -128,9 +141,6 @@ def make_handler(model):
                     if token <= -1:
                         break
                     choice = {"index": 0, "token_ids": [token], "text": ""}
-                    if first:
-                        choice["prompt_token_ids"] = input_tokens
-                        first = False
                     stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0
                     write_sse(self, {"choices": [choice]})
                     if trace_cpu:
