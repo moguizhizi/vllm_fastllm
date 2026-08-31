@@ -19,6 +19,9 @@ def parse_args():
     parser.add_argument("--atype", default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-batch", type=int, required=True)
+    parser.add_argument(
+        "--enable-prefix-cache", action="store_true",
+        help="保存已完成请求的KV Cache，供后续相同前缀请求复用")
     return parser.parse_args()
 
 
@@ -183,6 +186,8 @@ def main():
     model = llm.model(args.model, dtype=args.dtype)
     model.set_atype(args.atype)
     model.set_max_batch(args.max_batch)
+    if args.enable_prefix_cache:
+        model.set_save_history(True)
     model.warmup()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(model))
     server.daemon_threads = True

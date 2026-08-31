@@ -161,7 +161,7 @@ def server_spec(args, backend, max_batch):
             "--model", args.model, "--host", "127.0.0.1",
             "--port", str(args.port), "--dtype", args.flm_dtype,
             "--atype", args.flm_atype, "--device", args.flm_device,
-            "--max-batch", str(max_batch),
+            "--max-batch", str(max_batch), "--enable-prefix-cache",
         ]
         env = os.environ.copy()
         env["FASTLLM_CUDA_GRAPH"] = "1"
