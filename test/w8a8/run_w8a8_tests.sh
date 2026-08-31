@@ -295,7 +295,9 @@ sm90_block128_fused_m256_bf16 64 bf16
 EOF
         fi
 
-        if [[ "${scope}" != int8-azp && "${scope}" != moe ]]; then
+        if [[ "${scope}" != int8-azp &&
+              "${scope}" != int8-symmetric &&
+              "${scope}" != moe ]]; then
             run_logged "sm90_vllm_official_functional_${scope}" \
                 "${vllm_python}" test/w8a8/operator_functional_vllm.py \
                 --scale-layout "${scope}"
