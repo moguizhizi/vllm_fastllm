@@ -2,6 +2,7 @@
 """使用Python标准库生成简单的多工作表XLSX报告。"""
 
 import re
+from pathlib import Path
 from xml.sax.saxutils import escape
 import zipfile
 
@@ -44,13 +45,24 @@ def _cell_xml(reference, value, style=0):
             f'<t{preserve}>{text}</t></is></c>')
 
 
-def write_xlsx(path, sheets):
-    """把`(名称, 表头, 行)`列表写成无需第三方依赖的XLSX工作簿。"""
+def write_xlsx(path, sheets, image_sheets=None):
+    """把表格和PNG趋势图写成无需第三方依赖的XLSX工作簿。"""
     used_names = set()
     normalized = [
         (_sheet_name(name, used_names), headers, rows)
         for name, headers, rows in sheets
     ]
+    normalized_images = []
+    for name, images in image_sheets or []:
+        paths = [Path(image) for image in images]
+        normalized_images.append((
+            len(normalized) + 1,
+            paths,
+        ))
+        normalized.append((
+            _sheet_name(name, used_names), ["趋势图文件"],
+            [[path.name] for path in paths],
+        ))
 
     content_types = [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
@@ -64,6 +76,12 @@ def write_xlsx(path, sheets):
         content_types.append(
             f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
             'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+    if normalized_images:
+        content_types.append('<Default Extension="png" ContentType="image/png"/>')
+    for drawing_index in range(1, len(normalized_images) + 1):
+        content_types.append(
+            f'<Override PartName="/xl/drawings/drawing{drawing_index}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>')
     content_types.append('</Types>')
 
     workbook_sheets = "".join(
@@ -122,6 +140,12 @@ def write_xlsx(path, sheets):
         archive.writestr("xl/_rels/workbook.xml.rels", "".join(workbook_rels))
         archive.writestr("xl/styles.xml", styles)
 
+        image_sheet_map = {
+            sheet_index: (drawing_index, paths)
+            for drawing_index, (sheet_index, paths) in
+            enumerate(normalized_images, 1)
+        }
+        media_index = 1
         for sheet_index, (_, headers, rows) in enumerate(normalized, 1):
             all_rows = [headers, *rows]
             widths = []
@@ -144,11 +168,72 @@ def write_xlsx(path, sheets):
                     for column_index, value in enumerate(row, 1))
                 row_xml.append(f'<row r="{row_index}">{cells}</row>')
             last_cell = f"{_column_name(len(headers))}{len(all_rows)}"
+            drawing = image_sheet_map.get(sheet_index)
+            relationship_namespace = (
+                ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+                if drawing else "")
+            drawing_reference = '<drawing r:id="rId1"/>' if drawing else ""
             worksheet = (
                 '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+                f'{relationship_namespace}>'
                 '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
                 'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
                 f'<cols>{columns}</cols><sheetData>{"".join(row_xml)}</sheetData>'
-                f'<autoFilter ref="A1:{last_cell}"/></worksheet>')
+                f'<autoFilter ref="A1:{last_cell}"/>{drawing_reference}</worksheet>')
             archive.writestr(f"xl/worksheets/sheet{sheet_index}.xml", worksheet)
+
+            if not drawing:
+                continue
+            drawing_index, image_paths = drawing
+            worksheet_rels = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+                f'Target="../drawings/drawing{drawing_index}.xml"/></Relationships>')
+            archive.writestr(
+                f"xl/worksheets/_rels/sheet{sheet_index}.xml.rels",
+                worksheet_rels)
+
+            anchors = []
+            drawing_relationships = []
+            for local_index, image_path in enumerate(image_paths, 1):
+                if not image_path.is_file():
+                    raise FileNotFoundError(f"趋势图不存在：{image_path}")
+                start_row = 2 + (local_index - 1) * 42
+                anchors.append(
+                    '<xdr:twoCellAnchor>'
+                    f'<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff>'
+                    f'<xdr:row>{start_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+                    f'<xdr:to><xdr:col>16</xdr:col><xdr:colOff>0</xdr:colOff>'
+                    f'<xdr:row>{start_row + 38}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+                    '<xdr:pic><xdr:nvPicPr>'
+                    f'<xdr:cNvPr id="{local_index}" name="{escape(image_path.name)}"/>'
+                    '<xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill>'
+                    f'<a:blip r:embed="rId{local_index}"/><a:stretch><a:fillRect/></a:stretch>'
+                    '</xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/>'
+                    '</a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/>'
+                    '</xdr:twoCellAnchor>')
+                drawing_relationships.append(
+                    f'<Relationship Id="rId{local_index}" '
+                    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                    f'Target="../media/image{media_index}.png"/>')
+                archive.writestr(
+                    f"xl/media/image{media_index}.png", image_path.read_bytes())
+                media_index += 1
+
+            drawing_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+                'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                f'{"".join(anchors)}</xdr:wsDr>')
+            drawing_rels = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f'{"".join(drawing_relationships)}</Relationships>')
+            archive.writestr(f"xl/drawings/drawing{drawing_index}.xml", drawing_xml)
+            archive.writestr(
+                f"xl/drawings/_rels/drawing{drawing_index}.xml.rels",
+                drawing_rels)

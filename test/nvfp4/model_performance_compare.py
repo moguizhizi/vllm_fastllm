@@ -15,6 +15,11 @@ import time
 
 import requests
 
+TEST_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TEST_DIR))
+
+from common.performance_report import (  # noqa: E402
+    ChartSpec, markdown_images, slugify, write_dashboard)
 from xlsx_report import write_xlsx
 
 
@@ -603,6 +608,33 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                      vllm_item["output_tok_s"]),
                 ])
             lines.append("")
+    chart_paths = []
+    image_dir = result_dir / "images"
+    chart_specs = (
+        ChartSpec("TTFT", "ttft_ms", "ms"),
+        ChartSpec("TPOT", "tpot_ms", "ms"),
+        ChartSpec("E2EL", "e2el_ms", "ms"),
+        ChartSpec("OUTPUT THROUGHPUT", "output_tok_s", "tok/s"),
+    )
+    for mode in MODES:
+        for scenario in SCENARIOS:
+            workloads = sorted({
+                row["workload"] for row in csv_rows
+                if row["mode"] == mode and row["scenario"] == scenario
+            })
+            for workload in workloads:
+                chart_rows = [
+                    row for row in csv_rows
+                    if row["mode"] == mode and row["scenario"] == scenario and
+                    row["workload"] == workload
+                ]
+                filename = "model-performance-{}-{}-{}.png".format(
+                    slugify(mode), slugify(scenario), slugify(workload))
+                chart_paths.append(write_dashboard(
+                    image_dir / filename, chart_rows, chart_specs,
+                    f"{quantization.upper()} {mode} {scenario} {workload}"))
+    lines.extend(markdown_images(chart_paths))
+
     report = "\n".join(lines)
     markdown_path = result_dir / "model-performance-compare.md"
     csv_path = result_dir / "model-performance-compare.csv"
@@ -623,12 +655,13 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
         ("FastLLM-vLLM比值", [
             "状态", "模式", "场景", "Workload", "Batch", "TTFT比", "TPOT比",
             "ITL比", "E2EL比", "Output吞吐比"], comparison_rows),
-    ])
+    ], image_sheets=[("Batch趋势图", chart_paths)])
     print(report)
     print(f"Summary: PASS ({len(csv_rows)} backend case records)")
     print(f"Markdown: {markdown_path}")
     print(f"CSV: {csv_path}")
     print(f"Excel: {result_dir / 'model-performance-compare.xlsx'}")
+    print(f"Images: {image_dir}")
 
 
 def orchestrate(args):
