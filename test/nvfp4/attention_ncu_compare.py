@@ -61,6 +61,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
+    parser.add_argument("--flm-attention-backend", default="auto")
+    parser.add_argument("--flm-attention-backend-strict", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--port", type=int, default=18083)
@@ -594,14 +596,19 @@ def make_reports(result_dir, summaries):
         "> Nsight Systems统计进程启动、Graph warmup和正式请求的完整生命周期，",
         "> 最后从进程启动采集首个稳定Decode目标Kernel。NCU会重放Kernel，",
         "> 本报告用于微观归因，不能替代未使用Profiler的TPOT。", "",
-        "| 状态 | 后端 | Kernel | 完整跳过数 | 启动/预热调用 | Grid | Block | Duration | DRAM Read | DRAM Write | "
+        "| 状态 | 后端 | 请求Attention后端 | 实际Attention后端 | 后端确认 | Kernel | "
+        "完整跳过数 | 启动/预热调用 | Grid | Block | Duration | DRAM Read | DRAM Write | "
         "DRAM吞吐 | Occupancy | Registers/Thread | Shared Memory/Block |",
-        "| --- | --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in summaries:
         selected = item["selected_metrics"]
         lines.append(
-            f"| {item['result']} | {item['backend']} | `{item['kernel_marker']}` | "
+            f"| {item['result']} | {item['backend']} | "
+            f"{item.get('requested_attention_backend', 'n/a')} | "
+            f"{','.join(item.get('actual_attention_backends', [])) or 'n/a'} | "
+            f"{item.get('attention_backend_confirmed', 'n/a')} | "
+            f"`{item['kernel_marker']}` | "
             f"{item['launch_skip']} | {item['startup_and_warmup_matches']} | "
             f"{item['grid'] or 'n/a'} | {item['block'] or 'n/a'} | "
             f"{metric_text(selected['Duration'])} | "
@@ -649,7 +656,11 @@ def make_reports(result_dir, summaries):
     for item in summaries:
         selected = item["selected_metrics"]
         summary_rows.append([
-            item["result"], item["backend"], item["kernel_marker"],
+            item["result"], item["backend"],
+            item.get("requested_attention_backend", "n/a"),
+            ",".join(item.get("actual_attention_backends", [])) or "n/a",
+            item.get("attention_backend_confirmed", "n/a"),
+            item["kernel_marker"],
             item["grid"], item["block"],
             metric_text(selected["Duration"]),
             metric_text(selected["DRAM Read Bytes"]),
@@ -674,7 +685,8 @@ def make_reports(result_dir, summaries):
             ])
     decode_nsys.write_xlsx(xlsx_path, [
         ("关键指标", [
-            "状态", "后端", "Kernel", "Grid", "Block", "Duration", "DRAM Read",
+            "状态", "后端", "请求Attention后端", "实际Attention后端",
+            "Attention后端确认", "Kernel", "Grid", "Block", "Duration", "DRAM Read",
             "DRAM Write", "DRAM吞吐", "Occupancy", "Registers/Thread",
             "Shared Memory/Block", "完整launch-skip", "启动及预热调用数",
             "正式请求稳定边界前调用数", "校准区间稳定调用数"],
@@ -729,15 +741,29 @@ def main():
                 f"[{backend}] launch-skip="
                 f"{startup_calibration['launch_skip']}", flush=True)
             print(f"[{backend}] 3/3 正式采集稳定Decode Kernel", flush=True)
-            report, _ = run_profile(
+            report, profile_log = run_profile(
                 args, backend, prompt, startup_calibration, backend_dir)
         finally:
             args.port = original_port
         raw_csv = backend_dir / "03-profile" / "attention-merge-raw.csv"
         raw_rows = parse_ncu_raw(args, report, raw_csv)
-        summaries.append(summarize_backend(
+        summary = summarize_backend(
             backend, report, raw_csv, request_calibration,
-            startup_calibration, discovery, raw_rows))
+            startup_calibration, discovery, raw_rows)
+        if backend == "fastllm":
+            actual_backends = decode_nsys.read_attention_backend_selection(
+                profile_log)
+            confirmed = decode_nsys.attention_backend_confirmed(
+                args.flm_attention_backend, actual_backends)
+            if args.flm_attention_backend_strict and not confirmed:
+                raise RuntimeError(
+                    "FastLLM请求的Attention Backend未在NCU目标日志中确认："
+                    f"requested={args.flm_attention_backend}, "
+                    f"actual={actual_backends}")
+            summary["requested_attention_backend"] = args.flm_attention_backend
+            summary["actual_attention_backends"] = actual_backends
+            summary["attention_backend_confirmed"] = confirmed
+        summaries.append(summary)
 
     md_path, json_path, xlsx_path = make_reports(result_dir, summaries)
     print(f"Markdown: {md_path}")

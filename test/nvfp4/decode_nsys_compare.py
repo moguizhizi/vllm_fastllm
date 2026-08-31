@@ -22,6 +22,8 @@ sys.path.insert(0, str(REPO_DIR / "test"))
 import model_performance_compare as model_compare  # noqa: E402
 from common.performance_report import (  # noqa: E402
     ChartSpec, markdown_images, write_dashboard)
+from common.attention_backend_report import (  # noqa: E402
+    actual_attention_backends, attention_backend_confirmed)
 from xlsx_report import write_xlsx  # noqa: E402
 
 
@@ -76,6 +78,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
+    parser.add_argument("--flm-attention-backend", default="auto")
+    parser.add_argument("--flm-attention-backend-strict", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--port", type=int, default=18082)
@@ -164,7 +168,11 @@ def server_spec(args, backend, max_batch):
             "--port", str(args.port), "--dtype", args.flm_dtype,
             "--atype", args.flm_atype, "--device", args.flm_device,
             "--max-batch", str(max_batch), "--enable-prefix-cache",
+            "--attention-backend", args.flm_attention_backend,
+            "--attention-backend-trace",
         ]
+        if args.flm_attention_backend_strict:
+            command.append("--attention-backend-strict")
         env = os.environ.copy()
         env["FASTLLM_CUDA_GRAPH"] = "1"
         env.pop("FASTLLM_CUDA_GRAPH_TRACE", None)
@@ -196,6 +204,12 @@ def server_spec(args, backend, max_batch):
     env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     env["VLLM_USE_FLASHINFER_MOE_FP4"] = "0"
     return command, env, "decode-nsys"
+
+
+def read_attention_backend_selection(log_path):
+    """从FastLLM服务日志读取框架实际选择的Attention后端。"""
+    return actual_attention_backends(
+        log_path.read_text(encoding="utf-8", errors="replace"))
 
 
 def launch_profiled_server(args, backend, max_batch, backend_dir):
@@ -541,6 +555,100 @@ def ordered_categories(categories):
     return known + sorted(set(categories) - set(KERNEL_CATEGORY_ORDER))
 
 
+def kernel_match_signature(name):
+    """生成跨FastLLM/vLLM名称空间的保守Kernel匹配签名。"""
+    is_fastllm_cutlass = "fastllm_w8a8_dense_detail::DenseKernel" in name
+    is_vllm_cutlass = "vllm::cutlass_3x_gemm" in name
+    if is_fastllm_cutlass or is_vllm_cutlass:
+        shapes = re.findall(r"cute::C<\(int\)(\d+)>", name)
+        architecture = re.search(r"cutlass::arch::Sm(\d+)", name)
+        mainloop = re.search(r"cutlass::gemm::(Kernel[\w]+)", name)
+        epilogue = re.search(r"cutlass::epilogue::([\w:]+)", name)
+        if len(shapes) >= 6 and architecture and mainloop and epilogue:
+            input_type = (
+                "int8" if "signed char" in name else
+                "fp8-e4m3" if "e4m3" in name.lower() else "unknown")
+            output_type = (
+                "bf16" if "bfloat16_t" in name else
+                "fp16" if "half_t" in name else "unknown")
+            tile = "x".join(shapes[:3])
+            cluster = "x".join(shapes[3:6])
+            arch = f"SM{architecture.group(1)}"
+            label = f"{arch} {input_type.upper()} {tile} cluster={cluster}"
+            signature = "|".join((
+                "cutlass-gemm", arch, input_type, output_type, tile, cluster,
+                mainloop.group(1), epilogue.group(1)))
+            return signature, "structural", label
+
+    lowered = name.lower()
+    if ("quantizepertoken" in lowered and "signed char" in lowered) or \
+            "dynamic_scaled_int8_quant_kernel" in lowered:
+        return ("dynamic-int8-per-token-quant", "semantic",
+                "Dynamic INT8 per-token quantize")
+
+    # 相同的Nsight符号只证明进入同名实现，不能替代SASS一致性校验。
+    return f"symbol|{name}", "symbol", name.split("(", 1)[0].strip()
+
+
+def build_kernel_matches(rows):
+    """基于全部汇总Kernel建立跨后端配对，并返回Top页注释映射。"""
+    grouped = {}
+    for row in rows:
+        kernels = row["nsys"].get("kernels", row["nsys"]["top_kernels"])
+        for item in kernels:
+            signature, level, label = kernel_match_signature(item["name"])
+            entry = grouped.setdefault(
+                (row["batch"], signature),
+                {"level": level, "label": label,
+                 "fastllm": [], "vllm": []})
+            entry[row["backend"]].append(item)
+
+    matches = []
+    annotations = {}
+    match_index = 1
+    for (batch, signature), entry in sorted(grouped.items()):
+        if not entry["fastllm"] or not entry["vllm"]:
+            continue
+        match_id = f"K{match_index:03d}"
+        match_index += 1
+
+        def aggregate(items):
+            instances = sum(item["instances"] for item in items)
+            total_ms = sum(item["total_ms"] for item in items)
+            return {
+                "name": " | ".join(item["name"] for item in items),
+                "instances": instances,
+                "total_ms": total_ms,
+                "average_us": total_ms * 1000.0 / instances,
+            }
+
+        fast = aggregate(entry["fastllm"])
+        vllm = aggregate(entry["vllm"])
+        common_instances = min(fast["instances"], vllm["instances"])
+        match = {
+            "batch": batch,
+            "match_id": match_id,
+            "signature": signature,
+            "label": entry["label"],
+            "level": entry["level"],
+            "category": kernel_category(fast["name"]),
+            "fastllm": fast,
+            "vllm": vllm,
+            "common_instances": common_instances,
+            "fastllm_extra_instances": fast["instances"] - common_instances,
+            "vllm_extra_instances": vllm["instances"] - common_instances,
+            "instance_ratio": fast["instances"] / vllm["instances"],
+            "average_us_ratio": fast["average_us"] / vllm["average_us"],
+            "total_ms_ratio": fast["total_ms"] / vllm["total_ms"],
+        }
+        matches.append(match)
+        for backend in BACKENDS:
+            for item in entry[backend]:
+                annotations[(batch, backend, item["name"])] = (
+                    match_id, entry["level"], entry["label"])
+    return matches, annotations
+
+
 def stable_decode_trace(rows):
     """裁掉首Token以前的Prefill与采样，只保留后续稳定Decode GPU事件。"""
     events = []
@@ -819,6 +927,7 @@ def summarize_report(args, report, output_base):
         "timeline": timeline,
         "stable_decode_filter": decode_filter,
         "categories": categories,
+        "kernels": kernels,
         "top_kernels": kernels[:args.top_kernels],
         "top_cuda_apis": apis[:10],
         "memory_operations": memory,
@@ -941,6 +1050,22 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                                  "unreported"),
                 "nsys": summary,
             }
+            if backend == "fastllm":
+                actual_attention_backends = read_attention_backend_selection(
+                    server["log_path"])
+                backend_confirmed = attention_backend_confirmed(
+                    args.flm_attention_backend, actual_attention_backends)
+                if (args.flm_attention_backend_strict and
+                        not backend_confirmed):
+                    raise RuntimeError(
+                        "FastLLM请求的Attention Backend未在Nsight服务日志中确认："
+                        f"requested={args.flm_attention_backend}, "
+                        f"actual={actual_attention_backends}")
+                row["requested_attention_backend"] = (
+                    args.flm_attention_backend)
+                row["actual_attention_backends"] = actual_attention_backends
+                row["attention_backend_confirmed"] = (
+                    backend_confirmed)
             cpu_trace = summary["cpu_trace"]
             if cpu_trace is not None:
                 cpu_trace["launch_api_sum_ms_per_decode_step"] = (
@@ -984,7 +1109,8 @@ def fmt(value, digits=3):
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
-def make_excel_report(result_dir, rows, top_count, chart_paths):
+def make_excel_report(result_dir, rows, top_count, chart_paths,
+                      kernel_matches, kernel_annotations):
     """把Decode Nsight结构化结果写入便于筛选分析的Excel工作簿。"""
     sheets = []
     sheets.append(("说明", ["项目", "内容"], [
@@ -996,7 +1122,8 @@ def make_excel_report(result_dir, rows, top_count, chart_paths):
     ]))
 
     engine_headers = [
-        "状态", "Batch", "后端", "平均TPOT(ms)", "请求TPOT P50(ms)",
+        "状态", "Batch", "后端", "请求Attention后端", "实际Attention后端",
+        "Attention后端确认", "平均TPOT(ms)", "请求TPOT P50(ms)",
         "请求TPOT P95(ms)", "ITL(ms)", "请求E2EL P50(ms)",
         "请求E2EL P95(ms)", "Batch Wall(ms)", "Output(tok/s)",
         "Cache命中率",
@@ -1004,7 +1131,10 @@ def make_excel_report(result_dir, rows, top_count, chart_paths):
     engine_rows = []
     for row in rows:
         engine_rows.append([
-            row["result"], row["batch"], row["backend"], row["tpot_ms"],
+            row["result"], row["batch"], row["backend"],
+            row.get("requested_attention_backend", "n/a"),
+            ",".join(row.get("actual_attention_backends", [])) or "n/a",
+            row.get("attention_backend_confirmed", "n/a"), row["tpot_ms"],
             row["request_tpot_p50_ms"], row["request_tpot_p95_ms"],
             row["itl_ms"], row["request_e2el_p50_ms"],
             row["request_e2el_p95_ms"], row["request_wall_ms"],
@@ -1228,16 +1358,43 @@ def make_excel_report(result_dir, rows, top_count, chart_paths):
             "时间差(ms)", "FastLLM(ms/步)", "vLLM(ms/步)",
             "FastLLM启动数", "vLLM启动数", "启动数差"], compare_rows))
 
+    match_rows = []
+    for match in kernel_matches:
+        fast = match["fastllm"]
+        vllm = match["vllm"]
+        match_rows.append([
+            match["batch"], match["match_id"], match["level"],
+            match["category"], match["label"], match["signature"],
+            fast["name"], vllm["name"], fast["instances"],
+            vllm["instances"], match["common_instances"],
+            match["fastllm_extra_instances"], match["vllm_extra_instances"],
+            match["instance_ratio"], fast["average_us"],
+            vllm["average_us"], match["average_us_ratio"],
+            fast["total_ms"], vllm["total_ms"], match["total_ms_ratio"],
+        ])
+    sheets.append(("Kernel配对对比", [
+        "Batch", "匹配ID", "匹配等级", "类别", "标准Kernel", "标准签名",
+        "FastLLM Kernel", "vLLM Kernel", "FastLLM调用数", "vLLM调用数",
+        "共同调用数", "FastLLM额外调用", "vLLM额外调用", "调用数比",
+        "FastLLM平均(us)", "vLLM平均(us)", "平均耗时比",
+        "FastLLM总时间(ms)", "vLLM总时间(ms)", "总时间比"], match_rows))
+
     top_rows = []
     for row in rows:
         for rank, item in enumerate(row["nsys"]["top_kernels"][:top_count], 1):
+            annotation = kernel_annotations.get(
+                (row["batch"], row["backend"], item["name"]))
             top_rows.append([
-                row["batch"], row["backend"], rank, item["name"],
-                item["instances"], item["total_ms"], item["average_us"],
+                row["batch"], row["backend"], rank,
+                "" if annotation is None else annotation[0],
+                "unmatched" if annotation is None else annotation[1],
+                "" if annotation is None else annotation[2],
+                kernel_category(item["name"]), item["name"], item["instances"],
+                item["total_ms"], item["average_us"],
             ])
     sheets.append(("Top Kernels", [
-        "Batch", "后端", "排名", "Kernel", "调用次数", "总时间(ms)",
-        "平均(us)"], top_rows))
+        "Batch", "后端", "排名", "匹配ID", "匹配等级", "标准Kernel", "类别",
+        "Kernel", "调用次数", "总时间(ms)", "平均(us)"], top_rows))
 
     path = result_dir / "decode-nsys-compare.xlsx"
     write_xlsx(path, sheets, image_sheets=[("Batch趋势图", chart_paths)])
@@ -1255,10 +1412,11 @@ def make_report(result_dir, rows, top_count):
         "> GPU时间线空闲只统计首个与最后一个GPU事件之间的内部空隙；",
         "> 第一个输出Token属于Prefill，逐步指标按`output_tokens - 1`归一化。", "",
         "## 引擎指标", "",
-        "| 状态 | Batch | 后端 | 平均TPOT(ms) | 请求TPOT P50(ms) | 请求TPOT P95(ms) | "
+        "| 状态 | Batch | 后端 | 请求Attention后端 | 实际Attention后端 | 后端确认 | "
+        "平均TPOT(ms) | 请求TPOT P50(ms) | 请求TPOT P95(ms) | "
         "ITL(ms) | 请求E2EL P50(ms) | 请求E2EL P95(ms) | Batch Wall(ms) | "
         "Output(tok/s) | Cache命中 |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "| --- | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | "
         "---: | --- |",
     ]
     for row in rows:
@@ -1266,7 +1424,11 @@ def make_report(result_dir, rows, top_count):
         cache_text = ("未报告" if row["cache_status"] == "unreported" else
                       f"{cache * 100:.1f}%")
         lines.append(
-            f"| {row['result']} | {row['batch']} | {row['backend']} | {fmt(row['tpot_ms'])} | "
+            f"| {row['result']} | {row['batch']} | {row['backend']} | "
+            f"{row.get('requested_attention_backend', 'n/a')} | "
+            f"{','.join(row.get('actual_attention_backends', [])) or 'n/a'} | "
+            f"{row.get('attention_backend_confirmed', 'n/a')} | "
+            f"{fmt(row['tpot_ms'])} | "
             f"{fmt(row['request_tpot_p50_ms'])} | "
             f"{fmt(row['request_tpot_p95_ms'])} | {fmt(row['itl_ms'])} | "
             f"{fmt(row['request_e2el_p50_ms'])} | "
@@ -1333,6 +1495,7 @@ def make_report(result_dir, rows, top_count):
         if (row["batch"], "fastllm") in by_case and
         (row["batch"], "vllm") in by_case
     })
+    kernel_matches, kernel_annotations = build_kernel_matches(rows)
     if paired_batches:
         lines.extend([
             "", "## FastLLM / vLLM比值", "",
@@ -1447,16 +1610,40 @@ def make_report(result_dir, rows, top_count):
                 f"{vllm_idle:.3f} | {fast_idle - vllm_idle:+.3f} | "
                 f"{fast_idle_step:.3f} | {vllm_idle_step:.3f} | — | — | — |")
 
+    if kernel_matches:
+        lines.extend([
+            "", "## Kernel配对对比", "",
+            "> structural表示CUTLASS数据类型、Tile、Cluster和调度结构一致；",
+            "> semantic表示功能相同但实现边界不同；symbol只表示Nsight符号相同，",
+            "> 不能替代SASS一致性验证。", "",
+            "| Batch | ID | 等级 | 标准Kernel | FT调用 | vLLM调用 | 调用比 | "
+            "FT平均(us) | vLLM平均(us) | 平均耗时比 |",
+            "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for match in kernel_matches:
+            fast = match["fastllm"]
+            vllm = match["vllm"]
+            lines.append(
+                f"| {match['batch']} | {match['match_id']} | {match['level']} | "
+                f"{match['label'].replace('|', '/')} | {fast['instances']} | "
+                f"{vllm['instances']} | {match['instance_ratio']:.3f} | "
+                f"{fast['average_us']:.3f} | {vllm['average_us']:.3f} | "
+                f"{match['average_us_ratio']:.3f} |")
+
     for row in rows:
         lines.extend([
             "", f"## Batch={row['batch']} / {row['backend']} Top Kernels", "",
-            "| Kernel | 调用次数 | 总时间(ms) | 平均(us) |",
-            "| --- | ---: | ---: | ---: |",
+            "| 匹配ID | 匹配等级 | 类别 | Kernel | 调用次数 | 总时间(ms) | 平均(us) |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: |",
         ])
         for item in row["nsys"]["top_kernels"][:top_count]:
             name = item["name"].replace("|", "\\|")
+            annotation = kernel_annotations.get(
+                (row["batch"], row["backend"], item["name"]))
             lines.append(
-                f"| `{name}` | {item['instances']} | "
+                f"| {'' if annotation is None else annotation[0]} | "
+                f"{'unmatched' if annotation is None else annotation[1]} | "
+                f"{kernel_category(item['name'])} | `{name}` | {item['instances']} | "
                 f"{item['total_ms']:.3f} | {item['average_us']:.3f} |")
 
     chart_rows = []
@@ -1486,6 +1673,73 @@ def make_report(result_dir, rows, top_count):
             "submit_count_per_step": submit_count_per_step,
             "kernels_per_submission": kernels_per_submission,
         })
+
+    def chart_ratio(left, right):
+        return None if left is None or right in (None, 0) else left / right
+
+    ratio_rows = []
+    for batch in paired_batches:
+        fast = by_case[(batch, "fastllm")]
+        vllm = by_case[(batch, "vllm")]
+        fast_cpu = fast["nsys"].get("cpu_trace")
+        vllm_cpu = vllm["nsys"].get("cpu_trace")
+        if fast_cpu is None or vllm_cpu is None:
+            continue
+        fast_steps = fast["nsys"]["decode_steps"]
+        vllm_steps = vllm["nsys"]["decode_steps"]
+        ratio_rows.append({
+            "batch": batch,
+            "backend": "ratio",
+            "kernel_execution_ratio": chart_ratio(
+                fast_cpu["kernel_execution_count"] / fast_steps,
+                vllm_cpu["kernel_execution_count"] / vllm_steps),
+            "kernel_time_ratio": chart_ratio(
+                fast["nsys"]["kernel_ms_per_decode_step"],
+                vllm["nsys"]["kernel_ms_per_decode_step"]),
+            "submit_time_ratio": chart_ratio(
+                fast_cpu["launch_api_union_ms_per_decode_step"],
+                vllm_cpu["launch_api_union_ms_per_decode_step"]),
+            "tpot_ratio": chart_ratio(fast["tpot_ms"], vllm["tpot_ms"]),
+        })
+
+    matched_kernel_rows = []
+    for batch in paired_batches:
+        batch_matches = [
+            match for match in kernel_matches if match["batch"] == batch
+        ]
+        if not batch_matches:
+            continue
+        common_instances = sum(
+            match["common_instances"] for match in batch_matches)
+        fast_common_us = sum(
+            match["fastllm"]["average_us"] * match["common_instances"]
+            for match in batch_matches)
+        vllm_common_us = sum(
+            match["vllm"]["average_us"] * match["common_instances"]
+            for match in batch_matches)
+        fast_instances = sum(
+            match["fastllm"]["instances"] for match in batch_matches)
+        vllm_instances = sum(
+            match["vllm"]["instances"] for match in batch_matches)
+        fast_total_ms = sum(
+            match["fastllm"]["total_ms"] for match in batch_matches)
+        vllm_total_ms = sum(
+            match["vllm"]["total_ms"] for match in batch_matches)
+        steps = by_case[(batch, "fastllm")]["nsys"]["decode_steps"]
+        matched_kernel_rows.append({
+            "batch": batch,
+            "backend": "ratio",
+            "matched_average_us_ratio": chart_ratio(
+                fast_common_us / common_instances,
+                vllm_common_us / common_instances),
+            "matched_instance_ratio": chart_ratio(
+                fast_instances, vllm_instances),
+            "matched_total_ms_ratio": chart_ratio(
+                fast_total_ms, vllm_total_ms),
+            "fastllm_extra_per_step": sum(
+                match["fastllm_extra_instances"] for match in batch_matches
+            ) / steps,
+        })
     image_dir = result_dir / "images"
     chart_paths = [
         write_dashboard(
@@ -1504,12 +1758,29 @@ def make_report(result_dir, rows, top_count):
             ), "DECODE NSYS BOTTLENECK TRENDS"),
         write_dashboard(
             image_dir / "decode-nsys-submission-trends.png", chart_rows, (
-                ChartSpec("KERNEL EXECUTIONS", "kernel_count_per_step", "count/step"),
                 ChartSpec("KERNEL SUBMISSIONS", "submit_count_per_step", "count/step"),
                 ChartSpec("KERNELS PER SUBMISSION", "kernels_per_submission", "ratio"),
                 ChartSpec("SUBMIT API TIME", "submit_ms_per_step", "ms/step"),
+                ChartSpec("GPU IDLE RATIO", "gpu_idle_pct", "%"),
             ), "DECODE NSYS CPU SUBMISSION TRENDS"),
     ]
+    if ratio_rows:
+        chart_paths.append(write_dashboard(
+            image_dir / "decode-nsys-relative-ratio-trends.png", ratio_rows, (
+                ChartSpec("KERNEL EXECUTION RATIO", "kernel_execution_ratio", "x", 1.0),
+                ChartSpec("KERNEL TIME RATIO", "kernel_time_ratio", "x", 1.0),
+                ChartSpec("SUBMIT API TIME RATIO", "submit_time_ratio", "x", 1.0),
+                ChartSpec("TPOT RATIO", "tpot_ratio", "x", 1.0),
+            ), "FASTLLM / VLLM RELATIVE TRENDS"))
+    if matched_kernel_rows:
+        chart_paths.append(write_dashboard(
+            image_dir / "decode-nsys-matched-kernel-trends.png",
+            matched_kernel_rows, (
+                ChartSpec("MATCHED AVG LATENCY RATIO", "matched_average_us_ratio", "x", 1.0),
+                ChartSpec("MATCHED CALL COUNT RATIO", "matched_instance_ratio", "x", 1.0),
+                ChartSpec("MATCHED TOTAL TIME RATIO", "matched_total_ms_ratio", "x", 1.0),
+                ChartSpec("FASTLLM EXTRA CALLS", "fastllm_extra_per_step", "count/step"),
+            ), "MATCHED KERNEL TRENDS"))
     lines.extend(markdown_images(chart_paths))
 
     report = "\n".join(lines) + "\n"
@@ -1517,11 +1788,17 @@ def make_report(result_dir, rows, top_count):
     path.write_text(report, encoding="utf-8")
     (result_dir / "decode-nsys-compare.json").write_text(
         json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    excel_path = make_excel_report(result_dir, rows, top_count, chart_paths)
+    (result_dir / "decode-nsys-kernel-matches.json").write_text(
+        json.dumps(kernel_matches, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    excel_path = make_excel_report(
+        result_dir, rows, top_count, chart_paths,
+        kernel_matches, kernel_annotations)
     print(report)
     print(f"Summary: PASS ({len(rows)} Decode Nsight cases)")
     print(f"Markdown: {path}")
     print(f"Excel: {excel_path}")
+    print(f"Kernel matches: {result_dir / 'decode-nsys-kernel-matches.json'}")
     print(f"Images: {image_dir}")
 
 

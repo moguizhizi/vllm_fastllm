@@ -9,7 +9,12 @@ gpu_profile=${NVFP4_GPU_PROFILE:-auto}
 cuda_arch=${NVFP4_CUDA_ARCH:-auto}
 optest=${NVFP4_OPTEST:-"${repo_dir}/optest"}
 nvcc_path=${NVFP4_NVCC:-$(command -v nvcc || true)}
+attention_backend=${NVFP4_ATTENTION_BACKEND:-auto}
 mkdir -p "${log_dir}"
+attention_backend_args=(--flm-attention-backend "${attention_backend}")
+if [[ "${NVFP4_ATTENTION_BACKEND_STRICT:-0}" == 1 ]]; then
+    attention_backend_args+=(--flm-attention-backend-strict)
+fi
 
 resolve_gpu_profile() {
     local compute_cap major minor detected_arch
@@ -307,7 +312,8 @@ run_forward() {
     run_logged forward_check_vllm env FASTLLM_CUDA_NVFP4_TRACE=1 \
         python test/nvfp4/forward_check_vllm.py --model "${model_path}" \
         --tokens 8 --flm-dtype auto --flm-atype bfloat16 \
-        --flm-device cuda --result-dir "${log_dir}/forward-vllm-results"
+        --flm-device cuda "${attention_backend_args[@]}" \
+        --result-dir "${log_dir}/forward-vllm-results"
 }
 
 run_model() {
@@ -318,6 +324,7 @@ run_model() {
         python test/nvfp4/model_performance_compare.py \
         --model "${model_path}" \
         --result-dir "${log_dir}/model-performance-results" \
+        "${attention_backend_args[@]}" \
         --prefill-input-tokens 4096 --prefill-max-tokens 16 \
         --decode-batch-sizes 1,2,4,8,16,32 --decode-input-tokens 512 \
         --decode-max-tokens 64 --warmup 1 --repeats 5

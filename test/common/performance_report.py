@@ -12,6 +12,7 @@ import zlib
 BACKEND_COLORS = {
     "fastllm": (68, 114, 196),
     "vllm": (237, 125, 49),
+    "ratio": (112, 48, 160),
 }
 GRID_COLOR = (218, 223, 230)
 TEXT_COLOR = (45, 52, 64)
@@ -24,6 +25,7 @@ class ChartSpec:
     title: str
     field: str
     unit: str
+    reference: float = None
 
 
 # 报告标题只使用ASCII，内置5x7字模即可保证无第三方字体时仍能输出PNG。
@@ -174,6 +176,9 @@ def _draw_panel(canvas, bounds, rows, spec, batch_field, backend_field):
                       if row.get(batch_field) is not None})
     values = [_safe_float(row.get(spec.field)) for row in rows]
     values = [value for value in values if value is not None]
+    reference = _safe_float(spec.reference)
+    if reference is not None:
+        values.append(reference)
     if not batches or not values:
         canvas.text(plot_left + 20, plot_top + 50, "NO DATA", scale=3)
         return
@@ -187,6 +192,13 @@ def _draw_panel(canvas, bounds, rows, spec, batch_field, backend_field):
         value = upper * index / 4
         canvas.line(plot_left, y, plot_right, y, GRID_COLOR)
         canvas.text(left + 6, y - 7, _format_tick(value), scale=1)
+    if reference is not None:
+        reference_y = plot_bottom - round(
+            (plot_bottom - plot_top) * reference / upper)
+        canvas.line(plot_left, reference_y, plot_right, reference_y,
+                    (112, 173, 71), 2)
+        canvas.text(plot_right - 42, reference_y - 14,
+                    _format_tick(reference), (112, 173, 71), 1)
 
     if len(batches) == 1:
         x_positions = {batches[0]: (plot_left + plot_right) // 2}
@@ -202,8 +214,17 @@ def _draw_panel(canvas, bounds, rows, spec, batch_field, backend_field):
         canvas.text(x - len(label) * 3, plot_bottom + 10, label, scale=1)
     canvas.text((plot_left + plot_right) // 2 - 15, bottom - 18, "BATCH", scale=1)
 
-    for backend in ("fastllm", "vllm"):
-        color = BACKEND_COLORS[backend]
+    present_backends = {
+        str(row.get(backend_field, "")).lower() for row in rows
+    }
+    ordered_backends = [
+        backend for backend in ("fastllm", "vllm", "ratio")
+        if backend in present_backends
+    ]
+    ordered_backends.extend(sorted(
+        present_backends - set(ordered_backends)))
+    for backend in ordered_backends:
+        color = BACKEND_COLORS.get(backend, (128, 128, 128))
         points = []
         for row in rows:
             if str(row.get(backend_field, "")).lower() != backend:
@@ -234,10 +255,20 @@ def write_dashboard(path, rows, specs, title, batch_field="batch",
         raise ValueError("一张趋势图必须包含1到4个子图")
     canvas = _Canvas(1280, 820)
     canvas.text(36, 20, title, scale=3)
-    canvas.line(900, 31, 950, 31, BACKEND_COLORS["fastllm"], 4)
-    canvas.text(960, 21, "FASTLLM", scale=2)
-    canvas.line(1090, 31, 1140, 31, BACKEND_COLORS["vllm"], 4)
-    canvas.text(1150, 21, "VLLM", scale=2)
+    present_backends = {
+        str(row.get(backend_field, "")).lower() for row in rows
+    }
+    legend_backends = [
+        backend for backend in ("fastllm", "vllm", "ratio")
+        if backend in present_backends
+    ]
+    legend_x = 900
+    for backend in legend_backends:
+        color = BACKEND_COLORS[backend]
+        label = "FASTLLM/VLLM" if backend == "ratio" else backend.upper()
+        canvas.line(legend_x, 31, legend_x + 50, 31, color, 4)
+        canvas.text(legend_x + 60, 21, label, scale=2)
+        legend_x += 190 if backend != "ratio" else 260
 
     bounds = (
         (20, 65, 640, 440), (640, 65, 1260, 440),

@@ -7,9 +7,14 @@ optest=${W8A8_OPTEST:-"${repo_dir}/optest"}
 model=${W8A8_MODEL:-}
 vllm_python=${W8A8_VLLM_PYTHON:-python}
 nvcc=${W8A8_NVCC:-/usr/local/cuda/bin/nvcc}
+attention_backend=${W8A8_ATTENTION_BACKEND:-auto}
 suite=${1:-ops}
 mkdir -p "${log_dir}"
 functional_summary_pending=0
+attention_backend_args=(--flm-attention-backend "${attention_backend}")
+if [[ "${W8A8_ATTENTION_BACKEND_STRICT:-0}" == 1 ]]; then
+    attention_backend_args+=(--flm-attention-backend-strict)
+fi
 
 write_functional_summary() {
     "${vllm_python}" "${repo_dir}/test/w8a8/operator_functional_summary.py" \
@@ -604,6 +609,7 @@ run_forward() {
         --vllm-python "${vllm_python}" \
         --max-model-len 512 --gpu-memory-utilization 0.90 \
         --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+        "${attention_backend_args[@]}" \
         --result-dir "${log_dir}/forward-results"
 }
 
@@ -615,6 +621,7 @@ run_model_performance() {
         --model "${model}" --result-dir "${log_dir}/model-compare" \
         --vllm-python "${vllm_python}" --fastllm-python "${vllm_python}" \
         --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+        "${attention_backend_args[@]}" \
         --prefill-input-tokens 4096 --prefill-max-tokens 16 \
         --decode-input-tokens 512 --decode-batch-sizes 1,2,4,8,16,32 \
         --decode-max-tokens 64 --warmup 1 --repeats 5 \

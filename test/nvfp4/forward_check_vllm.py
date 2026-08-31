@@ -13,7 +13,10 @@ import sys
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_DIR / "test"))
 sys.path.insert(0, str(REPO_DIR / "test" / "basic"))
+from common.attention_backend_report import (  # noqa: E402
+    actual_attention_backends)
 from config import default_messages_list  # noqa: E402
 from xlsx_report import write_xlsx  # noqa: E402
 
@@ -34,6 +37,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
+    parser.add_argument("--flm-attention-backend", default="auto")
+    parser.add_argument("--flm-attention-backend-strict", action="store_true")
     parser.add_argument("--min-topk-overlap", type=float, default=0.8)
     parser.add_argument("--max-first-logprob-diff", type=float, default=0.1)
     parser.add_argument(
@@ -169,6 +174,9 @@ def run_fastllm(args):
     from ftllm import llm
 
     llm.set_device_map(args.flm_device)
+    llm.set_attention_backend(args.flm_attention_backend)
+    llm.set_attention_backend_strict(args.flm_attention_backend_strict)
+    llm.set_attention_backend_trace(True)
     model = llm.model(args.model, dtype=args.flm_dtype)
     model.set_atype(args.flm_atype)
     if model.hf_tokenizer is not None:
@@ -228,6 +236,16 @@ def compare_results(args, vllm_result, fastllm_result):
     target_backend_confirmed = fastllm_result.get("target_backend_confirmed")
     target_backend_ok = (
         not target_backend_required or target_backend_confirmed is True)
+    requested_attention_backend = args.flm_attention_backend
+    actual_attention_backends = fastllm_result.get(
+        "actual_attention_backends", [])
+    attention_backend_required = (
+        args.flm_attention_backend_strict and
+        requested_attention_backend != "auto")
+    attention_backend_confirmed = (
+        requested_attention_backend in actual_attention_backends)
+    attention_backend_ok = (
+        not attention_backend_required or attention_backend_confirmed)
     sampling_top1_first = fastllm_result.get("sampling_top1_first")
     sampling_top1_first_match = (
         sampling_top1_first.get("match")
@@ -253,6 +271,8 @@ def compare_results(args, vllm_result, fastllm_result):
         failure_class = "prompt_token_ids_mismatch"
     elif not target_backend_ok:
         failure_class = "target_backend_not_confirmed"
+    elif not attention_backend_ok:
+        failure_class = "attention_backend_not_confirmed"
     elif sampling_top1_first_match is None:
         failure_class = "fastllm_sampling_top1_trace_missing"
     elif sampling_top1_first_match is False:
@@ -286,6 +306,9 @@ def compare_results(args, vllm_result, fastllm_result):
           f"{f_production_matches_first_request_argmax}")
     print(f"target_backend_required: {target_backend_required}")
     print(f"target_backend_confirmed: {target_backend_confirmed}")
+    print(f"requested_attention_backend: {requested_attention_backend}")
+    print(f"actual_attention_backends: {actual_attention_backends}")
+    print(f"attention_backend_confirmed: {attention_backend_confirmed}")
     print("production_trace_boundaries_found: "
           f"{fastllm_result.get('production_trace_boundaries_found', False)}")
     print(f"target_backend_trace_count: "
@@ -307,7 +330,7 @@ def compare_results(args, vllm_result, fastllm_result):
 
     # 功能结论和数值诊断全部来自双方各自唯一一次正式生成请求。
     functional_passed = (
-        same_prompt and target_backend_ok and first_token_match and
+        same_prompt and target_backend_ok and attention_backend_ok and first_token_match and
         v_generation_matches_argmax and sampling_top1_first_match is True and
         f_production_matches_first_request_argmax)
     alignment_passed = (
@@ -342,6 +365,10 @@ def compare_results(args, vllm_result, fastllm_result):
         "target_backend_trace_pattern": args.target_trace_pattern,
         "target_backend_trace_count": fastllm_result.get(
             "target_backend_trace_count", 0),
+        "requested_attention_backend": requested_attention_backend,
+        "actual_attention_backends": actual_attention_backends,
+        "attention_backend_required": attention_backend_required,
+        "attention_backend_confirmed": attention_backend_confirmed,
         "production_trace_boundaries_found": fastllm_result.get(
             "production_trace_boundaries_found", False),
         "sampling_top1_trace_count": fastllm_result.get(
@@ -419,6 +446,8 @@ def write_summary_reports(result_dir, summary):
         "FastLLM首次正式请求argmax",
         "vLLM argmax/FastLLM首次正式请求一致", "vLLM生成/argmax一致",
         "FastLLM正式Token/同请求argmax一致",
+        "请求Attention Backend", "实际Attention Backend",
+        "Attention Backend要求", "Attention Backend确认",
         "vLLM首Token在FastLLM首次正式请求TopK排名",
         "FastLLM正式首Token在vLLM TopK排名",
         "首次正式请求TopK", "首次正式请求TopK重合率", "最低重合率",
@@ -445,6 +474,10 @@ def write_summary_reports(result_dir, summary):
         summary["vllm_argmax_matches_fastllm_first_request"],
         summary["vllm_generation_matches_argmax"],
         summary["fastllm_production_matches_first_request_argmax"],
+        summary["requested_attention_backend"],
+        json.dumps(summary["actual_attention_backends"], ensure_ascii=False),
+        summary["attention_backend_required"],
+        summary["attention_backend_confirmed"],
         summary["vllm_token_rank_in_fastllm_first_request_topk"],
         summary["fastllm_production_rank_in_vllm_topk"],
         summary["topk"], summary["topk_overlap"],
@@ -478,8 +511,10 @@ def child_command(args, stage, output, python):
         "--flm-dtype", args.flm_dtype,
         "--flm-atype", args.flm_atype,
         "--flm-device", args.flm_device,
+        "--flm-attention-backend", args.flm_attention_backend,
         "--label", args.label,
-    ]
+    ] + (["--flm-attention-backend-strict"]
+         if args.flm_attention_backend_strict else [])
 
 
 def production_trace(output):
@@ -593,6 +628,8 @@ def orchestrate(args):
         trace_count > 0 if args.target_trace_pattern else None)
     fastllm_result["target_backend_trace_count"] = trace_count
     fastllm_result["production_trace_boundaries_found"] = boundaries_found
+    fastllm_result["actual_attention_backends"] = (
+        actual_attention_backends(fastllm_log))
     sampling_top1_traces = parse_sampling_top1_traces(request_trace)
     fastllm_result["sampling_top1_trace_count"] = len(sampling_top1_traces)
     fastllm_result["sampling_top1_first"] = (

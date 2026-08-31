@@ -20,6 +20,8 @@ sys.path.insert(0, str(TEST_DIR))
 
 from common.performance_report import (  # noqa: E402
     ChartSpec, markdown_images, slugify, write_dashboard)
+from common.attention_backend_report import (  # noqa: E402
+    actual_attention_backends, attention_backend_confirmed)
 from xlsx_report import write_xlsx
 
 
@@ -38,6 +40,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
+    parser.add_argument("--flm-attention-backend", default="auto")
+    parser.add_argument("--flm-attention-backend-strict", action="store_true")
     parser.add_argument("--prefill-input-tokens", type=int, default=4096)
     parser.add_argument("--prefill-max-tokens", type=int, default=16)
     parser.add_argument("--decode-input-tokens", type=int, default=512)
@@ -440,7 +444,11 @@ def run_fastllm(args, prompts, result_dir, mode):
         "--port", str(args.port), "--dtype", args.flm_dtype,
         "--atype", args.flm_atype, "--device", args.flm_device,
         "--max-batch", str(max(decode_batch_cases(args))),
+        "--attention-backend", args.flm_attention_backend,
+        "--attention-backend-trace",
     ]
+    if args.flm_attention_backend_strict:
+        command.append("--attention-backend-strict")
     env = os.environ.copy()
     env.pop("FASTLLM_CUDA_NVFP4_TRACE", None)
     env.pop("FASTLLM_CUDA_GRAPH_TRACE", None)
@@ -457,9 +465,23 @@ def run_fastllm(args, prompts, result_dir, mode):
         env["FASTLLM_CUDA_W8A8"] = "1"
         env["FASTLLM_CUDA_W8A8_STRICT"] = "1"
     env["FASTLLM_CUDA_GRAPH"] = "0" if mode == "eager" else "1"
-    return run_server(
-        command, env, result_dir / f"fastllm-{mode}-server.log", "FastLLM",
-        base_url, prompts, args, mode)
+    server_log = result_dir / f"fastllm-{mode}-server.log"
+    rows = run_server(
+        command, env, server_log, "FastLLM", base_url, prompts, args, mode)
+    actual_backends = actual_attention_backends(
+        server_log.read_text(encoding="utf-8", errors="replace"))
+    confirmed = attention_backend_confirmed(
+        args.flm_attention_backend, actual_backends)
+    if args.flm_attention_backend_strict and not confirmed:
+        raise RuntimeError(
+            "FastLLM请求的Attention Backend未在服务日志中确认："
+            f"requested={args.flm_attention_backend}, "
+            f"actual={actual_backends}")
+    for row in rows:
+        row["requested_attention_backend"] = args.flm_attention_backend
+        row["actual_attention_backends"] = actual_backends
+        row["attention_backend_confirmed"] = confirmed
+    return rows
 
 
 def run_vllm(args, prompts, result_dir, mode):
@@ -537,15 +559,18 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                 fastllm_results, vllm_results, mode, scenario)
             lines.extend([
                 f"## {mode.upper()} / {scenario}", "",
-                "| 状态 | Workload | 后端 | Batch | Prompt/请求 | Prompt总数 | "
+                "| 状态 | Workload | 后端 | Attention Backend | Batch | Prompt/请求 | Prompt总数 | "
                 "Output总数 | Cache命中 | TTFT(ms) | TPOT(ms) | ITL(ms) | E2EL(ms) | "
                 "Prefill(tok/s) | Output(tok/s) | Wall(s) |",
-                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
                 "---: | ---: | ---: | ---: | ---: |",
             ])
             for item in rows:
+                attention_backends = item.get("actual_attention_backends", [])
+                attention_label = ",".join(attention_backends) or "n/a"
                 lines.append(
-                    f"| PASS | {item['workload']} | {item['backend']} | {item['batch']} | "
+                    f"| PASS | {item['workload']} | {item['backend']} | "
+                    f"{attention_label} | {item['batch']} | "
                     f"{item['prompt_tokens_per_request']} | "
                     f"{item['total_prompt_tokens']} | {item['total_output_tokens']} | "
                     f"{fmt_percent(item['cache_hit_ratio'])} | "
@@ -559,6 +584,12 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                     "scenario": scenario,
                     "workload": item["workload"],
                     "backend": item["backend"],
+                    "requested_attention_backend": item.get(
+                        "requested_attention_backend", "n/a"),
+                    "actual_attention_backends": json.dumps(
+                        attention_backends, ensure_ascii=False),
+                    "attention_backend_confirmed": item.get(
+                        "attention_backend_confirmed", "n/a"),
                     "batch": item["batch"],
                     "prompt_tokens_per_request": item["prompt_tokens_per_request"],
                     "total_prompt_tokens": item["total_prompt_tokens"],
