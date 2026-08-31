@@ -4660,7 +4660,7 @@ namespace {
             }
             weight.ToDevice(fastllm::DataDevice::CUDA);
             if (params.GetInt("has_bias")) {
-                bias = MakeRampTensor({out}, -0.1f);
+                bias.CopyFrom(MakeRampTensor({out}, -0.1f));
                 bias.ToDevice(fastllm::DataDevice::CUDA);
             }
             output.dataType = input.dataType; output.UpdateUnitSize();
