@@ -827,12 +827,17 @@ def summarize_report(args, report, output_base):
 def profile_backend(args, backend, batches, prompts, result_dir):
     backend_dir = result_dir / backend
     backend_dir.mkdir(parents=True, exist_ok=True)
-    server = launch_profiled_server(args, backend, max(batches), backend_dir)
+    server = None
     rows = []
     try:
         for batch in batches:
             case_dir = backend_dir / f"batch-{batch}"
             case_dir.mkdir(parents=True, exist_ok=True)
+            # 每个Batch使用独立服务进程，避免其他Batch保存的Prefix Cache
+            # 占用GPU内存或改变当前case的缓存淘汰状态。服务启动、模型加载
+            # 和关闭均位于Nsight采集区间之外。
+            server = launch_profiled_server(
+                args, backend, batch, case_dir)
             prompt = prompts[batch]
             cache_warmup_prompt = make_cache_warmup_prompt(
                 prompt, args.prefix_cache_padding_tokens)
@@ -963,9 +968,13 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                 "kernel_total_ms": summary["kernel_total_ms"],
                 "kernel_instances": summary["kernel_instances"],
             }, ensure_ascii=False), flush=True)
+            shutdown_session(args, server["session"], server["launcher"])
+            server["log_handle"].close()
+            server = None
     finally:
-        shutdown_session(args, server["session"], server["launcher"])
-        server["log_handle"].close()
+        if server is not None:
+            shutdown_session(args, server["session"], server["launcher"])
+            server["log_handle"].close()
     return rows
 
 
