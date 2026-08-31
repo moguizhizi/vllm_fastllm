@@ -743,6 +743,15 @@ namespace fastllm {
             cpuLogitsData, (int)cudaTokens.size(), channels, cudaTokens);
     }
 
+    void TraceSamplingTop1IfEnabled(
+            Data &logits, const std::vector<int> &sampledIds) {
+        if (!ShouldTraceSamplingTop1()) {
+            return;
+        }
+
+        TraceSamplingTop1(logits, sampledIds);
+    }
+
     static const std::string &LogitsDumpPath() {
         return GetLogitsDebugOptions().dumpPath;
     }
@@ -937,8 +946,6 @@ namespace fastllm {
             }
         }
 
-        if (ShouldTraceSamplingTop1()) {
-            TraceSamplingTop1(logits, lastRet);
-        }
+        TraceSamplingTop1IfEnabled(logits, lastRet);
     }
 }

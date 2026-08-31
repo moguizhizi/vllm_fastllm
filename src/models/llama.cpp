@@ -411,6 +411,8 @@ namespace fastllm {
                     lastRet.push_back(LLMSampling(logits, base, generationConfig, lastTokens.units[b]));
                 }
             }
+
+            TraceSamplingTop1IfEnabled(logits, lastRet);
         }
         if (sinDataPtr != &sinData)
             delete sinDataPtr;
@@ -880,6 +882,9 @@ namespace fastllm {
                 }
             }
         }
+
+        TraceSamplingTop1IfEnabled(logits, lastRet);
+
         if (sinDataPtr != &sinData)
             delete sinDataPtr;
         if (cosDataPtr != &cosData)
