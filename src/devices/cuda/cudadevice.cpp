@@ -78,6 +78,23 @@ namespace fastllm {
         return CudaEnvFlagEnabled(name);
     }
 
+    /**
+     * 对MoE门控中间张量执行GEGLU或SwiGLU激活。
+     *
+     * 本声明供文件前部的SM90 Block128 MoE路径调用；具体实现仍位于通用
+     * MergeMOE辅助函数区域。输入输出的形状准备和CUDA计算均由正式算子
+     * 完成，本函数不负责选择MoE后端或处理失败回退。
+     *
+     * @param input           门控线性层输出张量。
+     * @param output          激活结果张量。
+     * @param gateType        GEGLU或SwiGLU门控类型。
+     * @param isCrossSwiglu   true表示使用交叉SwiGLU布局。
+     * @return 无返回值。
+     */
+    static inline void ApplyCudaMoeGate(
+        Data &input, Data &output, MoeGateType gateType,
+        bool isCrossSwiglu = false);
+
     static void TraceCudaLinearFp8Path(const char *path, int n, int m, int k) {
         if (!CudaEnvFlagEnabled("FASTLLM_CUDA_LINEAR_FP8_TRACE")) {
             return;
@@ -7339,7 +7356,9 @@ namespace fastllm {
         FastllmCudaAddHostToDevice(output.cudaData, output.cpuData, len, output.dataType);
     }
 
-    static inline void ApplyCudaMoeGate(Data &input, Data &output, MoeGateType gateType, bool isCrossSwiglu = false) {
+    static inline void ApplyCudaMoeGate(
+        Data &input, Data &output, MoeGateType gateType,
+        bool isCrossSwiglu) {
         if (gateType == MoeGateGeglu) {
             DoCudaGegluReshape(input, output);
             DoCudaGeglu(input, output);
