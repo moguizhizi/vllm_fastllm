@@ -289,6 +289,10 @@ namespace fastllm {
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 128;
+    static std::string attentionBackend = "auto";
+    static bool attentionBackendStrict = false;
+    static bool attentionBackendTrace = false;
+    static std::mutex attentionBackendConfigMutex;
     static float gpuMemRatio = 0.9f;
     static Data emptyData;
 
@@ -511,6 +515,44 @@ namespace fastllm {
 
     int GetPageLen() {
         return defaultPageLen;
+    }
+
+    /**
+     * 设置进程级Attention Backend选择。
+     *
+     * 配置应在模型加载前完成，正式推理期间不得修改。空字符串按auto处理，
+     * Backend名称由设备侧注册表解释。
+     *
+     * @param backend Backend名称或auto。
+     */
+    void SetAttentionBackend(const std::string &backend) {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        attentionBackend = backend.empty() ? "auto" : backend;
+    }
+
+    std::string GetAttentionBackend() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return attentionBackend;
+    }
+
+    void SetAttentionBackendStrict(bool strict) {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        attentionBackendStrict = strict;
+    }
+
+    bool GetAttentionBackendStrict() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return attentionBackendStrict;
+    }
+
+    void SetAttentionBackendTrace(bool trace) {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        attentionBackendTrace = trace;
+    }
+
+    bool GetAttentionBackendTrace() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return attentionBackendTrace;
     }
 
     void SetGpuMemRatio(float ratio) {

@@ -6,6 +6,10 @@
 #include "devices/cuda/cudadevice.h"
 
 #include "fastllm-cuda.cuh"
+#ifndef USE_ROCM
+#include "devices/cuda/attention/fastllm-attention-backend.h"
+#include "devices/cuda/attention/fastllm-paged-attention-native.cuh"
+#endif
 
 #include "utils.h"
 #include "json11.hpp"
@@ -4674,6 +4678,7 @@ namespace fastllm {
         FastllmCudaRMSNormPart(input, weight, output, eps, start, end);
     }
 
+#ifndef USE_ROCM
     namespace {
         bool CudaKimiK3HasType(const DataDict &datas, const char *name,
                                DataType type) {
@@ -9787,9 +9792,169 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, (void*)posDataHost.data(), batch * sizeof(int32_t));
     }
 
-    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1) {
-        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph, windowLeft);
+    namespace {
+        /**
+         * 检查FastLLM原生分页Attention是否兼容当前调用。
+         *
+         * @param invocation 分页KV Cache调用参数。
+         * @return 支持状态及拒绝原因；原生路径不接受滑窗语义。
+         */
+        CudaAttentionSupportResult SupportsNativePagedAttention(
+            const CudaAttentionInvocation &invocation) {
+            if (invocation.cacheLayout != CudaAttentionCacheLayout::PAGED) {
+                return {false, "requires paged KV cache"};
+            }
+            if (invocation.q == nullptr || invocation.kCaches == nullptr ||
+                invocation.vCaches == nullptr || invocation.qSizes == nullptr ||
+                invocation.pageSizes == nullptr || invocation.pageIndexs == nullptr ||
+                invocation.lastPageLens == nullptr || invocation.output == nullptr ||
+                invocation.batch <= 0) {
+                return {false, "missing paged attention tensors or metadata"};
+            }
+            if (invocation.dataType != DataType::FLOAT16 &&
+                invocation.dataType != DataType::BFLOAT16) {
+                return {false, "requires float16 or bfloat16"};
+            }
+            if (invocation.windowLeft >= 0) {
+                return {false, "sliding-window attention requires FlashInfer"};
+            }
+            return {true, "supported"};
+        }
+
+        /**
+         * 检查FlashInfer分页Attention是否兼容当前调用和GPU。
+         *
+         * @param invocation 分页KV Cache调用参数。
+         * @return 支持状态及拒绝原因。
+         */
+        CudaAttentionSupportResult SupportsFlashInferPagedAttention(
+            const CudaAttentionInvocation &invocation) {
+            if (invocation.cacheLayout != CudaAttentionCacheLayout::PAGED) {
+                return {false, "requires paged KV cache"};
+            }
+            if (invocation.q == nullptr || invocation.kCaches == nullptr ||
+                invocation.vCaches == nullptr || invocation.qSizes == nullptr ||
+                invocation.pageSizes == nullptr || invocation.pageIndexs == nullptr ||
+                invocation.lastPageLens == nullptr || invocation.output == nullptr ||
+                invocation.batch <= 0) {
+                return {false, "missing paged attention tensors or metadata"};
+            }
+            if (invocation.dataType != DataType::FLOAT16 &&
+                invocation.dataType != DataType::BFLOAT16) {
+                return {false, "requires float16 or bfloat16"};
+            }
+            if (!FastllmCudaFlashInferSupported()) {
+                return {false, "FlashInfer is unavailable on the current GPU"};
+            }
+            return {true, "supported"};
+        }
+
+        /**
+         * 调用FastLLM原生分页Attention并保持历史同步边界。
+         *
+         * @param invocation 完整分页Attention参数。
+         * @return true表示Kernel提交及可选同步成功。
+         */
+        bool RunNativePagedAttention(CudaAttentionInvocation &invocation) {
+            bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                *invocation.q, *invocation.kCaches, *invocation.vCaches,
+                *invocation.qSizes, *invocation.pageSizes,
+                *invocation.pageIndexs, *invocation.lastPageLens,
+                *invocation.output, invocation.group, invocation.scale);
+            if (invocation.sync) {
+                DeviceSync();
+            }
+            return ok;
+        }
+
+        /**
+         * 调用正式FlashInfer分页入口。
+         *
+         * @param invocation 完整分页Attention参数和CUDA Graph状态。
+         * @return true表示FlashInfer正式入口执行成功。
+         */
+        bool RunFlashInferPagedAttention(CudaAttentionInvocation &invocation) {
+            return FastllmCudaHalfPagedAttentionBatch(
+                *invocation.q, *invocation.kCaches, *invocation.vCaches,
+                *invocation.qSizes, *invocation.pageSizes,
+                *invocation.pageIndexs, *invocation.lastPageLens,
+                *invocation.output, invocation.group, invocation.scale,
+                invocation.attentionType, invocation.inited, invocation.sync,
+                invocation.enableCudaGraph, invocation.flashInferCudaGraph,
+                invocation.windowLeft);
+        }
     }
+
+    /** 注册原生与FlashInfer两个分页KV Cache Backend。 */
+    void RegisterCudaPagedAttentionBackends() {
+        static const bool nativeRegistered = RegisterCudaAttentionBackend({
+            "native_paged", 50,
+            SupportsNativePagedAttention,
+            RunNativePagedAttention,
+        });
+        static const bool flashInferRegistered = RegisterCudaAttentionBackend({
+            "flashinfer_paged", 100,
+            SupportsFlashInferPagedAttention,
+            RunFlashInferPagedAttention,
+        });
+        AssertInFastLLM(nativeRegistered && flashInferRegistered,
+                        "Failed to register paged attention backends.\n");
+    }
+
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches,
+                                   Data &qSizes, Data &pageSizes,
+                                   Data &pageIndexs, Data &lastPageLens,
+                                   Data &output, int group, float scale,
+                                   int attentionType, bool inited,
+                                   bool sync, bool enableCudaGraph,
+                                   int flashInferCudaGraph, int windowLeft) {
+        CudaAttentionInvocation invocation;
+        invocation.cacheLayout = CudaAttentionCacheLayout::PAGED;
+        const int batch = qSizes.dims.empty() ? 0 : qSizes.dims[0] - 1;
+        invocation.phase = q.dims.size() >= 2 && q.dims[1] == batch
+            ? CudaAttentionPhase::DECODE : CudaAttentionPhase::PREFILL;
+        invocation.dataType = q.dataType;
+        cudaGetDevice(&invocation.deviceId);
+        invocation.batch = batch;
+        invocation.group = group;
+        invocation.headDim = q.dims.size() >= 3 ? q.dims[2] : 0;
+        invocation.scale = scale;
+        invocation.attentionType = attentionType;
+        invocation.inited = inited;
+        invocation.sync = sync;
+        invocation.enableCudaGraph = enableCudaGraph;
+        invocation.flashInferCudaGraph = flashInferCudaGraph;
+        invocation.windowLeft = windowLeft;
+        invocation.q = &q;
+        invocation.kCaches = &kCaches;
+        invocation.vCaches = &vCaches;
+        invocation.qSizes = &qSizes;
+        invocation.pageSizes = &pageSizes;
+        invocation.pageIndexs = &pageIndexs;
+        invocation.lastPageLens = &lastPageLens;
+        invocation.output = &output;
+
+        std::string actualBackend;
+        std::string lastError;
+        if (!RunCudaAttentionBackend(invocation, actualBackend, lastError)) {
+            ErrorInFastLLM("AttentionPagedBatch backend selection failed: " +
+                           lastError + "\n");
+        }
+    }
+#else
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches,
+                                   Data &qSizes, Data &pageSizes,
+                                   Data &pageIndexs, Data &lastPageLens,
+                                   Data &output, int group, float scale,
+                                   int attentionType, bool inited,
+                                   bool sync, bool enableCudaGraph,
+                                   int flashInferCudaGraph, int windowLeft) {
+        FastllmCudaHalfPagedAttentionBatch(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType, inited, sync,
+            enableCudaGraph, flashInferCudaGraph, windowLeft);
+    }
+#endif
 
     void CudaAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {

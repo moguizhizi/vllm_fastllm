@@ -105,6 +105,18 @@ namespace fastllm {
     int GetMaxTokens();
     void SetPageLen(int pageLen);
     int GetPageLen();
+    /** 设置进程级Attention Backend名称；应在模型加载前调用。 */
+    void SetAttentionBackend(const std::string &backend);
+    /** 返回当前进程请求的Attention Backend名称。 */
+    std::string GetAttentionBackend();
+    /** 设置显式Backend不兼容时是否禁止回退到auto。 */
+    void SetAttentionBackendStrict(bool strict);
+    /** 返回Attention Backend严格选择开关。 */
+    bool GetAttentionBackendStrict();
+    /** 设置是否记录每种静态调用签名的首次Backend选择。 */
+    void SetAttentionBackendTrace(bool trace);
+    /** 返回Attention Backend路径记录开关。 */
+    bool GetAttentionBackendTrace();
     void SetGpuMemRatio(float ratio);
     float GetGpuMemRatio();
     AliveThreadPool *GetAlivePool();

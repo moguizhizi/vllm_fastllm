@@ -480,6 +480,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--attention-backend', type = str, default = "auto",
+                        help = 'Attention实现，可使用auto、legacy_contiguous、native_paged或flashinfer_paged')
+    parser.add_argument('--attention-backend-strict', action = 'store_true',
+                        help = '指定Attention Backend不兼容时直接失败，禁止fallback')
+    parser.add_argument('--attention-backend-trace', action = 'store_true',
+                        help = '输出每种Attention静态调用签名首次选择的Backend')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
@@ -1005,6 +1011,9 @@ def make_normal_llm_model(args, startup_progress = None):
     apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
+    llm.set_attention_backend(args.attention_backend)
+    llm.set_attention_backend_strict(args.attention_backend_strict)
+    llm.set_attention_backend_trace(args.attention_backend_trace)
     apply_prefix_cache_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)

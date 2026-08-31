@@ -409,6 +409,9 @@ fastllm_lib.set_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_c
 fastllm_lib.set_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
+fastllm_lib.set_attention_backend.argtypes = [ctypes.c_char_p]
+fastllm_lib.set_attention_backend_strict.argtypes = [ctypes.c_bool]
+fastllm_lib.set_attention_backend_trace.argtypes = [ctypes.c_bool]
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -573,6 +576,15 @@ def set_max_tokens(max_tokens):
 
 def set_page_size(page_size):
     fastllm_lib.set_page_size(ctypes.c_int(page_size));
+
+def set_attention_backend(backend: str):
+    fastllm_lib.set_attention_backend(str(backend or "auto").encode("utf-8"))
+
+def set_attention_backend_strict(strict: bool):
+    fastllm_lib.set_attention_backend_strict(ctypes.c_bool(strict))
+
+def set_attention_backend_trace(trace: bool):
+    fastllm_lib.set_attention_backend_trace(ctypes.c_bool(trace))
 
 def set_gpu_mem_ratio(ratio):
     fastllm_lib.set_gpu_mem_ratio(ctypes.c_float(ratio));
