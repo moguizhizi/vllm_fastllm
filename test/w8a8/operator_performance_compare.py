@@ -261,6 +261,8 @@ def run_vllm(args):
                     n, device="cuda", dtype=torch.int32).view(1, n)
                 weight = ((n_indices * 17 + k_indices * 13) % 255 - 127).to(
                     torch.int8)
+                # vLLM CUTLASS接收逻辑[K,N]、物理Column-Major的B矩阵。
+                weight = weight.t().contiguous().t()
                 weight_scale = (
                     0.0025 + 0.00001 * (n_indices % 31)).to(torch.float32)
                 del indices, k_indices, n_indices
