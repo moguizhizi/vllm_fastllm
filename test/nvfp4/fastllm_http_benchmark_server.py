@@ -19,6 +19,8 @@ def parse_args():
     parser.add_argument("--atype", default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-batch", type=int, required=True)
+    parser.add_argument("--kv-cache-layout", default="auto",
+                        choices=("auto", "continuous", "paged"))
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument("--attention-backend-strict", action="store_true")
     parser.add_argument("--attention-backend-trace", action="store_true")
@@ -196,6 +198,7 @@ def main():
 
     llm.set_device_map(args.device)
     llm.set_device_map(args.device, True)
+    llm.set_kv_cache_layout(args.kv_cache_layout)
     llm.set_attention_backend(args.attention_backend)
     llm.set_attention_backend_strict(args.attention_backend_strict)
     llm.set_attention_backend_trace(args.attention_backend_trace)

@@ -21,7 +21,8 @@ sys.path.insert(0, str(TEST_DIR))
 from common.performance_report import (  # noqa: E402
     ChartSpec, markdown_images, slugify, write_dashboard)
 from common.attention_backend_report import (  # noqa: E402
-    actual_attention_backends, attention_backend_confirmed)
+    actual_attention_backends, actual_kv_cache_layouts,
+    attention_backend_confirmed, kv_cache_layout_confirmed)
 from xlsx_report import write_xlsx
 
 
@@ -40,6 +41,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
+    parser.add_argument("--flm-kv-cache-layout", default="auto",
+                        choices=("auto", "continuous", "paged"))
     parser.add_argument("--flm-attention-backend", default="auto")
     parser.add_argument("--flm-attention-backend-strict", action="store_true")
     parser.add_argument("--prefill-input-tokens", type=int, default=4096)
@@ -444,6 +447,7 @@ def run_fastllm(args, prompts, result_dir, mode):
         "--port", str(args.port), "--dtype", args.flm_dtype,
         "--atype", args.flm_atype, "--device", args.flm_device,
         "--max-batch", str(max(decode_batch_cases(args))),
+        "--kv-cache-layout", args.flm_kv_cache_layout,
         "--attention-backend", args.flm_attention_backend,
         "--attention-backend-trace",
     ]
@@ -468,19 +472,29 @@ def run_fastllm(args, prompts, result_dir, mode):
     server_log = result_dir / f"fastllm-{mode}-server.log"
     rows = run_server(
         command, env, server_log, "FastLLM", base_url, prompts, args, mode)
-    actual_backends = actual_attention_backends(
-        server_log.read_text(encoding="utf-8", errors="replace"))
+    server_output = server_log.read_text(encoding="utf-8", errors="replace")
+    actual_backends = actual_attention_backends(server_output)
+    actual_layouts = actual_kv_cache_layouts(server_output)
     confirmed = attention_backend_confirmed(
         args.flm_attention_backend, actual_backends)
+    layout_confirmed = kv_cache_layout_confirmed(
+        args.flm_kv_cache_layout, actual_layouts)
     if args.flm_attention_backend_strict and not confirmed:
         raise RuntimeError(
             "FastLLM请求的Attention Backend未在服务日志中确认："
             f"requested={args.flm_attention_backend}, "
             f"actual={actual_backends}")
+    if not layout_confirmed:
+        raise RuntimeError(
+            "FastLLM请求的KV Cache布局未在服务日志中确认："
+            f"requested={args.flm_kv_cache_layout}, actual={actual_layouts}")
     for row in rows:
         row["requested_attention_backend"] = args.flm_attention_backend
         row["actual_attention_backends"] = actual_backends
         row["attention_backend_confirmed"] = confirmed
+        row["requested_kv_cache_layout"] = args.flm_kv_cache_layout
+        row["actual_kv_cache_layouts"] = actual_layouts
+        row["kv_cache_layout_confirmed"] = layout_confirmed
     return rows
 
 
@@ -559,18 +573,20 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                 fastllm_results, vllm_results, mode, scenario)
             lines.extend([
                 f"## {mode.upper()} / {scenario}", "",
-                "| 状态 | Workload | 后端 | Attention Backend | Batch | Prompt/请求 | Prompt总数 | "
+                "| 状态 | Workload | 后端 | KV Cache布局 | Attention Backend | Batch | Prompt/请求 | Prompt总数 | "
                 "Output总数 | Cache命中 | TTFT(ms) | TPOT(ms) | ITL(ms) | E2EL(ms) | "
                 "Prefill(tok/s) | Output(tok/s) | Wall(s) |",
-                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-                "---: | ---: | ---: | ---: | ---: |",
+                "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | "
+                "---: | ---: | ---: | ---: | ---: | ---: |",
             ])
             for item in rows:
                 attention_backends = item.get("actual_attention_backends", [])
                 attention_label = ",".join(attention_backends) or "n/a"
+                kv_layouts = item.get("actual_kv_cache_layouts", [])
+                kv_layout_label = ",".join(kv_layouts) or "n/a"
                 lines.append(
                     f"| PASS | {item['workload']} | {item['backend']} | "
-                    f"{attention_label} | {item['batch']} | "
+                    f"{kv_layout_label} | {attention_label} | {item['batch']} | "
                     f"{item['prompt_tokens_per_request']} | "
                     f"{item['total_prompt_tokens']} | {item['total_output_tokens']} | "
                     f"{fmt_percent(item['cache_hit_ratio'])} | "
@@ -590,6 +606,12 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                         attention_backends, ensure_ascii=False),
                     "attention_backend_confirmed": item.get(
                         "attention_backend_confirmed", "n/a"),
+                    "requested_kv_cache_layout": item.get(
+                        "requested_kv_cache_layout", "n/a"),
+                    "actual_kv_cache_layouts": json.dumps(
+                        kv_layouts, ensure_ascii=False),
+                    "kv_cache_layout_confirmed": item.get(
+                        "kv_cache_layout_confirmed", "n/a"),
                     "batch": item["batch"],
                     "prompt_tokens_per_request": item["prompt_tokens_per_request"],
                     "total_prompt_tokens": item["total_prompt_tokens"],

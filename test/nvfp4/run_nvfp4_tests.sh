@@ -10,8 +10,12 @@ cuda_arch=${NVFP4_CUDA_ARCH:-auto}
 optest=${NVFP4_OPTEST:-"${repo_dir}/optest"}
 nvcc_path=${NVFP4_NVCC:-$(command -v nvcc || true)}
 attention_backend=${NVFP4_ATTENTION_BACKEND:-auto}
+kv_cache_layout=${NVFP4_KV_CACHE_LAYOUT:-auto}
 mkdir -p "${log_dir}"
-attention_backend_args=(--flm-attention-backend "${attention_backend}")
+attention_backend_args=(
+    --flm-kv-cache-layout "${kv_cache_layout}"
+    --flm-attention-backend "${attention_backend}"
+)
 if [[ "${NVFP4_ATTENTION_BACKEND_STRICT:-0}" == 1 ]]; then
     attention_backend_args+=(--flm-attention-backend-strict)
 fi

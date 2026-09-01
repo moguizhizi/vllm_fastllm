@@ -23,7 +23,8 @@ import model_performance_compare as model_compare  # noqa: E402
 from common.performance_report import (  # noqa: E402
     ChartSpec, markdown_images, write_dashboard)
 from common.attention_backend_report import (  # noqa: E402
-    actual_attention_backends, attention_backend_confirmed)
+    actual_attention_backends, actual_kv_cache_layouts,
+    attention_backend_confirmed, kv_cache_layout_confirmed)
 from xlsx_report import write_xlsx  # noqa: E402
 
 
@@ -78,6 +79,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
+    parser.add_argument("--flm-kv-cache-layout", default="auto",
+                        choices=("auto", "continuous", "paged"))
     parser.add_argument("--flm-attention-backend", default="auto")
     parser.add_argument("--flm-attention-backend-strict", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -172,6 +175,7 @@ def server_spec(args, backend, max_batch):
             "--port", str(args.port), "--dtype", args.flm_dtype,
             "--atype", args.flm_atype, "--device", args.flm_device,
             "--max-batch", str(max_batch), "--enable-prefix-cache",
+            "--kv-cache-layout", args.flm_kv_cache_layout,
             "--attention-backend", args.flm_attention_backend,
             "--attention-backend-trace",
         ]
@@ -213,6 +217,12 @@ def server_spec(args, backend, max_batch):
 def read_attention_backend_selection(log_path):
     """从FastLLM服务日志读取框架实际选择的Attention后端。"""
     return actual_attention_backends(
+        log_path.read_text(encoding="utf-8", errors="replace"))
+
+
+def read_kv_cache_layout_selection(log_path):
+    """从FastLLM服务日志读取模型实际使用的KV Cache布局。"""
+    return actual_kv_cache_layouts(
         log_path.read_text(encoding="utf-8", errors="replace"))
 
 
@@ -1090,21 +1100,33 @@ def profile_backend(args, backend, batches, prompts, result_dir):
                 "nsys": summary,
             }
             if backend == "fastllm":
-                actual_attention_backends = read_attention_backend_selection(
+                selected_attention_backends = read_attention_backend_selection(
                     server["log_path"])
                 backend_confirmed = attention_backend_confirmed(
-                    args.flm_attention_backend, actual_attention_backends)
+                    args.flm_attention_backend, selected_attention_backends)
                 if (args.flm_attention_backend_strict and
                         not backend_confirmed):
                     raise RuntimeError(
                         "FastLLM请求的Attention Backend未在Nsight服务日志中确认："
                         f"requested={args.flm_attention_backend}, "
-                        f"actual={actual_attention_backends}")
+                        f"actual={selected_attention_backends}")
+                selected_kv_layouts = read_kv_cache_layout_selection(
+                    server["log_path"])
+                layout_confirmed = kv_cache_layout_confirmed(
+                    args.flm_kv_cache_layout, selected_kv_layouts)
+                if not layout_confirmed:
+                    raise RuntimeError(
+                        "FastLLM请求的KV Cache布局未在Nsight服务日志中确认："
+                        f"requested={args.flm_kv_cache_layout}, "
+                        f"actual={selected_kv_layouts}")
                 row["requested_attention_backend"] = (
                     args.flm_attention_backend)
-                row["actual_attention_backends"] = actual_attention_backends
+                row["actual_attention_backends"] = selected_attention_backends
                 row["attention_backend_confirmed"] = (
                     backend_confirmed)
+                row["requested_kv_cache_layout"] = args.flm_kv_cache_layout
+                row["actual_kv_cache_layouts"] = selected_kv_layouts
+                row["kv_cache_layout_confirmed"] = layout_confirmed
             cpu_trace = summary["cpu_trace"]
             if cpu_trace is not None:
                 cpu_trace["launch_api_sum_ms_per_decode_step"] = (
@@ -1165,7 +1187,8 @@ def make_excel_report(result_dir, rows, top_count, chart_paths,
     ]))
 
     engine_headers = [
-        "状态", "Batch", "后端", "请求Attention后端", "实际Attention后端",
+        "状态", "Batch", "后端", "请求KV Cache布局", "实际KV Cache布局",
+        "KV Cache布局确认", "请求Attention后端", "实际Attention后端",
         "Attention后端确认", "平均TPOT(ms)", "请求TPOT P50(ms)",
         "请求TPOT P95(ms)", "ITL(ms)", "请求E2EL P50(ms)",
         "请求E2EL P95(ms)", "Batch Wall(ms)", "Output(tok/s)",
@@ -1175,6 +1198,9 @@ def make_excel_report(result_dir, rows, top_count, chart_paths,
     for row in rows:
         engine_rows.append([
             row["result"], row["batch"], row["backend"],
+            row.get("requested_kv_cache_layout", "n/a"),
+            ",".join(row.get("actual_kv_cache_layouts", [])) or "n/a",
+            row.get("kv_cache_layout_confirmed", "n/a"),
             row.get("requested_attention_backend", "n/a"),
             ",".join(row.get("actual_attention_backends", [])) or "n/a",
             row.get("attention_backend_confirmed", "n/a"), row["tpot_ms"],
@@ -1457,12 +1483,13 @@ def make_report(result_dir, rows, top_count):
         "> `.nsys-rep`、SQLite和导出CSV默认在每个Batch汇总后删除；",
         "> 只有指定`--keep-nsys-reports`才会保留。", "",
         "## 引擎指标", "",
-        "| 状态 | Batch | 后端 | 请求Attention后端 | 实际Attention后端 | 后端确认 | "
+        "| 状态 | Batch | 后端 | 请求KV Cache布局 | 实际KV Cache布局 | 布局确认 | "
+        "请求Attention后端 | 实际Attention后端 | 后端确认 | "
         "平均TPOT(ms) | 请求TPOT P50(ms) | 请求TPOT P95(ms) | "
         "ITL(ms) | 请求E2EL P50(ms) | 请求E2EL P95(ms) | Batch Wall(ms) | "
         "Output(tok/s) | Cache命中 |",
-        "| --- | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | "
-        "---: | --- |",
+        "| --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "---: | ---: | --- |",
     ]
     for row in rows:
         cache = row["cache_hit_ratio"]
@@ -1470,6 +1497,9 @@ def make_report(result_dir, rows, top_count):
                       f"{cache * 100:.1f}%")
         lines.append(
             f"| {row['result']} | {row['batch']} | {row['backend']} | "
+            f"{row.get('requested_kv_cache_layout', 'n/a')} | "
+            f"{','.join(row.get('actual_kv_cache_layouts', [])) or 'n/a'} | "
+            f"{row.get('kv_cache_layout_confirmed', 'n/a')} | "
             f"{row.get('requested_attention_backend', 'n/a')} | "
             f"{','.join(row.get('actual_attention_backends', [])) or 'n/a'} | "
             f"{row.get('attention_backend_confirmed', 'n/a')} | "

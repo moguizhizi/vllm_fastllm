@@ -8,10 +8,14 @@ model=${W8A8_MODEL:-}
 vllm_python=${W8A8_VLLM_PYTHON:-python}
 nvcc=${W8A8_NVCC:-/usr/local/cuda/bin/nvcc}
 attention_backend=${W8A8_ATTENTION_BACKEND:-auto}
+kv_cache_layout=${W8A8_KV_CACHE_LAYOUT:-auto}
 suite=${1:-ops}
 mkdir -p "${log_dir}"
 functional_summary_pending=0
-attention_backend_args=(--flm-attention-backend "${attention_backend}")
+attention_backend_args=(
+    --flm-kv-cache-layout "${kv_cache_layout}"
+    --flm-attention-backend "${attention_backend}"
+)
 if [[ "${W8A8_ATTENTION_BACKEND_STRICT:-0}" == 1 ]]; then
     attention_backend_args+=(--flm-attention-backend-strict)
 fi
@@ -613,6 +617,35 @@ run_forward() {
         --result-dir "${log_dir}/forward-results"
 }
 
+run_attention_layout_forward() {
+    require_model
+    local layout backend strict_args=()
+    for layout_backend in \
+        "continuous:auto" \
+        "paged:native_paged" \
+        "paged:flashinfer_paged"; do
+        layout=${layout_backend%%:*}
+        backend=${layout_backend#*:}
+        strict_args=()
+        if [[ "${backend}" != auto ]]; then
+            strict_args+=(--flm-attention-backend-strict)
+        fi
+        run_logged "forward_${layout}_${backend}" \
+            env FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+            FASTLLM_CUDA_W8A8_TRACE=1 FASTLLM_SAMPLING_TOP1_TRACE=1 \
+            W8A8_VLLM_PYTHON="${vllm_python}" \
+            "${vllm_python}" test/w8a8/forward_check_vllm.py \
+            --model "${model}" --tokens 8 --top-logprobs 10 \
+            --vllm-python "${vllm_python}" \
+            --max-model-len 512 --gpu-memory-utilization 0.90 \
+            --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+            --flm-kv-cache-layout "${layout}" \
+            --flm-attention-backend "${backend}" \
+            "${strict_args[@]}" \
+            --result-dir "${log_dir}/forward-${layout}-${backend}"
+    done
+}
+
 run_model_performance() {
     require_model
     run_logged model_performance_compare env FASTLLM_CUDA_W8A8=1 \
@@ -650,10 +683,11 @@ case "${suite}" in
     ops-compare) run_ops_performance ;;
     ops) run_ops_functional; run_ops_performance ;;
     forward) run_forward ;;
+    forward-attention-layouts) run_attention_layout_forward ;;
     model-performance) run_model_performance ;;
     all) run_ops_functional; run_ops_performance; run_forward; run_model_performance ;;
     *)
-        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-symmetric-functional|ops-int8-symmetric-performance|ops-int8-symmetric|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-moe-functional|ops-moe-performance|ops-moe|ops-functional|ops-performance|ops-compare|ops|forward|model-performance|all}" >&2
+        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-symmetric-functional|ops-int8-symmetric-performance|ops-int8-symmetric|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-moe-functional|ops-moe-performance|ops-moe|ops-functional|ops-performance|ops-compare|ops|forward|forward-attention-layouts|model-performance|all}" >&2
         exit 2
         ;;
 esac

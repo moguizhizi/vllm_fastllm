@@ -61,6 +61,8 @@ def parse_args():
     parser.add_argument("--flm-dtype", default="auto")
     parser.add_argument("--flm-atype", default="bfloat16")
     parser.add_argument("--flm-device", default="cuda")
+    parser.add_argument("--flm-kv-cache-layout", default="auto",
+                        choices=("auto", "continuous", "paged"))
     parser.add_argument("--flm-attention-backend", default="auto")
     parser.add_argument("--flm-attention-backend-strict", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -763,6 +765,18 @@ def main():
             summary["requested_attention_backend"] = args.flm_attention_backend
             summary["actual_attention_backends"] = actual_backends
             summary["attention_backend_confirmed"] = confirmed
+            actual_layouts = decode_nsys.read_kv_cache_layout_selection(
+                profile_log)
+            layout_confirmed = decode_nsys.kv_cache_layout_confirmed(
+                args.flm_kv_cache_layout, actual_layouts)
+            if not layout_confirmed:
+                raise RuntimeError(
+                    "FastLLM请求的KV Cache布局未在NCU目标日志中确认："
+                    f"requested={args.flm_kv_cache_layout}, "
+                    f"actual={actual_layouts}")
+            summary["requested_kv_cache_layout"] = args.flm_kv_cache_layout
+            summary["actual_kv_cache_layouts"] = actual_layouts
+            summary["kv_cache_layout_confirmed"] = layout_confirmed
         summaries.append(summary)
 
     md_path, json_path, xlsx_path = make_reports(result_dir, summaries)
