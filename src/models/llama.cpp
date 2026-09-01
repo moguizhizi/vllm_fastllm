@@ -446,6 +446,8 @@ namespace fastllm {
         Data w1, w2, w3, curInput, curOutput;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
+        Data qSizes, pageSizes, pageIndexs, lastPageLens;
+        Data insertIndexs, insertPositions;
         std::vector <Data> curContextLayer;
         curContextLayer.resize(batch);
         std::vector <Data> curKs, curVs, curQs;
@@ -463,12 +465,25 @@ namespace fastllm {
         attns.resize(batch);
         masks.resize(batch);
         contexts.resize(batch);
+        std::vector <Data*> batchPastKeys(batch);
+        std::vector <Data*> batchPastValues(batch);
         Data allPositionIds;
 
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
         }
+        const bool isPrefill = !all1;
+        const std::string requestedKVCacheLayout = GetKVCacheLayout();
+        const bool usePagedKVCache = requestedKVCacheLayout == "paged";
+        AssertInFastLLM(!usePagedKVCache || alibiData.dims.empty(),
+                        "Llama paged KV cache doesn't support ALiBi attention.\n");
+        AssertInFastLLM(!usePagedKVCache || !GetKVCacheInCPU(),
+                        "Llama paged KV cache doesn't support CPU KV cache.\n");
+        bool generatedBatchDecodeParams = false;
+        bool generatedAppendPagedCacheBatchParams = false;
+        TraceKVCacheLayout("llama", usePagedKVCache ? "paged" : "continuous");
+
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
             std::vector <float> vPositionIds;            
             for (int b = 0; b < batch; b++) {
@@ -506,7 +521,44 @@ namespace fastllm {
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
 
-            if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
+            if (usePagedKVCache) {
+                const bool hasMergeQkv =
+                    weight.weight.find(mergeQkvWeightName) != weight.weight.end();
+                Data *mergeW = hasMergeQkv ? &weight[mergeQkvWeightName] : GetEmptyData();
+                Data *mergeB = hasMergeQkv ? &weight[mergeQkvBiasName] : GetEmptyData();
+                Data *qW = hasMergeQkv ? GetEmptyData() : &weight[qWeightName];
+                Data *kW = hasMergeQkv ? GetEmptyData() : &weight[kWeightName];
+                Data *vW = hasMergeQkv ? GetEmptyData() : &weight[vWeightName];
+                Data *qB = !hasMergeQkv && weight.weight.find(qBiasName) != weight.weight.end()
+                    ? &weight[qBiasName] : GetEmptyData();
+                Data *kB = !hasMergeQkv && weight.weight.find(kBiasName) != weight.weight.end()
+                    ? &weight[kBiasName] : GetEmptyData();
+                Data *vB = !hasMergeQkv && weight.weight.find(vBiasName) != weight.weight.end()
+                    ? &weight[vBiasName] : GetEmptyData();
+                Data *oB = weight.weight.find(oBiasName) != weight.weight.end()
+                    ? &weight[oBiasName] : GetEmptyData();
+
+                AttentionPagedBlock(
+                    &attenInput,
+                    mergeW, mergeB,
+                    qW, qB, kW, kB, vW, vB,
+                    GetEmptyData(), GetEmptyData(),
+                    GetEmptyData(), GetEmptyData(),
+                    &weight[oWeightName], oB,
+                    &allPositionIds,
+                    &pastKeyValues, &batchPastKeys, &batchPastValues,
+                    &qkv, &q, &attenOutput, &attenLastOutput,
+                    &insertIndexs, &insertPositions,
+                    &qSizes, &pageSizes, &pageIndexs, &lastPageLens,
+                    &generatedAppendPagedCacheBatchParams,
+                    &generatedBatchDecodeParams,
+                    batch, block_cnt, i, seqLens,
+                    num_attention_heads, num_key_value_heads, head_dim,
+                    rotary_dim, rms_norm_eps,
+                    rope_base, rope_factor, max_positions, rope_type,
+                    false, isPrefill, &hiddenStates,
+                    false, false);
+            } else if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
                 && CanRunMergeAttention()
                 && true) {
                 // MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);

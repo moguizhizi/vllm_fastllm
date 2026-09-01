@@ -289,6 +289,7 @@ namespace fastllm {
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 128;
+    static std::string kvCacheLayout = "auto";
     static std::string attentionBackend = "auto";
     static bool attentionBackendStrict = false;
     static bool attentionBackendTrace = false;
@@ -515,6 +516,54 @@ namespace fastllm {
 
     int GetPageLen() {
         return defaultPageLen;
+    }
+
+    /**
+     * 设置支持双KV布局模型使用的Cache布局。
+     *
+     * 该配置只决定模型构造连续Cache还是分页Cache，不决定分页Attention的
+     * 具体实现。auto保留各模型原有布局；显式布局不受Attention Backend
+     * fallback影响。配置应在模型加载前完成。
+     *
+     * @param layout auto、continuous或paged。
+     */
+    void SetKVCacheLayout(const std::string &layout) {
+        const std::string normalized = layout.empty() ? "auto" : layout;
+        AssertInFastLLM(normalized == "auto" || normalized == "continuous" ||
+                        normalized == "paged",
+                        "KV Cache layout should be auto, continuous or paged.\n");
+
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        kvCacheLayout = normalized;
+    }
+
+    std::string GetKVCacheLayout() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return kvCacheLayout;
+    }
+
+    /**
+     * 输出模型首次确定的KV Cache布局，供正式路径测试确认。
+     *
+     * 相同模型、请求布局和实际布局在进程内只记录一次，避免逐层、逐Token
+     * 打印影响性能。
+     *
+     * @param model 模型族名称。
+     * @param actual continuous或paged。
+     */
+    void TraceKVCacheLayout(const std::string &model, const std::string &actual) {
+        if (!GetAttentionBackendTrace()) {
+            return;
+        }
+
+        static std::mutex traceMutex;
+        static std::set<std::tuple<std::string, std::string, std::string>> traced;
+        const std::string requested = GetKVCacheLayout();
+        std::lock_guard<std::mutex> guard(traceMutex);
+        if (traced.emplace(model, requested, actual).second) {
+            printf("[fastllm][kv-cache] model=%s requested=%s actual=%s\n",
+                   model.c_str(), requested.c_str(), actual.c_str());
+        }
     }
 
     /**

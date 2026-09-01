@@ -480,6 +480,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--kv-cache-layout', choices = ('auto', 'continuous', 'paged'), default = 'auto',
+                        help = '支持双KV布局模型的Cache布局；auto保留模型默认布局')
     parser.add_argument('--attention-backend', type = str, default = "auto",
                         help = 'Attention实现，可使用auto、legacy_contiguous、native_paged或flashinfer_paged')
     parser.add_argument('--attention-backend-strict', action = 'store_true',
@@ -1011,6 +1013,7 @@ def make_normal_llm_model(args, startup_progress = None):
     apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
+    llm.set_kv_cache_layout(args.kv_cache_layout)
     llm.set_attention_backend(args.attention_backend)
     llm.set_attention_backend_strict(args.attention_backend_strict)
     llm.set_attention_backend_trace(args.attention_backend_trace)

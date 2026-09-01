@@ -9,6 +9,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include <map>
 #include <set>
 #include <queue>
@@ -105,6 +106,12 @@ namespace fastllm {
     int GetMaxTokens();
     void SetPageLen(int pageLen);
     int GetPageLen();
+    /** 设置支持双KV布局模型使用的Cache布局；应在模型加载前调用。 */
+    void SetKVCacheLayout(const std::string &layout);
+    /** 返回请求的KV Cache布局名称。 */
+    std::string GetKVCacheLayout();
+    /** 在Attention路径记录开启时输出模型实际使用的KV Cache布局。 */
+    void TraceKVCacheLayout(const std::string &model, const std::string &actual);
     /** 设置进程级Attention Backend名称；应在模型加载前调用。 */
     void SetAttentionBackend(const std::string &backend);
     /** 返回当前进程请求的Attention Backend名称。 */

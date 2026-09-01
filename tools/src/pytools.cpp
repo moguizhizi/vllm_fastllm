@@ -113,6 +113,11 @@ extern "C" {
         fastllm::SetPageLen(page_size);
     }
 
+    /** 设置支持双KV布局模型使用的Cache布局。 */
+    DLL_EXPORT void set_kv_cache_layout(const char *layout) {
+        fastllm::SetKVCacheLayout(layout == nullptr ? "auto" : layout);
+    }
+
     /** 设置进程级Attention Backend名称，空字符串等价于auto。 */
     DLL_EXPORT void set_attention_backend(const char *backend) {
         fastllm::SetAttentionBackend(backend == nullptr ? "auto" : backend);

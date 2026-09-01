@@ -409,6 +409,7 @@ fastllm_lib.set_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_c
 fastllm_lib.set_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
+fastllm_lib.set_kv_cache_layout.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_attention_backend.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_attention_backend_strict.argtypes = [ctypes.c_bool]
 fastllm_lib.set_attention_backend_trace.argtypes = [ctypes.c_bool]
@@ -576,6 +577,9 @@ def set_max_tokens(max_tokens):
 
 def set_page_size(page_size):
     fastllm_lib.set_page_size(ctypes.c_int(page_size));
+
+def set_kv_cache_layout(layout: str):
+    fastllm_lib.set_kv_cache_layout(str(layout or "auto").encode("utf-8"))
 
 def set_attention_backend(backend: str):
     fastllm_lib.set_attention_backend(str(backend or "auto").encode("utf-8"))
