@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cfloat>
 #include <climits>
+#include <cstdio>
 #include <thread>
 #include <algorithm>
 #include <queue>
@@ -563,6 +564,7 @@ namespace fastllm {
         if (traced.emplace(model, requested, actual).second) {
             printf("[fastllm][kv-cache] model=%s requested=%s actual=%s\n",
                    model.c_str(), requested.c_str(), actual.c_str());
+            fflush(stdout);
         }
     }
 

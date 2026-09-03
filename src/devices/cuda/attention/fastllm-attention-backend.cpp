@@ -88,6 +88,7 @@ namespace fastllm {
                    PhaseName(invocation.phase).c_str(),
                    GetDataTypeName(invocation.dataType).c_str(), invocation.batch,
                    invocation.headDim, invocation.group, reason.c_str());
+            fflush(stdout);
         }
     }
 
