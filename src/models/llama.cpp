@@ -441,7 +441,7 @@ namespace fastllm {
         Data hiddenStates;
         Data attenInput;
         Data q, k, v, qkv;
-        Data attenWeights, curAttenOutput;
+        Data attenWeights, attenOutput, curAttenOutput;
         Data attenLastOutput;
         Data w1, w2, w3, curInput, curOutput;
         Data* sinDataPtr = &sinData;
@@ -672,7 +672,7 @@ namespace fastllm {
                     fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
                 }
 
-                Data attenOutput = Data(this->dataType);
+                attenOutput = Data(this->dataType);
                 int total = 0;
 
                 if (false) {
