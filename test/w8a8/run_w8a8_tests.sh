@@ -16,6 +16,11 @@ attention_backend_args=(
     --flm-kv-cache-layout "${kv_cache_layout}"
     --flm-attention-backend "${attention_backend}"
 )
+attention_layout_matrix=(
+    "continuous:auto"
+    "paged:native_paged"
+    "paged:flashinfer_paged"
+)
 if [[ "${W8A8_ATTENTION_BACKEND_STRICT:-0}" == 1 ]]; then
     attention_backend_args+=(--flm-attention-backend-strict)
 fi
@@ -617,35 +622,44 @@ run_forward() {
         --result-dir "${log_dir}/forward-results"
 }
 
-run_attention_layout_forward() {
-    require_model
-    local layout backend strict_args=()
-    # forward_check只发起一个正式请求。Paged组合用于回归Llama单请求是否
-    # 与多请求共用新版ForwardBatch，而不是静默落回旧Continuous路径。
-    for layout_backend in \
-        "continuous:auto" \
-        "paged:native_paged" \
-        "paged:flashinfer_paged"; do
+run_attention_layout_matrix() {
+    local case_runner=$1 layout_backend layout backend status=0
+    for layout_backend in "${attention_layout_matrix[@]}"; do
         layout=${layout_backend%%:*}
         backend=${layout_backend#*:}
-        strict_args=()
-        if [[ "${backend}" != auto ]]; then
-            strict_args+=(--flm-attention-backend-strict)
+        if ! "${case_runner}" "${layout}" "${backend}"; then
+            status=1
         fi
-        run_logged "forward_single_request_${layout}_${backend}" \
-            env FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
-            FASTLLM_CUDA_W8A8_TRACE=1 FASTLLM_SAMPLING_TOP1_TRACE=1 \
-            W8A8_VLLM_PYTHON="${vllm_python}" \
-            "${vllm_python}" test/w8a8/forward_check_vllm.py \
-            --model "${model}" --tokens 8 --top-logprobs 10 \
-            --vllm-python "${vllm_python}" \
-            --max-model-len 512 --gpu-memory-utilization 0.90 \
-            --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
-            --flm-kv-cache-layout "${layout}" \
-            --flm-attention-backend "${backend}" \
-            "${strict_args[@]}" \
-            --result-dir "${log_dir}/forward-${layout}-${backend}"
     done
+    return "${status}"
+}
+
+run_forward_attention_layout_case() {
+    local layout=$1 backend=$2 strict_args=()
+    if [[ "${backend}" != auto ]]; then
+        strict_args+=(--flm-attention-backend-strict)
+    fi
+
+    run_logged "forward_single_request_${layout}_${backend}" \
+        env FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+        FASTLLM_CUDA_W8A8_TRACE=1 FASTLLM_SAMPLING_TOP1_TRACE=1 \
+        W8A8_VLLM_PYTHON="${vllm_python}" \
+        "${vllm_python}" test/w8a8/forward_check_vllm.py \
+        --model "${model}" --tokens 8 --top-logprobs 10 \
+        --vllm-python "${vllm_python}" \
+        --max-model-len 512 --gpu-memory-utilization 0.90 \
+        --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+        --flm-kv-cache-layout "${layout}" \
+        --flm-attention-backend "${backend}" \
+        "${strict_args[@]}" \
+        --result-dir "${log_dir}/forward-${layout}-${backend}"
+}
+
+run_attention_layout_forward() {
+    require_model
+    # forward_check只发起一个正式请求。Paged组合用于回归Llama单请求是否
+    # 与多请求共用新版ForwardBatch，而不是静默落回旧Continuous路径。
+    run_attention_layout_matrix run_forward_attention_layout_case
 }
 
 run_model_performance() {
@@ -661,6 +675,79 @@ run_model_performance() {
         --decode-input-tokens 512 --decode-batch-sizes 1,2,4,8,16,32 \
         --decode-max-tokens 64 --warmup 1 --repeats 5 \
         --max-model-len 8192 --gpu-memory-utilization 0.90
+}
+
+run_model_performance_attention_layout_case() {
+    local layout=$1 backend=$2 strict_args=()
+    local result_root="${log_dir}/model-performance-attention-layouts"
+    if [[ "${backend}" != auto ]]; then
+        strict_args+=(--flm-attention-backend-strict)
+    fi
+
+    run_logged "model_performance_${layout}_${backend}" \
+        env FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+        "${vllm_python}" test/w8a8/model_performance_compare.py \
+        --model "${model}" \
+        --result-dir "${result_root}/${layout}-${backend}" \
+        --vllm-python "${vllm_python}" --fastllm-python "${vllm_python}" \
+        --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+        --flm-kv-cache-layout "${layout}" \
+        --flm-attention-backend "${backend}" \
+        "${strict_args[@]}" \
+        --prefill-input-tokens 4096 --prefill-max-tokens 16 \
+        --decode-input-tokens 512 --decode-batch-sizes 1,2,4,8,16,32 \
+        --decode-max-tokens 64 --warmup 1 --repeats 5 \
+        --max-model-len 8192 --gpu-memory-utilization 0.90
+}
+
+run_model_performance_attention_layouts() {
+    require_model
+    local result_root="${log_dir}/model-performance-attention-layouts" status=0
+    run_attention_layout_matrix run_model_performance_attention_layout_case || status=$?
+    "${vllm_python}" test/w8a8/attention_layout_matrix_report.py \
+        --kind model-performance --result-dir "${result_root}"
+    return "${status}"
+}
+
+run_decode_nsys_attention_layout_case() {
+    local layout=$1 backend=$2 strict_args=() optional_args=()
+    local result_root="${log_dir}/decode-nsys-attention-layouts"
+    if [[ "${backend}" != auto ]]; then
+        strict_args+=(--flm-attention-backend-strict)
+    fi
+    if [[ "${W8A8_NSYS_CPU_TRACE:-1}" == 1 ]]; then
+        optional_args+=(--cpu-trace)
+    fi
+    if [[ "${W8A8_KEEP_NSYS_REPORTS:-0}" == 1 ]]; then
+        optional_args+=(--keep-nsys-reports)
+    fi
+
+    run_logged "decode_nsys_${layout}_${backend}" \
+        env FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
+        VLLM_USE_FLASHINFER_SAMPLER=0 \
+        "${vllm_python}" test/w8a8/decode_nsys_compare.py \
+        --model "${model}" \
+        --result-dir "${result_root}/${layout}-${backend}" \
+        --backends fastllm,vllm --batch-sizes 1,2,4,8,16,32 \
+        --prompt-tokens 512 --output-tokens 64 --warmup-output-tokens 8 \
+        --prefix-cache-padding-tokens 128 \
+        --vllm-python "${vllm_python}" --fastllm-python "${vllm_python}" \
+        --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
+        --flm-kv-cache-layout "${layout}" \
+        --flm-attention-backend "${backend}" \
+        "${strict_args[@]}" "${optional_args[@]}" \
+        --max-model-len 8192 --gpu-memory-utilization 0.90 \
+        --port 18082 --startup-timeout 1200 --request-timeout 3600 \
+        --nsys nsys --top-kernels 20
+}
+
+run_decode_nsys_attention_layouts() {
+    require_model
+    local result_root="${log_dir}/decode-nsys-attention-layouts" status=0
+    run_attention_layout_matrix run_decode_nsys_attention_layout_case || status=$?
+    "${vllm_python}" test/w8a8/attention_layout_matrix_report.py \
+        --kind decode-nsys --result-dir "${result_root}"
+    return "${status}"
 }
 
 case "${suite}" in
@@ -687,9 +774,11 @@ case "${suite}" in
     forward) run_forward ;;
     forward-attention-layouts) run_attention_layout_forward ;;
     model-performance) run_model_performance ;;
+    model-performance-attention-layouts) run_model_performance_attention_layouts ;;
+    decode-nsys-attention-layouts) run_decode_nsys_attention_layouts ;;
     all) run_ops_functional; run_ops_performance; run_forward; run_model_performance ;;
     *)
-        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-symmetric-functional|ops-int8-symmetric-performance|ops-int8-symmetric|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-moe-functional|ops-moe-performance|ops-moe|ops-functional|ops-performance|ops-compare|ops|forward|forward-attention-layouts|model-performance|all}" >&2
+        echo "usage: $0 {build|ops-dense-functional|ops-dense-performance|ops-dense|ops-block128-functional|ops-block128-performance|ops-block128|ops-int8-symmetric-functional|ops-int8-symmetric-performance|ops-int8-symmetric|ops-int8-azp-functional|ops-int8-azp-performance|ops-int8-azp|ops-moe-functional|ops-moe-performance|ops-moe|ops-functional|ops-performance|ops-compare|ops|forward|forward-attention-layouts|model-performance|model-performance-attention-layouts|decode-nsys-attention-layouts|all}" >&2
         exit 2
         ;;
 esac

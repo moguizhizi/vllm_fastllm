@@ -153,6 +153,19 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-model" \
 结果目录生成`model-performance-compare.{md,csv,json,xlsx}`。成功完成全部
 请求并得到完整对应记录的case标记为`PASS`；速度比不作为正确性判定。
 
+标准Llama需要横向比较KV布局和Paged Backend时，使用矩阵入口。它依次运行
+`continuous+auto`、`paged+native_paged+strict`和
+`paged+flashinfer_paged+strict`，每组仍完整覆盖Eager/Best、Cold/Cache Hit及
+decode batch=1/2/4/8/16/32。各组报告分别保存，同时在矩阵根目录生成合并的
+`model-performance-attention-layout-matrix.{md,csv,json,xlsx}`和跨布局趋势图。
+
+```bash
+W8A8_MODEL=/root/autodl-tmp/neuralmagic/Meta-Llama-3___1-8B-Instruct-quantized___w8a8 \
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/llama-attention-model-performance" \
+  test/w8a8/run_w8a8_tests.sh model-performance-attention-layouts
+```
+
 Decode性能归因使用独立的`decode_nsys_compare.py`。它让两个后端分时加载
 同一模型；每个Batch先用同一Prompt完成CUDA Graph、shape和Prefix Cache
 warmup，再由Nsight Systems只采集一轮BEST模式HTTP请求。默认覆盖
@@ -172,6 +185,19 @@ python test/w8a8/decode_nsys_compare.py \
   --batch-sizes 1,2,4,8,16,32 \
   --prompt-tokens 512 \
   --output-tokens 64
+```
+
+标准Llama的Nsight矩阵使用同样三种组合，并为每种组合覆盖
+batch=1/2/4/8/16/32。默认开启`--cpu-trace`，采集汇总完成后删除大体积
+`.nsys-rep`、SQLite和导出CSV；设置`W8A8_KEEP_NSYS_REPORTS=1`才会保留。
+矩阵根目录生成`decode-nsys-attention-layout-matrix.{md,csv,json,xlsx}`和跨布局
+GPU/CPU提交趋势图。
+
+```bash
+W8A8_MODEL=/root/autodl-tmp/neuralmagic/Meta-Llama-3___1-8B-Instruct-quantized___w8a8 \
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/llama-attention-decode-nsys" \
+  test/w8a8/run_w8a8_tests.sh decode-nsys-attention-layouts
 ```
 
 若Nsight Systems已经把Attention差距定位到FastLLM的
