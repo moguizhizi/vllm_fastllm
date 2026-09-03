@@ -620,6 +620,8 @@ run_forward() {
 run_attention_layout_forward() {
     require_model
     local layout backend strict_args=()
+    # forward_check只发起一个正式请求。Paged组合用于回归Llama单请求是否
+    # 与多请求共用新版ForwardBatch，而不是静默落回旧Continuous路径。
     for layout_backend in \
         "continuous:auto" \
         "paged:native_paged" \
@@ -630,7 +632,7 @@ run_attention_layout_forward() {
         if [[ "${backend}" != auto ]]; then
             strict_args+=(--flm-attention-backend-strict)
         fi
-        run_logged "forward_${layout}_${backend}" \
+        run_logged "forward_single_request_${layout}_${backend}" \
             env FASTLLM_CUDA_W8A8=1 FASTLLM_CUDA_W8A8_STRICT=1 \
             FASTLLM_CUDA_W8A8_TRACE=1 FASTLLM_SAMPLING_TOP1_TRACE=1 \
             W8A8_VLLM_PYTHON="${vllm_python}" \

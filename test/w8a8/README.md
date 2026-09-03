@@ -125,6 +125,19 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-forward" \
   test/w8a8/run_w8a8_tests.sh forward
 ```
 
+标准Llama的KV布局回归使用单个正式生成请求，依次验证`continuous+auto`、
+`paged+native_paged+strict`和`paged+flashinfer_paged+strict`。该套件专门防止
+batch=1通过旧`ForwardBatch`静默退回Continuous；显式Paged未出现在KV布局
+Trace中或指定Backend未被确认时必须失败。InternLM2、Phi3和MiniCPM当前只
+声明Continuous能力，不纳入Paged组合。
+
+```bash
+W8A8_MODEL=/root/autodl-tmp/neuralmagic/Meta-Llama-3___1-8B-Instruct-quantized___w8a8 \
+W8A8_VLLM_PYTHON=/root/miniconda3/bin/python \
+W8A8_LOG_DIR="$PWD/test/w8a8/logs/llama-attention-layouts" \
+  test/w8a8/run_w8a8_tests.sh forward-attention-layouts
+```
+
 需要严格数值对齐时，直接执行共享入口并增加
 `--strict-alignment`；此时首Token logprob差超过0.1会使测试失败。
 
