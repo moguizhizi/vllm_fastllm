@@ -528,7 +528,10 @@ namespace fastllm {
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vPositionIds));
         } else {
             allPositionIds.CopyFrom(*(Data*)positionIds[0]);
-            allPositionIds.Expansion({1, seqLen});
+            const std::vector<int> positionExpansionDims = {1, seqLen};
+            if (allPositionIds.dims != positionExpansionDims) {
+                allPositionIds.Expansion(positionExpansionDims);
+            }
             for (int i = 1; i < batch; i++) {
                 CatDirect(allPositionIds, *(Data*)positionIds[i], 1);
             }

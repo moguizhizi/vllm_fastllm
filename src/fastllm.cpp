@@ -2383,6 +2383,11 @@ namespace fastllm {
             }
         }
 
+        // 目标尺寸未增长时无需重分配，同时避免后续以-1访问dims和strides。
+        if (axis == -1) {
+            return;
+        }
+
         uint64_t oldBytes = GetBytes();
         int input1Stride = this->Count(axis);
 
