@@ -880,7 +880,9 @@ namespace fastllm {
         std::vector <Data> curLogits;
         curLogits.resize(batch);
 
-        if (batch > 1 && !all1) {
+        // Prefill只需要每个请求最后一个Token的logits。单请求也必须先收缩
+        // sequence维，否则后续SplitBatch会把sequence长度误当成batch数量。
+        if (!all1) {
             int total = 0;
             std::vector <Data> lastTokens;
             std::vector <Data*> lastTokenPointers;
