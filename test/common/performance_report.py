@@ -13,6 +13,9 @@ BACKEND_COLORS = {
     "fastllm": (68, 114, 196),
     "vllm": (237, 125, 49),
     "ratio": (112, 48, 160),
+    "continuous-auto": (68, 114, 196),
+    "paged-native_paged": (112, 173, 71),
+    "paged-flashinfer_paged": (112, 48, 160),
 }
 GRID_COLOR = (218, 223, 230)
 TEXT_COLOR = (45, 52, 64)
@@ -217,10 +220,8 @@ def _draw_panel(canvas, bounds, rows, spec, batch_field, backend_field):
     present_backends = {
         str(row.get(backend_field, "")).lower() for row in rows
     }
-    ordered_backends = [
-        backend for backend in ("fastllm", "vllm", "ratio")
-        if backend in present_backends
-    ]
+    ordered_backends = [backend for backend in BACKEND_COLORS
+                        if backend in present_backends]
     ordered_backends.extend(sorted(
         present_backends - set(ordered_backends)))
     for backend in ordered_backends:
@@ -258,17 +259,19 @@ def write_dashboard(path, rows, specs, title, batch_field="batch",
     present_backends = {
         str(row.get(backend_field, "")).lower() for row in rows
     }
-    legend_backends = [
-        backend for backend in ("fastllm", "vllm", "ratio")
-        if backend in present_backends
-    ]
-    legend_x = 900
+    legend_backends = [backend for backend in BACKEND_COLORS
+                       if backend in present_backends]
+    compact_legend = len(legend_backends) > 2
+    legend_x = 530 if compact_legend else 900
+    legend_scale = 1 if compact_legend else 2
     for backend in legend_backends:
         color = BACKEND_COLORS[backend]
-        label = "FASTLLM/VLLM" if backend == "ratio" else backend.upper()
+        label = ("FASTLLM/VLLM" if backend == "ratio" else
+                 backend.upper().replace("_", "-"))
         canvas.line(legend_x, 31, legend_x + 50, 31, color, 4)
-        canvas.text(legend_x + 60, 21, label, scale=2)
-        legend_x += 190 if backend != "ratio" else 260
+        canvas.text(legend_x + 60, 26 if compact_legend else 21,
+                    label, scale=legend_scale)
+        legend_x += 250 if compact_legend else 210
 
     bounds = (
         (20, 65, 640, 440), (640, 65, 1260, 440),
