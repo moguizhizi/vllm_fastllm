@@ -151,13 +151,52 @@ namespace fastllm {
                             std::vector <float> *retLogits) {
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
-        return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
+        return ForwardSingleWithRequestCaches(
+            inputIds, attentionMask, positionIds, pastKeyValues,
+            generationConfig, lastTokens, &batchLogits)[0];
+    }
+
+    std::vector<int> LlamaModel::ForwardSingleWithRequestCaches(
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *retLogits) {
+        std::vector<Data*> attentionMasks = {
+            attentionMask.dims.empty() ? nullptr : (Data*)&attentionMask};
+        std::vector<Data*> positionIdsBatch = {(Data*)&positionIds};
+        std::vector<int> seqLens = {inputIds.dims[1]};
+        std::vector<std::pair<Data*, Data*>> cachePointers;
+        cachePointers.reserve(pastKeyValues.size());
+        for (auto &cache : pastKeyValues) {
+            cachePointers.push_back({&cache.first, &cache.second});
+        }
+        std::vector<GenerationConfig> generationConfigs = {generationConfig};
+
+        return ForwardBatch(1, inputIds, attentionMasks, positionIdsBatch,
+                            seqLens, cachePointers, generationConfigs,
+                            lastTokens, retLogits);
     }
 
     std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
+        if (batch == 1) {
+            return ForwardSingleWithRequestCaches(
+                inputIds, attentionMask, positionIds, pastKeyValues,
+                generationConfig, lastTokens, retLogits);
+        }
+
+        ModelAttentionCapabilities legacyCapabilities = GetModelAttentionCapabilities();
+        legacyCapabilities.modelName += " legacy-batch";
+        legacyCapabilities.supportsPaged = false;
+        AttentionExecutor::Create(legacyCapabilities, batch, inputIds.dims[1] > 1,
+                                  this->weight.dicts["use_alibi"] == "1",
+                                  GetKVCacheInCPU());
+
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -473,16 +512,13 @@ namespace fastllm {
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
         }
-        const bool isPrefill = !all1;
-        const std::string requestedKVCacheLayout = GetKVCacheLayout();
-        const bool usePagedKVCache = requestedKVCacheLayout == "paged";
-        AssertInFastLLM(!usePagedKVCache || alibiData.dims.empty(),
-                        "Llama paged KV cache doesn't support ALiBi attention.\n");
-        AssertInFastLLM(!usePagedKVCache || !GetKVCacheInCPU(),
-                        "Llama paged KV cache doesn't support CPU KV cache.\n");
+        const AttentionExecutor attentionExecutor = AttentionExecutor::Create(
+            GetModelAttentionCapabilities(), batch, !all1,
+            !alibiData.dims.empty(), GetKVCacheInCPU());
+        const bool isPrefill = attentionExecutor.IsPrefill();
+        const bool usePagedKVCache = attentionExecutor.UsesPagedKVCache();
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
-        TraceKVCacheLayout("llama", usePagedKVCache ? "paged" : "continuous");
 
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
             std::vector <float> vPositionIds;            
@@ -950,6 +986,13 @@ namespace fastllm {
             return false;
         }
         return true;
+    }
+
+    ModelAttentionCapabilities LlamaModel::GetModelAttentionCapabilities() const {
+        const std::string name = model_type.empty() ? "llama" : model_type;
+        const bool isStandardLlama = name == "llama";
+        return {name, ModelKVCacheLayout::CONTINUOUS,
+                true, isStandardLlama, false, false};
     }
 
     void LlamaModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,

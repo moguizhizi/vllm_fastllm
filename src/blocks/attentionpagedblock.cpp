@@ -81,11 +81,16 @@ namespace fastllm {
             RMSNormPart(*qkv, *preKNormWeight, rms_norm_eps, qdim, qdim + per, *qkv);
         }
 
-        // 2. 计算 targetSeqLength 和 rope 参数
+        // 按request-major布局绑定当前层的K/V Cache描述符
+        KVCacheController::BindLayerCaches(
+            *pastKeyValues, batch, block_cnt, layerIdx,
+            *batchPastKeys, *batchPastValues);
+
+        // 计算 targetSeqLength 和 rope 参数
         int targetSeqLength = 0;
         for (int b = 0; b < batch; b++) {
-            Data &pastKey = *(*pastKeyValues)[b * block_cnt + layerIdx].first;
-            Data &pastValue = *(*pastKeyValues)[b * block_cnt + layerIdx].second;
+            Data &pastKey = *(*batchPastKeys)[b];
+            Data &pastValue = *(*batchPastValues)[b];
             if (kvCacheInCPU) {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
@@ -104,12 +109,6 @@ namespace fastllm {
             curRopeTheta = rope_base * scale;
         }
         float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
-
-        // 3. 准备batch的pastKeyValues列表
-        for (int b = 0; b < batch; b++) {
-            (*batchPastKeys)[b] = (*pastKeyValues)[b * block_cnt + layerIdx].first;
-            (*batchPastValues)[b] = (*pastKeyValues)[b * block_cnt + layerIdx].second;
-        }
 
         bool useFp8KVCache = ((*batchPastKeys)[0]->dataType == DataType::FP8_E4M3 ||
                               (*batchPastValues)[0]->dataType == DataType::FP8_E4M3);

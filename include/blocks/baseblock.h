@@ -2,6 +2,7 @@
 #define FASTLLM_BASEBLOCK_H
 
 #include "fastllm.h"
+#include "blocks/attentionexecutor.h"
 
 namespace fastllm {
     /*

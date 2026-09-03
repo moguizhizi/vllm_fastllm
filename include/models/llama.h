@@ -58,6 +58,9 @@ namespace fastllm {
 
         virtual void WarmUp(); // 预热
 
+        /** 标准Llama支持GPU Continuous和Paged KV Cache。 */
+        virtual ModelAttentionCapabilities GetModelAttentionCapabilities() const override;
+
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
@@ -65,6 +68,16 @@ namespace fastllm {
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
     protected:
+        /** 将单请求旧接口适配为request-major的新ForwardBatch接口。 */
+        std::vector<int> ForwardSingleWithRequestCaches(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float>*> *logits);
+
         RoPEType rope_type = RoPEType::BASE;
 
         float rope_base = 10000.f;
