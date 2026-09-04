@@ -15,8 +15,13 @@
 #include <climits>
 #include <cstdio>
 #include <thread>
+#include <atomic>
 #include <algorithm>
 #include <queue>
+
+#if defined(USE_CUDA) && (defined(__linux__) || defined(__APPLE__))
+#include <execinfo.h>
+#endif
 
 #ifdef USE_MMAP
 #include <sys/mman.h>
@@ -1039,6 +1044,66 @@ namespace fastllm {
         CopyFrom(ori);
     }
 
+#ifdef USE_CUDA
+    /**
+     * 输出分页路径中空CUDA源张量的深拷贝现场。
+     *
+     * 该诊断仅在FASTLLM_CUDA_PAGED_DEBUG启用时由Data::CopyFrom调用，最多
+     * 输出前8个现场，避免同一错误在多层K/V Cache中级联刷屏。函数只读取
+     * 张量元数据和主机调用栈，不读取设备内存，也不改变原有失败语义。
+     *
+     * @param dst   已为深拷贝分配目标空间的Data对象。
+     * @param src   cudaData为空但逻辑字节数非零的源Data对象。
+     * @param bytes 本次深拷贝准备传输的字节数。
+     */
+    static void PrintPagedNullCudaCopySource(
+            const Data &dst, const Data &src, size_t bytes) {
+        static std::atomic<int> loggedCount(0);
+        int logIndex = loggedCount.fetch_add(1, std::memory_order_relaxed);
+        if (logIndex >= 8) {
+            return;
+        }
+
+        std::string shape = "[";
+        for (size_t i = 0; i < src.dims.size(); i++) {
+            if (i > 0) {
+                shape += ",";
+            }
+            shape += std::to_string(src.dims[i]);
+        }
+        shape += "]";
+
+        fprintf(stderr,
+                "[fastllm][paged-debug] NULL_COPY_SOURCE index=%d "
+                "src_object=%p dst_object=%p src_cuda=%p dst_cuda=%p "
+                "bytes=%zu name=%s dtype=%s shape=%s data_device=%d "
+                "is_fake=%d direct_memory=%d borrowed=%d expansion_bytes=%llu\n",
+                logIndex, (const void*)&src, (const void*)&dst,
+                src.cudaData, dst.cudaData, bytes,
+                src.name.empty() ? "<unnamed>" : src.name.c_str(),
+                GetDataTypeName(src.dataType).c_str(), shape.c_str(),
+                (int)src.dataDevice, (int)src.isFake, (int)src.directMemory,
+                (int)src.cudaDataBorrowed,
+                (unsigned long long)src.expansionBytes);
+#if defined(__linux__) || defined(__APPLE__)
+        const int maxFrames = 32;
+        void *frames[maxFrames];
+        int frameCount = backtrace(frames, maxFrames);
+        char **symbols = backtrace_symbols(frames, frameCount);
+        if (symbols != nullptr) {
+            int end = std::min(frameCount, 20);
+            for (int i = 1; i < end; i++) {
+                fprintf(stderr, "  copy_stack#%d %s\n", i - 1, symbols[i]);
+            }
+            free(symbols);
+        }
+#else
+        fprintf(stderr, "  copy stack is unavailable on this platform.\n");
+#endif
+        fflush(stderr);
+    }
+#endif
+
     void Data::FakeFrom(const Data &ori, size_t offset) {
 #ifdef USE_CUDA
         FastllmCudaReleaseNvfp4W4A4Cache(this);
@@ -1163,7 +1228,12 @@ namespace fastllm {
             std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
+            size_t copyBytes = this->GetBytes();
+            if (copyBytes > 0 && ori.cudaData == nullptr &&
+                    FastllmCudaPagedDebugEnabled()) {
+                PrintPagedNullCudaCopySource(*this, ori, copyBytes);
+            }
+            FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, copyBytes);
 #endif
         }
     }
