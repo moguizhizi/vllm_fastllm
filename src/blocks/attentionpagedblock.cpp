@@ -206,8 +206,7 @@ namespace fastllm {
 
             // 2.6 逐 batch 做 AppendPagedCache
             // k/v 形状为 [num_kv_heads, totalSeqLen, head_dim]
-            auto makeCacheDesc = [](const Data &src, DataType targetType) {
-                Data desc(targetType);
+            auto fillCacheDesc = [](Data &desc, const Data &src) {
                 desc.dims = src.dims;
                 desc.strides = src.strides;
                 desc.dataDevice = src.dataDevice;
@@ -218,11 +217,12 @@ namespace fastllm {
                 desc.tpGlobalDims = src.tpGlobalDims;
                 desc.tpRanges = src.tpRanges;
                 desc.UpdateUnitSize();
-                return desc;
             };
             if (batch == 1) {
-                Data kCacheDesc = makeCacheDesc(k, (*batchPastKeys)[0]->dataType);
-                Data vCacheDesc = makeCacheDesc(v, (*batchPastValues)[0]->dataType);
+                Data kCacheDesc((*batchPastKeys)[0]->dataType);
+                Data vCacheDesc((*batchPastValues)[0]->dataType);
+                fillCacheDesc(kCacheDesc, k);
+                fillCacheDesc(vCacheDesc, v);
                 int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
                     cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
@@ -247,8 +247,10 @@ namespace fastllm {
                     Split(k, 1, total, total + seqLens[b], curK);
                     Split(v, 1, total, total + seqLens[b], curV);
 
-                    Data kCacheDesc = makeCacheDesc(curK, pastKey.dataType);
-                    Data vCacheDesc = makeCacheDesc(curV, pastValue.dataType);
+                    Data kCacheDesc(pastKey.dataType);
+                    Data vCacheDesc(pastValue.dataType);
+                    fillCacheDesc(kCacheDesc, curK);
+                    fillCacheDesc(vCacheDesc, curV);
                     int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
                     PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
                         cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
