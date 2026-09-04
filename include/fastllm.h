@@ -124,6 +124,8 @@ namespace fastllm {
     void SetAttentionBackendTrace(bool trace);
     /** 返回Attention Backend路径记录开关。 */
     bool GetAttentionBackendTrace();
+    /** 返回进程中尚未销毁的异步推理请求上下文数量。 */
+    int GetActiveResponseContextCount();
     void SetGpuMemRatio(float ratio);
     float GetGpuMemRatio();
     AliveThreadPool *GetAlivePool();

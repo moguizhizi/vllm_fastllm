@@ -4536,6 +4536,81 @@ static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
     fflush(stderr);
 }
 
+/**
+ * 在真实OOM后输出设备内存池与请求生命周期摘要。
+ *
+ * 调用方必须已经持有目标设备的内存池锁。本函数只读取池元数据，不释放
+ * Buffer、不执行同步，也不改变正常分配和回退行为。
+ *
+ * @param id               CUDA设备编号。
+ * @param requestSize      本次失败的申请字节数。
+ * @param bigBuffersPtr    大块内存池。
+ * @param smallBuffersPtr  小块内存池。
+ */
+static void FastllmCudaPrintOomPoolStateLocked(
+        int id, size_t requestSize,
+        const std::vector<CudaMemoryBuffer> *bigBuffersPtr,
+        const std::vector<CudaMemoryBuffer> *smallBuffersPtr) {
+    struct PoolSummary {
+        size_t busyBytes = 0;
+        size_t freeBytes = 0;
+        size_t pinnedBytes = 0;
+        size_t pendingBytes = 0;
+        int busyCount = 0;
+        int freeCount = 0;
+        int pinnedCount = 0;
+        int pendingCount = 0;
+    };
+    auto summarize = [](const std::vector<CudaMemoryBuffer> *buffers) {
+        PoolSummary summary;
+        if (buffers == nullptr) {
+            return summary;
+        }
+        for (const auto &buffer : *buffers) {
+            if (buffer.busy) {
+                summary.busyBytes += buffer.size;
+                summary.busyCount++;
+            } else {
+                summary.freeBytes += buffer.size;
+                summary.freeCount++;
+            }
+            if (buffer.graphPins > 0) {
+                summary.pinnedBytes += buffer.size;
+                summary.pinnedCount++;
+            }
+            if (buffer.reusePending) {
+                summary.pendingBytes += buffer.size;
+                summary.pendingCount++;
+            }
+        }
+        return summary;
+    };
+
+    const PoolSummary big = summarize(bigBuffersPtr);
+    const PoolSummary small = summarize(smallBuffersPtr);
+    fprintf(stderr,
+            "[FASTLLM_CUDA_OOM] device=%d request_mb=%.2f active_response_contexts=%d\n",
+            id, requestSize / 1048576.0,
+            fastllm::GetActiveResponseContextCount());
+    fprintf(stderr,
+            "[FASTLLM_CUDA_OOM] big_pool busy_mb=%.2f busy_count=%d "
+            "free_mb=%.2f free_count=%d pinned_mb=%.2f pinned_count=%d "
+            "pending_mb=%.2f pending_count=%d\n",
+            big.busyBytes / 1048576.0, big.busyCount,
+            big.freeBytes / 1048576.0, big.freeCount,
+            big.pinnedBytes / 1048576.0, big.pinnedCount,
+            big.pendingBytes / 1048576.0, big.pendingCount);
+    fprintf(stderr,
+            "[FASTLLM_CUDA_OOM] small_pool busy_mb=%.2f busy_count=%d "
+            "free_mb=%.2f free_count=%d pinned_mb=%.2f pinned_count=%d "
+            "pending_mb=%.2f pending_count=%d\n",
+            small.busyBytes / 1048576.0, small.busyCount,
+            small.freeBytes / 1048576.0, small.freeCount,
+            small.pinnedBytes / 1048576.0, small.pinnedCount,
+            small.pendingBytes / 1048576.0, small.pendingCount);
+    fflush(stderr);
+}
+
 static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
     cudaError_t state = cudaSetDevice(id);
     checkCudaErrors("Error: CUDA error when switching device to release cached memory!", state);
@@ -4815,6 +4890,8 @@ void * FastllmCudaMalloc(size_t size) {
             state = cudaSuccess;
         }
         if (cudaSuccess != state) {
+            FastllmCudaPrintOomPoolStateLocked(
+                id, size, view.bigBuffers, view.smallBuffers);
             size_t freeMem = 0, totalMem = 0;
             cudaMemGetInfo(&freeMem, &totalMem);
             printf("Error: CUDA error when allocating %lu MB memory on device %d! "
@@ -4890,6 +4967,8 @@ void * FastllmCudaMalloc(size_t size) {
         state = cudaSuccess;
     }
     if (cudaSuccess != state) {
+        FastllmCudaPrintOomPoolStateLocked(
+            id, size, view.bigBuffers, view.smallBuffers);
         size_t freeMem = 0, totalMem = 0;
         cudaMemGetInfo(&freeMem, &totalMem);
         printf("Error: CUDA error when allocating %lu KB memory on device %d! "

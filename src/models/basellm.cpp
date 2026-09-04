@@ -22,6 +22,8 @@
 
 namespace fastllm {
     namespace {
+        std::atomic<int> activeResponseContextCount(0);
+
         /**
          * 判断是否开启异步响应调度器的CPU分段耗时诊断。
          *
@@ -422,6 +424,11 @@ namespace fastllm {
         return IsPureGpuMode(this);
     }
 
+    /** 返回进程中尚未销毁的异步推理请求上下文数量。 */
+    int GetActiveResponseContextCount() {
+        return activeResponseContextCount.load(std::memory_order_relaxed);
+    }
+
     int ResponseContextDict::CreateHandle() {
         locker.lock();
         int newId = 0;
@@ -429,6 +436,7 @@ namespace fastllm {
             newId++;
         }
         dicts[newId] = new ResponseContext();
+        activeResponseContextCount.fetch_add(1, std::memory_order_relaxed);
         locker.unlock();
         return newId;
     }
@@ -450,6 +458,8 @@ namespace fastllm {
     }
 
     ResponseContext::~ResponseContext() {
+        activeResponseContextCount.fetch_sub(1, std::memory_order_relaxed);
+
         // A tensor-parallel cache descriptor mirrors the first local shard's
         // page metadata without owning an additional page reference.  Release
         // the root and all local descriptors as one deduplicated unit before
