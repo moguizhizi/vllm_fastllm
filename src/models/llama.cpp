@@ -46,6 +46,7 @@ namespace fastllm {
     LlamaModel::LlamaModel() {
         this->model_struct = "llama";
         this->model_type = "llama";
+        this->use_new_engine = GetKVCacheLayout() == "paged";
 
         // 默认使用 llama3 的提示词和instruction
         this->pre_prompt="<|begin_of_text|><|start_header_id|>system<|end_header_id|>\nYou are a helpful assistant.<|eot_id|>";
@@ -984,6 +985,21 @@ namespace fastllm {
         if (cosDataPtr != &cosData)
             delete cosDataPtr;
         return lastRet;
+    }
+
+    std::vector<int> LlamaModel::ForwardV2(
+            int batch,
+            const Data &inputIds,
+            const std::vector<Data*> &attentionMask,
+            const std::vector<Data*> &positionIds,
+            const std::vector<int> &seqLens,
+            std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+            const std::vector<GenerationConfig> &generationConfigs,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *logits) {
+        return ForwardBatch(batch, inputIds, attentionMask, positionIds,
+                            seqLens, pastKeyValues, generationConfigs,
+                            lastTokens, logits);
     }
 
     bool LlamaModel::NeedAttentionMask(int qlen, int klen) {

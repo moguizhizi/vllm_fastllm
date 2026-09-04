@@ -514,13 +514,43 @@ namespace fastllm {
         model->TryRecordResponseContext(this);
     }
 
+    /**
+     * 按当前KV Cache布局记录已完成请求的Prefix Cache。
+     *
+     * Continuous Cache拥有独立且连续的Data缓冲区，继续保存到通用
+     * PastKVCacheManager。Paged Cache的Data仅保存页表描述符，实际K/V位于
+     * PagedCacheManager，因此只记录Page Trie，禁止把描述符当连续张量深拷贝。
+     *
+     * @param context 已完成或中止、准备记录Prefix Cache的请求上下文。
+     */
     void basellm::TryRecordResponseContext(ResponseContext *context) {
         if (context == nullptr) {
             return;
         }
+
         this->TryRecordHistoryCache(context->allTokens);
-        if (this->saveHistoryChat && this->UseGenericHistoryCache()) {
-            this->pastKVCacheManager.Record(context->allTokens, context->allTokens.size(), &context->pastKeyValues);
+        if (!this->saveHistoryChat) {
+            return;
+        }
+
+        bool hasPagedCache = false;
+        for (const auto &kv : context->pastKeyValues) {
+            if (kv.first.isPagedKVCache || kv.second.isPagedKVCache ||
+                kv.first.pagedKVCacheData != nullptr ||
+                kv.second.pagedKVCacheData != nullptr) {
+                hasPagedCache = true;
+                break;
+            }
+        }
+        if (hasPagedCache) {
+            context->TryRecordPagedCache(this);
+            return;
+        }
+
+        if (this->UseGenericHistoryCache()) {
+            this->pastKVCacheManager.Record(
+                context->allTokens, context->allTokens.size(),
+                &context->pastKeyValues);
         }
     }
 
