@@ -205,6 +205,10 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
 #endif
 void *FastllmCudaMalloc(size_t size);
 void *FastllmCudaMallocWithSource(size_t size, const char *file, int line);
+void *FastllmCudaMallocWithDataTag(size_t size, const void *owner,
+                                   int dataType, const int *dims, int dimCount,
+                                   bool isFake, bool isKVCache,
+                                   const char *file, int line);
 #ifndef FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #define FastllmCudaMalloc(size) \
     FastllmCudaMallocWithSource((size), __FILE__, __LINE__)

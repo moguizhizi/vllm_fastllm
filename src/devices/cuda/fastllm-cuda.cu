@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cfloat>
 #include <cmath>
@@ -3881,6 +3882,16 @@ void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
     DeviceSync();
 }
 
+/** 保存Data分配时的紧凑快照；只用于OOM报告，不持有或解引用owner。 */
+struct CudaAllocationMetadata {
+    const void *owner = nullptr;
+    int dataType = -1;
+    int dimCount = 0;
+    std::array<int, 4> dims = {0, 0, 0, 0};
+    bool isFake = false;
+    bool isKVCache = false;
+};
+
 struct CudaMemoryBuffer {
     void *data;
     size_t size;
@@ -3891,26 +3902,32 @@ struct CudaMemoryBuffer {
     const char *sourceFile;
     int sourceLine;
     size_t requestedSize;
+    CudaAllocationMetadata metadata;
 
     CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0),
             reuseReadyEvent(nullptr), reusePending(false),
             sourceFile("<unknown>"), sourceLine(0), requestedSize(0) {}
 
     CudaMemoryBuffer (void *data, size_t size, bool busy,
-                      const char *sourceFile = nullptr, int sourceLine = 0) :
+                      const char *sourceFile = nullptr, int sourceLine = 0,
+                      const CudaAllocationMetadata *metadata = nullptr) :
             data(data), size(size), busy(busy), graphPins(0),
             reuseReadyEvent(nullptr), reusePending(false),
             sourceFile(sourceFile == nullptr ? "<unknown>" : sourceFile),
-            sourceLine(sourceLine), requestedSize(size) {}
+            sourceLine(sourceLine), requestedSize(size),
+            metadata(metadata == nullptr ? CudaAllocationMetadata() : *metadata) {}
 };
 
 /** 更新池中Buffer当前使用者的源码位置。 */
 static void FastllmCudaSetBufferSource(CudaMemoryBuffer &buffer,
                                        const char *file, int line,
-                                       size_t requestedSize) {
+                                       size_t requestedSize,
+                                       const CudaAllocationMetadata *metadata) {
     buffer.sourceFile = file == nullptr ? "<unknown>" : file;
     buffer.sourceLine = line;
     buffer.requestedSize = requestedSize;
+    buffer.metadata = metadata == nullptr
+        ? CudaAllocationMetadata() : *metadata;
 }
 
 static bool FastllmCudaBufferReadyForReuseLocked(CudaMemoryBuffer &buffer) {
@@ -4626,8 +4643,29 @@ static void FastllmCudaPrintOomPoolStateLocked(
             small.pinnedBytes / 1048576.0, small.pinnedCount,
             small.pendingBytes / 1048576.0, small.pendingCount);
 
-    std::map<std::tuple<std::string, int, size_t, size_t>,
-             std::pair<size_t, int>> owners;
+    struct OwnerSummary {
+        size_t bytes = 0;
+        int count = 0;
+        const void *exampleOwner = nullptr;
+    };
+    auto describeMetadata = [](const CudaAllocationMetadata &metadata) {
+        if (metadata.owner == nullptr) {
+            return std::string("data=none");
+        }
+        std::string description = "dtype=" + fastllm::GetDataTypeName(
+            (fastllm::DataType)metadata.dataType) + " shape=[";
+        for (int i = 0; i < metadata.dimCount; i++) {
+            if (i > 0) {
+                description += ",";
+            }
+            description += std::to_string(metadata.dims[i]);
+        }
+        description += "] fake=" + std::to_string((int)metadata.isFake) +
+            " kv=" + std::to_string((int)metadata.isKVCache);
+        return description;
+    };
+    std::map<std::tuple<std::string, int, size_t, size_t, std::string>,
+             OwnerSummary> owners;
     auto collectOwners = [&](const std::vector<CudaMemoryBuffer> *buffers) {
         if (buffers == nullptr) {
             return;
@@ -4636,20 +4674,26 @@ static void FastllmCudaPrintOomPoolStateLocked(
             if (!buffer.busy) {
                 continue;
             }
-            auto &owner = owners[{std::string(buffer.sourceFile), buffer.sourceLine,
-                                  buffer.size, buffer.requestedSize}];
-            owner.first += buffer.size;
-            owner.second++;
+            auto &owner = owners[{std::string(buffer.sourceFile),
+                                  buffer.sourceLine, buffer.size,
+                                  buffer.requestedSize,
+                                  describeMetadata(buffer.metadata)}];
+            owner.bytes += buffer.size;
+            owner.count++;
+            if (owner.exampleOwner == nullptr) {
+                owner.exampleOwner = buffer.metadata.owner;
+            }
         }
     };
     collectOwners(bigBuffersPtr);
     collectOwners(smallBuffersPtr);
-    std::vector<std::pair<std::tuple<std::string, int, size_t, size_t>,
-                          std::pair<size_t, int>>> rankedOwners(
+    std::vector<std::pair<
+        std::tuple<std::string, int, size_t, size_t, std::string>,
+        OwnerSummary>> rankedOwners(
         owners.begin(), owners.end());
     std::sort(rankedOwners.begin(), rankedOwners.end(),
               [](const auto &left, const auto &right) {
-                  return left.second.first > right.second.first;
+                  return left.second.bytes > right.second.bytes;
               });
     const int ownerLimit = std::min(20, (int)rankedOwners.size());
     for (int i = 0; i < ownerLimit; i++) {
@@ -4657,11 +4701,14 @@ static void FastllmCudaPrintOomPoolStateLocked(
         const auto &value = rankedOwners[i].second;
         fprintf(stderr,
                 "[FASTLLM_CUDA_OOM] busy_owner rank=%d source=%s:%d "
-                "buffer_mb=%.2f requested_mb=%.2f total_mb=%.2f count=%d\n",
+                "buffer_mb=%.2f requested_mb=%.2f total_mb=%.2f count=%d "
+                "owner=%p %s\n",
                 i + 1, std::get<0>(key).c_str(), std::get<1>(key),
                 std::get<2>(key) / 1048576.0,
                 std::get<3>(key) / 1048576.0,
-                value.first / 1048576.0, value.second);
+                value.bytes / 1048576.0, value.count,
+                const_cast<void *>(value.exampleOwner),
+                std::get<4>(key).c_str());
     }
     fflush(stderr);
 }
@@ -4879,10 +4926,12 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
  * @param size        请求字节数。
  * @param sourceFile  发起分配的源码文件；未知时为nullptr。
  * @param sourceLine  发起分配的源码行号；未知时为0。
+ * @param metadata    可选Data元数据快照；函数返回前完成复制。
  * @return 成功时返回设备地址，失败时返回nullptr并设置CUDA错误状态。
  */
 static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
-                                   int sourceLine) {
+                                   int sourceLine,
+                                   const CudaAllocationMetadata *metadata) {
     sourceFile = sourceFile == nullptr ? "<unknown>" : sourceFile;
 
     int id = -1;
@@ -4914,7 +4963,7 @@ static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
         if (selId != -1) {
             bigBuffers[selId].busy = true;
             FastllmCudaSetBufferSource(
-                bigBuffers[selId], sourceFile, sourceLine, size);
+                bigBuffers[selId], sourceFile, sourceLine, size, metadata);
             FastllmCudaGraphPoolAfterAllocLocked(
                 bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4937,7 +4986,7 @@ static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
             if (selId != -1) {
                 bigBuffers[selId].busy = true;
                 FastllmCudaSetBufferSource(
-                    bigBuffers[selId], sourceFile, sourceLine, size);
+                    bigBuffers[selId], sourceFile, sourceLine, size, metadata);
                 FastllmCudaGraphPoolAfterAllocLocked(
                     bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4974,7 +5023,7 @@ static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
             return nullptr;
         }
         bigBuffers.push_back(CudaMemoryBuffer(
-            ret, size, true, sourceFile, sourceLine));
+            ret, size, true, sourceFile, sourceLine, metadata));
         FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(ret, size);
@@ -4990,7 +5039,7 @@ static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
                 cudaBuffers[i].data, captureIdentity)) {
             cudaBuffers[i].busy = true;
             FastllmCudaSetBufferSource(
-                cudaBuffers[i], sourceFile, sourceLine, size);
+                cudaBuffers[i], sourceFile, sourceLine, size, metadata);
             FastllmCudaGraphPoolAfterAllocLocked(
                 cudaBuffers[i].data, captureIdentity);
             *view.noBusy -= cudaBuffers[i].size;
@@ -5022,7 +5071,7 @@ static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
         if (selId != -1) {
             bigBuffers[selId].busy = true;
             FastllmCudaSetBufferSource(
-                bigBuffers[selId], sourceFile, sourceLine, size);
+                bigBuffers[selId], sourceFile, sourceLine, size, metadata);
             FastllmCudaGraphPoolAfterAllocLocked(
                 bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -5057,7 +5106,7 @@ static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
         return nullptr;
     }
     cudaBuffers.push_back(CudaMemoryBuffer(
-        ret, size, true, sourceFile, sourceLine));
+        ret, size, true, sourceFile, sourceLine, metadata));
     FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRecord(ret, size);
@@ -5067,12 +5116,47 @@ static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
 
 /** 使用未知调用位置执行兼容的CUDA池分配。 */
 void *FastllmCudaMalloc(size_t size) {
-    return FastllmCudaMallocImpl(size, nullptr, 0);
+    return FastllmCudaMallocImpl(size, nullptr, 0, nullptr);
 }
 
 /** 使用源码位置标记执行CUDA池分配，供OOM诊断归因。 */
 void *FastllmCudaMallocWithSource(size_t size, const char *file, int line) {
-    return FastllmCudaMallocImpl(size, file, line);
+    return FastllmCudaMallocImpl(size, file, line, nullptr);
+}
+
+/**
+ * 使用Data的紧凑元数据标记CUDA池分配。
+ *
+ * 仅复制owner地址、dtype、前四维形状和所有权标记；OOM报告不会解引用
+ * owner，因此Data析构后地址失效也不会造成访问越界。正常分配路径不构造
+ * 字符串，避免给模型热路径引入明显开销。
+ *
+ * @param size      请求字节数。
+ * @param owner     发起分配的Data地址，仅作为诊断标识。
+ * @param dataType  DataType枚举整数值。
+ * @param dims      逻辑形状数组，可为nullptr。
+ * @param dimCount  dims维数；报告最多保存前四维。
+ * @param isFake    Data是否为非拥有型视图。
+ * @param isKVCache Data是否为KV Cache。
+ * @param file      发起分配的源码文件。
+ * @param line      发起分配的源码行号。
+ * @return 成功时返回设备地址，失败时返回nullptr。
+ */
+void *FastllmCudaMallocWithDataTag(size_t size, const void *owner,
+                                   int dataType, const int *dims, int dimCount,
+                                   bool isFake, bool isKVCache,
+                                   const char *file, int line) {
+    CudaAllocationMetadata metadata;
+    metadata.owner = owner;
+    metadata.dataType = dataType;
+    metadata.dimCount = dims == nullptr
+        ? 0 : std::max(0, std::min(dimCount, 4));
+    for (int i = 0; i < metadata.dimCount; i++) {
+        metadata.dims[i] = dims[i];
+    }
+    metadata.isFake = isFake;
+    metadata.isKVCache = isKVCache;
+    return FastllmCudaMallocImpl(size, file, line, &metadata);
 }
 
 void FastllmCudaForceFree(void *ret) {

@@ -109,7 +109,13 @@ namespace fastllm {
             if (data.isModelWeight && !data.directMemory) {
                 return FastllmCudaMallocModelWeight(bytes, data.name);
             }
-            return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
+            if (data.directMemory) {
+                return FastllmCudaDirectMalloc(bytes);
+            }
+            return FastllmCudaMallocWithDataTag(
+                bytes, &data, (int)data.dataType, data.dims.data(),
+                (int)data.dims.size(), data.isFake, data.isKVCache,
+                __FILE__, __LINE__);
         }
 
         static bool CheckCudaMallocForData(const Data &data, void *&ptr,
