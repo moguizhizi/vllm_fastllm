@@ -438,6 +438,19 @@ def run_server(command, env, server_log, backend, base_url, prompts, args, mode)
             stop_process(process)
 
 
+def require_cache_hit(rows, backend):
+    """确认标记为cache_hit的用例确实复用了至少一个Prompt Token。"""
+    missed = [
+        row for row in rows
+        if row["scenario"] == "cache_hit" and
+        (row.get("cache_hit_ratio") is None or row["cache_hit_ratio"] <= 0)
+    ]
+    if missed:
+        cases = ", ".join(
+            f"{row['workload']}/batch-{row['batch']}" for row in missed)
+        raise RuntimeError(f"{backend}的cache_hit场景未实际命中Prefix Cache：{cases}")
+
+
 def run_fastllm(args, prompts, result_dir, mode):
     base_url = f"http://127.0.0.1:{args.port}"
     command = [
@@ -449,7 +462,7 @@ def run_fastllm(args, prompts, result_dir, mode):
         "--max-batch", str(max(decode_batch_cases(args))),
         "--kv-cache-layout", args.flm_kv_cache_layout,
         "--attention-backend", args.flm_attention_backend,
-        "--attention-backend-trace",
+        "--attention-backend-trace", "--enable-prefix-cache",
     ]
     if args.flm_attention_backend_strict:
         command.append("--attention-backend-strict")
@@ -472,6 +485,7 @@ def run_fastllm(args, prompts, result_dir, mode):
     server_log = result_dir / f"fastllm-{mode}-server.log"
     rows = run_server(
         command, env, server_log, "FastLLM", base_url, prompts, args, mode)
+    require_cache_hit(rows, "FastLLM")
     server_output = server_log.read_text(encoding="utf-8", errors="replace")
     actual_backends = actual_attention_backends(server_output)
     actual_layouts = actual_kv_cache_layouts(server_output)
@@ -518,9 +532,11 @@ def run_vllm(args, prompts, result_dir, mode):
     env = os.environ.copy()
     env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     env["VLLM_USE_FLASHINFER_MOE_FP4"] = "0"
-    return run_server(
+    rows = run_server(
         command, env, result_dir / f"vllm-{mode}-server.log", "vLLM",
         base_url, prompts, args, mode)
+    require_cache_hit(rows, "vLLM")
+    return rows
 
 
 def fmt_ms(value):
