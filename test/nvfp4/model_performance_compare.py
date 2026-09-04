@@ -526,6 +526,7 @@ def run_vllm(args, prompts, result_dir, mode):
         # 固定vLLM原生CUTLASS，避免auto选择FLASHINFER_CUTLASS触发运行时JIT。
         "--moe-backend", "cutlass",
         "--enable-prefix-caching", "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
     ]
     if mode == "eager":
         command.append("--enforce-eager")
