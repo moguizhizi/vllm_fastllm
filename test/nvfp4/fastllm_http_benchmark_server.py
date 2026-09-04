@@ -144,6 +144,15 @@ def make_handler(model):
                     if trace_cpu:
                         fetch_us += (time.perf_counter_ns() - stage_begin_ns) // 1000
                     if token <= -1:
+                        if generated == 0:
+                            write_sse(self, {
+                                "error": {
+                                    "message": (
+                                        "FastLLM在首Token前结束生成；请检查服务日志中的"
+                                        "[fastllm][paged-debug]首个失败阶段"),
+                                    "type": "fastllm_backend_error",
+                                },
+                            })
                         break
                     choice = {"index": 0, "token_ids": [token], "text": ""}
                     stage_begin_ns = time.perf_counter_ns() if trace_cpu else 0

@@ -514,6 +514,67 @@ static bool FastllmCudaEnvFlagEnabled(const char *name) {
            std::strcmp(v, "disable") != 0 && std::strcmp(v, "DISABLE") != 0;
 }
 
+bool FastllmCudaPagedDebugEnabled() {
+    static const bool enabled =
+        FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_PAGED_DEBUG");
+    return enabled;
+}
+
+/** 输出分页诊断中的单个张量描述，不读取张量内容。 */
+static void FastllmCudaPrintPagedDebugTensor(
+        const char *name, const fastllm::Data *data) {
+    if (data == nullptr) {
+        fprintf(stderr, "[fastllm][paged-debug] %s=null\n", name);
+        return;
+    }
+
+    std::string shape = "[";
+    for (size_t i = 0; i < data->dims.size(); i++) {
+        if (i > 0) {
+            shape += ",";
+        }
+        shape += std::to_string(data->dims[i]);
+    }
+    shape += "]";
+    int pointerDevice = data->cudaData == nullptr
+        ? -1 : GetPointerDeviceId(data->cudaData);
+    fprintf(stderr,
+            "[fastllm][paged-debug] %s dtype=%s shape=%s cuda=%p "
+            "pointer_device=%d data_device=%d unit=%d\n",
+            name, fastllm::GetDataTypeName(data->dataType).c_str(),
+            shape.c_str(), data->cudaData, pointerDevice,
+            (int)data->dataDevice, data->unitSize);
+}
+
+bool FastllmCudaPagedDebugSynchronize(
+        const char *stage, int layer, const fastllm::Data *first,
+        const fastllm::Data *second) {
+    if (!FastllmCudaPagedDebugEnabled()) {
+        return true;
+    }
+
+    int device = -1;
+    cudaGetDevice(&device);
+    cudaError_t pending = cudaPeekAtLastError();
+    cudaError_t synchronized = cudaDeviceSynchronize();
+    cudaError_t state = pending != cudaSuccess ? pending : synchronized;
+    if (state == cudaSuccess) {
+        return true;
+    }
+
+    FastllmCudaSetThreadError();
+    fprintf(stderr,
+            "[fastllm][paged-debug] FAILED stage=%s layer=%d device=%d "
+            "pending=%d(%s) synchronize=%d(%s)\n",
+            stage == nullptr ? "unknown" : stage, layer, device,
+            (int)pending, cudaGetErrorName(pending),
+            (int)synchronized, cudaGetErrorName(synchronized));
+    FastllmCudaPrintPagedDebugTensor("first", first);
+    FastllmCudaPrintPagedDebugTensor("second", second);
+    fflush(stderr);
+    return false;
+}
+
 bool FastllmCudaFlashInferSupported() {
     static thread_local std::map<int, bool> supportedByDevice;
     static thread_local std::map<int, bool> loggedByDevice;
@@ -5756,6 +5817,15 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     }
 
     state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
+    if (state != cudaSuccess && FastllmCudaPagedDebugEnabled()) {
+        int device = -1;
+        cudaGetDevice(&device);
+        fprintf(stderr,
+                "[fastllm][paged-debug] FAILED stage=device_to_device_copy "
+                "device=%d dst=%p src=%p bytes=%zu error=%d(%s)\n",
+                device, dst, src, size, (int)state, cudaGetErrorName(state));
+        fflush(stderr);
+    }
     checkCudaErrors("Error: CUDA error when copy on GPU!", state);
     //cudaDeviceSynchronize();
 }

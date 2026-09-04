@@ -333,6 +333,26 @@ bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
     void *const *dsts, const void *const *srcs, const size_t *sizes, int count);
 
+/** 返回是否启用分页Attention的CUDA阶段诊断。 */
+bool FastllmCudaPagedDebugEnabled();
+
+/**
+ * 同步检查分页Attention阶段，并在首次CUDA错误处输出张量上下文。
+ *
+ * 仅在FASTLLM_CUDA_PAGED_DEBUG非零时执行同步；默认路径直接返回，不改变
+ * 正式推理的异步边界。失败日志包含阶段、层号、设备以及两个相关张量的
+ * dtype、shape和CUDA地址，调用方应立即停止当前Attention Block。
+ *
+ * @param stage  当前分页执行阶段名称。
+ * @param layer  当前模型层号。
+ * @param first  第一相关张量，可为空。
+ * @param second 第二相关张量，可为空。
+ * @return true表示未启用诊断或同步成功；false表示发现CUDA错误。
+ */
+bool FastllmCudaPagedDebugSynchronize(
+    const char *stage, int layer, const fastllm::Data *first,
+    const fastllm::Data *second);
+
 void *FastllmCudaHostMalloc(size_t size);
 void FastllmCudaHostFree(void *ptr);
 bool FastllmCudaHostRegister(void *ptr, size_t size);

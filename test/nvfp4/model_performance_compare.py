@@ -263,6 +263,11 @@ def run_http_request(base_url, model_name, input_tokens, output_tokens,
         if data == "[DONE]":
             break
         chunk = json.loads(data)
+        if chunk.get("error"):
+            error = chunk["error"]
+            message = error.get("message", str(error)) if isinstance(
+                error, dict) else str(error)
+            raise RuntimeError(f"请求{request_id}后端执行失败：{message}")
         usage = chunk.get("usage") or usage
         choices = chunk.get("choices") or []
         if not choices:
@@ -423,7 +428,8 @@ def run_server(command, env, server_log, backend, base_url, prompts, args, mode)
         log_handle.write(f"COMMAND: {shlex.join(command)}\n\n")
         for name in sorted(name for name in env if name.startswith(
                 ("FASTLLM_CUDA_NVFP4", "FASTLLM_CUDA_GRAPH",
-                 "FASTLLM_CUDA_W8A8", "VLLM_USE_FLASHINFER"))):
+                 "FASTLLM_CUDA_W8A8", "FASTLLM_CUDA_PAGED_DEBUG",
+                 "VLLM_USE_FLASHINFER"))):
             log_handle.write(f"ENV: {name}={env[name]}\n")
         log_handle.write("\n")
         log_handle.flush()

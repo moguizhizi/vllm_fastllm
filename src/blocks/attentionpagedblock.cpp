@@ -1,6 +1,9 @@
 #include "baseblock.h"
 #include "basellm.h"
 #include "fastllm.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -56,6 +59,22 @@ namespace fastllm {
         bool externalDecodeMeta,
         bool attentionPagedBatchSync
     ) {
+        bool pagedDebugEnabled = false;
+#ifdef USE_CUDA
+        pagedDebugEnabled = attenInput->dataDevice == DataDevice::CUDA &&
+                            FastllmCudaPagedDebugEnabled();
+#endif
+        auto debugPagedStage = [&](const char *stage, const Data *first,
+                                   const Data *second) -> bool {
+#ifdef USE_CUDA
+            if (pagedDebugEnabled) {
+                return FastllmCudaPagedDebugSynchronize(
+                    stage, layerIdx, first, second);
+            }
+#endif
+            return true;
+        };
+
         // 1. Linear QKV projection
         bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
 
@@ -79,6 +98,9 @@ namespace fastllm {
             int qdim = per * (num_attention_heads / num_key_value_heads);
             RMSNormPart(*qkv, *preQNormWeight, rms_norm_eps, 0, qdim, *qkv);
             RMSNormPart(*qkv, *preKNormWeight, rms_norm_eps, qdim, qdim + per, *qkv);
+        }
+        if (!debugPagedStage("qkv_projection", attenInput, qkv)) {
+            return;
         }
 
         // 按request-major布局绑定当前层的K/V Cache描述符
@@ -178,6 +200,9 @@ namespace fastllm {
             k.Reshape({-1, seqlen, head_dim});
             v.Reshape({-1, seqlen, head_dim});
             q->Reshape({-1, seqlen, head_dim});
+            if (!debugPagedStage("prefill_qkv_prepare", q, &k)) {
+                return;
+            }
 
             // 2.6 逐 batch 做 AppendPagedCache
             // k/v 形状为 [num_kv_heads, totalSeqLen, head_dim]
@@ -204,7 +229,13 @@ namespace fastllm {
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                     cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                 AppendPagedCache(*pagedCacheKManager, *(*batchPastKeys)[0], k);
+                if (!debugPagedStage("prefill_append_k", (*batchPastKeys)[0], &k)) {
+                    return;
+                }
                 AppendPagedCache(*pagedCacheVManager, *(*batchPastValues)[0], v);
+                if (!debugPagedStage("prefill_append_v", (*batchPastValues)[0], &v)) {
+                    return;
+                }
             } else  {
                 int total = 0;
                 Data curK, curV;
@@ -224,7 +255,13 @@ namespace fastllm {
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                         cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                     AppendPagedCache(*pagedCacheKManager, pastKey, curK);
+                    if (!debugPagedStage("prefill_append_k", &pastKey, &curK)) {
+                        return;
+                    }
                     AppendPagedCache(*pagedCacheVManager, pastValue, curV);
+                    if (!debugPagedStage("prefill_append_v", &pastValue, &curV)) {
+                        return;
+                    }
 
                     total += seqLens[b];
                 }
@@ -240,12 +277,18 @@ namespace fastllm {
                 // 生成 PagedBatch 参数，传入 seqLens 使 qSizes 按各 batch 的 seqLen 前缀和生成
                 GeneratePagedBatchParams(qForAttention, *batchPastKeys, batch,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens, seqLens);
+                if (!debugPagedStage("prefill_metadata", qSizes, pageIndexs)) {
+                    return;
+                }
 
                 AttentionPagedBatch(qForAttention,
                     kCaches, vCaches,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
                     *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1,
                     layerIdx > 0, attentionPagedBatchSync);
+                if (!debugPagedStage("prefill_attention", &qForAttention, attenOutput)) {
+                    return;
+                }
             }
 
             // 2.8 AttentionPagedBatch 输出形状为 [seqlen, num_heads, head_dim]
@@ -291,6 +334,9 @@ namespace fastllm {
                 rotary_dim, rms_norm_eps, curRopeTheta, ropeScale,
                 curPageLen, batch, doQKNorm,
                 fillLastPageLensOnDevice ? lastPageLens : nullptr);
+            if (!debugPagedStage("decode_fused_append", q, (Data*)pagedCacheKManager)) {
+                return;
+            }
 
             // 7. 更新 pastKey/pastValue 的 pageIndex 和 lastPageLen
             if (!externalDecodeMeta) {
@@ -315,6 +361,9 @@ namespace fastllm {
                 GeneratePagedBatchParams(qForAttention, *batchPastKeys, batch, 
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens, {}, fillLastPageLensOnDevice);
                 *generatedDecodeParams = true;
+                if (!debugPagedStage("decode_metadata", qSizes, pageIndexs)) {
+                    return;
+                }
             }
             Data qForAttentionHolder;
             Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType, qForAttentionHolder);
@@ -323,6 +372,9 @@ namespace fastllm {
                 *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
                 *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1,
                 layerIdx > 0, attentionPagedBatchSync);
+            if (!debugPagedStage("decode_attention", &qForAttention, attenOutput)) {
+                return;
+            }
 
             // 9. Reshape + Permute
             attenOutput->Reshape({seqlen, bsz, -1});
