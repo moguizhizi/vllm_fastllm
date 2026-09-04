@@ -480,7 +480,7 @@ namespace fastllm {
         Data hiddenStates;
         Data attenInput;
         Data q, k, v, qkv;
-        Data attenWeights, attenOutput, curAttenOutput;
+        Data attenWeights, curAttenOutput;
         Data attenLastOutput;
         Data w1, w2, w3, curInput, curOutput;
         Data* sinDataPtr = &sinData;
@@ -543,6 +543,8 @@ namespace fastllm {
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            Data attenOutput(this->dataType);
+
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -711,7 +713,6 @@ namespace fastllm {
                     fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
                 }
 
-                attenOutput = Data(this->dataType);
                 int total = 0;
 
                 if (false) {
