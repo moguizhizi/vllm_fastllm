@@ -204,6 +204,11 @@ void FastllmCudaClearBigBuffer();
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
 #endif
 void *FastllmCudaMalloc(size_t size);
+void *FastllmCudaMallocWithSource(size_t size, const char *file, int line);
+#ifndef FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
+#define FastllmCudaMalloc(size) \
+    FastllmCudaMallocWithSource((size), __FILE__, __LINE__)
+#endif
 void FastllmCudaForceFree(void *ret);
 // Return a pooled allocation after all work already submitted to this host
 // thread's per-thread stream has completed. The allocation is detached from

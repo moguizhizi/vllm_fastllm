@@ -24,6 +24,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
@@ -3887,14 +3888,30 @@ struct CudaMemoryBuffer {
     int graphPins;
     cudaEvent_t reuseReadyEvent;
     bool reusePending;
+    const char *sourceFile;
+    int sourceLine;
+    size_t requestedSize;
 
     CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0),
-            reuseReadyEvent(nullptr), reusePending(false) {}
+            reuseReadyEvent(nullptr), reusePending(false),
+            sourceFile("<unknown>"), sourceLine(0), requestedSize(0) {}
 
-    CudaMemoryBuffer (void *data, size_t size, bool busy) :
+    CudaMemoryBuffer (void *data, size_t size, bool busy,
+                      const char *sourceFile = nullptr, int sourceLine = 0) :
             data(data), size(size), busy(busy), graphPins(0),
-            reuseReadyEvent(nullptr), reusePending(false) {}
+            reuseReadyEvent(nullptr), reusePending(false),
+            sourceFile(sourceFile == nullptr ? "<unknown>" : sourceFile),
+            sourceLine(sourceLine), requestedSize(size) {}
 };
+
+/** 更新池中Buffer当前使用者的源码位置。 */
+static void FastllmCudaSetBufferSource(CudaMemoryBuffer &buffer,
+                                       const char *file, int line,
+                                       size_t requestedSize) {
+    buffer.sourceFile = file == nullptr ? "<unknown>" : file;
+    buffer.sourceLine = line;
+    buffer.requestedSize = requestedSize;
+}
 
 static bool FastllmCudaBufferReadyForReuseLocked(CudaMemoryBuffer &buffer) {
     if (!buffer.reusePending) {
@@ -4608,6 +4625,44 @@ static void FastllmCudaPrintOomPoolStateLocked(
             small.freeBytes / 1048576.0, small.freeCount,
             small.pinnedBytes / 1048576.0, small.pinnedCount,
             small.pendingBytes / 1048576.0, small.pendingCount);
+
+    std::map<std::tuple<std::string, int, size_t, size_t>,
+             std::pair<size_t, int>> owners;
+    auto collectOwners = [&](const std::vector<CudaMemoryBuffer> *buffers) {
+        if (buffers == nullptr) {
+            return;
+        }
+        for (const auto &buffer : *buffers) {
+            if (!buffer.busy) {
+                continue;
+            }
+            auto &owner = owners[{std::string(buffer.sourceFile), buffer.sourceLine,
+                                  buffer.size, buffer.requestedSize}];
+            owner.first += buffer.size;
+            owner.second++;
+        }
+    };
+    collectOwners(bigBuffersPtr);
+    collectOwners(smallBuffersPtr);
+    std::vector<std::pair<std::tuple<std::string, int, size_t, size_t>,
+                          std::pair<size_t, int>>> rankedOwners(
+        owners.begin(), owners.end());
+    std::sort(rankedOwners.begin(), rankedOwners.end(),
+              [](const auto &left, const auto &right) {
+                  return left.second.first > right.second.first;
+              });
+    const int ownerLimit = std::min(20, (int)rankedOwners.size());
+    for (int i = 0; i < ownerLimit; i++) {
+        const auto &key = rankedOwners[i].first;
+        const auto &value = rankedOwners[i].second;
+        fprintf(stderr,
+                "[FASTLLM_CUDA_OOM] busy_owner rank=%d source=%s:%d "
+                "buffer_mb=%.2f requested_mb=%.2f total_mb=%.2f count=%d\n",
+                i + 1, std::get<0>(key).c_str(), std::get<1>(key),
+                std::get<2>(key) / 1048576.0,
+                std::get<3>(key) / 1048576.0,
+                value.first / 1048576.0, value.second);
+    }
     fflush(stderr);
 }
 
@@ -4818,7 +4873,18 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
-void * FastllmCudaMalloc(size_t size) {
+/**
+ * 从当前设备的CUDA内存池分配Buffer，并记录当前调用位置。
+ *
+ * @param size        请求字节数。
+ * @param sourceFile  发起分配的源码文件；未知时为nullptr。
+ * @param sourceLine  发起分配的源码行号；未知时为0。
+ * @return 成功时返回设备地址，失败时返回nullptr并设置CUDA错误状态。
+ */
+static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
+                                   int sourceLine) {
+    sourceFile = sourceFile == nullptr ? "<unknown>" : sourceFile;
+
     int id = -1;
     cudaError_t state = cudaSuccess;
     state = cudaGetDevice(&id);
@@ -4847,6 +4913,8 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (selId != -1) {
             bigBuffers[selId].busy = true;
+            FastllmCudaSetBufferSource(
+                bigBuffers[selId], sourceFile, sourceLine, size);
             FastllmCudaGraphPoolAfterAllocLocked(
                 bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4868,6 +4936,8 @@ void * FastllmCudaMalloc(size_t size) {
             }
             if (selId != -1) {
                 bigBuffers[selId].busy = true;
+                FastllmCudaSetBufferSource(
+                    bigBuffers[selId], sourceFile, sourceLine, size);
                 FastllmCudaGraphPoolAfterAllocLocked(
                     bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4885,8 +4955,10 @@ void * FastllmCudaMalloc(size_t size) {
             FastllmCudaSetThreadError();
             return nullptr;
         }
-        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
-        if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+        state = FastllmCudaCheckedMalloc(
+            &ret, size, sourceFile, sourceLine);
+        if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(
+                size, &ret, id, sourceFile, sourceLine)) {
             state = cudaSuccess;
         }
         if (cudaSuccess != state) {
@@ -4901,7 +4973,8 @@ void * FastllmCudaMalloc(size_t size) {
             checkCudaErrors("", state);
             return nullptr;
         }
-        bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+        bigBuffers.push_back(CudaMemoryBuffer(
+            ret, size, true, sourceFile, sourceLine));
         FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(ret, size);
@@ -4916,6 +4989,8 @@ void * FastllmCudaMalloc(size_t size) {
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
             cudaBuffers[i].busy = true;
+            FastllmCudaSetBufferSource(
+                cudaBuffers[i], sourceFile, sourceLine, size);
             FastllmCudaGraphPoolAfterAllocLocked(
                 cudaBuffers[i].data, captureIdentity);
             *view.noBusy -= cudaBuffers[i].size;
@@ -4946,6 +5021,8 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (selId != -1) {
             bigBuffers[selId].busy = true;
+            FastllmCudaSetBufferSource(
+                bigBuffers[selId], sourceFile, sourceLine, size);
             FastllmCudaGraphPoolAfterAllocLocked(
                 bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4962,8 +5039,9 @@ void * FastllmCudaMalloc(size_t size) {
         FastllmCudaSetThreadError();
         return nullptr;
     }
-    state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
-    if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+    state = FastllmCudaCheckedMalloc(&ret, size, sourceFile, sourceLine);
+    if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(
+            size, &ret, id, sourceFile, sourceLine)) {
         state = cudaSuccess;
     }
     if (cudaSuccess != state) {
@@ -4978,12 +5056,23 @@ void * FastllmCudaMalloc(size_t size) {
         checkCudaErrors("", state);
         return nullptr;
     }
-    cudaBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+    cudaBuffers.push_back(CudaMemoryBuffer(
+        ret, size, true, sourceFile, sourceLine));
     FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRecord(ret, size);
 #endif
     return ret;
+}
+
+/** 使用未知调用位置执行兼容的CUDA池分配。 */
+void *FastllmCudaMalloc(size_t size) {
+    return FastllmCudaMallocImpl(size, nullptr, 0);
+}
+
+/** 使用源码位置标记执行CUDA池分配，供OOM诊断归因。 */
+void *FastllmCudaMallocWithSource(size_t size, const char *file, int line) {
+    return FastllmCudaMallocImpl(size, file, line);
 }
 
 void FastllmCudaForceFree(void *ret) {
