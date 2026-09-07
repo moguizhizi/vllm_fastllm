@@ -1,4 +1,5 @@
 #include "fastllm-cuda.cuh"
+#include "utils/math.hpp"
 
 #include <cuda_runtime.h>
 
@@ -65,10 +66,6 @@ enum class FusionState : uint8_t {
 std::mutex stateMutex;
 std::map<std::pair<const fastllm::Data *, int>, BackendState> backendStates;
 std::map<std::pair<const fastllm::Data *, int>, FusionState> fusionStates;
-
-static int RoundUp(int value, int alignment) {
-    return (value + alignment - 1) / alignment * alignment;
-}
 
 static bool Enabled() {
     const char *value = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
@@ -256,8 +253,8 @@ static WeightCache *GetWeightCache(fastllm::Data &weight, int m, int n, int k,
     std::lock_guard<std::mutex> guard(cacheMutex);
     auto key = std::make_pair((const fastllm::Data *)&weight, device);
     WeightCache &cache = weightCaches[key];
-    const int paddedK = RoundUp(k, 32);
-    const int paddedN = RoundUp(n, 32);
+    const int paddedK = fastllm::round_to_next_multiple_of(k, 32);
+    const int paddedN = fastllm::round_to_next_multiple_of(n, 32);
 
     // N/K及已分配内容完全匹配时直接复用，不重复上传和重排权重。
     if (cache.sourceRows == n && cache.sourceColumns == k &&
