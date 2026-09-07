@@ -4765,12 +4765,47 @@ namespace {
         ScopedFirstDevice guard(device);
         LinearInt8W8A8State state; state.Init(params);
         if (params.GetInt("check")) { state.Check(); return {}; }
+
         for (int i = 0; i < warmup; ++i) state.Run();
-        ForceDeviceSync(); auto begin = Clock::now();
+        ForceDeviceSync();
+
+        cudaEvent_t begin = nullptr;
+        cudaEvent_t end = nullptr;
+        if (cudaEventCreate(&begin) != cudaSuccess ||
+            cudaEventCreate(&end) != cudaSuccess) {
+            if (begin != nullptr) cudaEventDestroy(begin);
+            if (end != nullptr) cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to create CUDA timing events");
+        }
+        if (cudaEventRecord(begin, 0) != cudaSuccess) {
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to record the start CUDA event");
+        }
+
         for (int i = 0; i < iters; ++i) state.Run();
-        ForceDeviceSync(); auto end = Clock::now();
+        if (cudaEventRecord(end, 0) != cudaSuccess ||
+            cudaEventSynchronize(end) != cudaSuccess) {
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to record or synchronize the end CUDA event");
+        }
+
+        float elapsedMs = 0.0f;
+        if (cudaEventElapsedTime(&elapsedMs, begin, end) != cudaSuccess) {
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to read CUDA event timing");
+        }
+        cudaEventDestroy(begin);
+        cudaEventDestroy(end);
+
         BenchmarkResult result;
-        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() / std::max(iters, 1);
+        result.avgMs = elapsedMs / std::max(iters, 1);
         result.bytesMoved = (double)state.batch * state.in * 2 +
             (double)state.out * state.in + state.out * sizeof(float) +
             (double)state.batch * state.out * 2;
