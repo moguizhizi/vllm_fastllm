@@ -31,6 +31,24 @@ class ChartSpec:
     reference: float = None
 
 
+def model_performance_chart_specs(workload):
+    """返回与模型性能工作负载语义一致的趋势图指标。"""
+    if workload == "prefill":
+        return (
+            ChartSpec("TTFT", "ttft_ms", "ms"),
+            ChartSpec("PREFILL THROUGHPUT", "prefill_tok_s", "tok/s"),
+            ChartSpec("E2EL", "e2el_ms", "ms"),
+        )
+    if workload == "decode":
+        return (
+            ChartSpec("TPOT", "tpot_ms", "ms"),
+            ChartSpec("ITL", "itl_ms", "ms"),
+            ChartSpec("OUTPUT THROUGHPUT", "output_tok_s", "tok/s"),
+            ChartSpec("E2EL", "e2el_ms", "ms"),
+        )
+    raise ValueError(f"未知模型性能工作负载：{workload}")
+
+
 # 报告标题只使用ASCII，内置5x7字模即可保证无第三方字体时仍能输出PNG。
 _FONT = {
     " ": ("00000",) * 7,

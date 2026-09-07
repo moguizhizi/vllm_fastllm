@@ -19,7 +19,7 @@ TEST_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TEST_DIR))
 
 from common.performance_report import (  # noqa: E402
-    ChartSpec, markdown_images, slugify, write_dashboard)
+    markdown_images, model_performance_chart_specs, slugify, write_dashboard)
 from common.attention_backend_report import (  # noqa: E402
     actual_attention_backends, actual_kv_cache_layouts,
     attention_backend_confirmed, kv_cache_layout_confirmed)
@@ -686,12 +686,6 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
             lines.append("")
     chart_paths = []
     image_dir = result_dir / "images"
-    chart_specs = (
-        ChartSpec("TTFT", "ttft_ms", "ms"),
-        ChartSpec("TPOT", "tpot_ms", "ms"),
-        ChartSpec("E2EL", "e2el_ms", "ms"),
-        ChartSpec("OUTPUT THROUGHPUT", "output_tok_s", "tok/s"),
-    )
     for mode in MODES:
         for scenario in SCENARIOS:
             workloads = sorted({
@@ -707,7 +701,8 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
                 filename = "model-performance-{}-{}-{}.png".format(
                     slugify(mode), slugify(scenario), slugify(workload))
                 chart_paths.append(write_dashboard(
-                    image_dir / filename, chart_rows, chart_specs,
+                    image_dir / filename, chart_rows,
+                    model_performance_chart_specs(workload),
                     f"{quantization.upper()} {mode} {scenario} {workload}"))
     lines.extend(markdown_images(chart_paths))
 

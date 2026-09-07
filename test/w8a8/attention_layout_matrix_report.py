@@ -12,7 +12,8 @@ REPO_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_DIR / "test"))
 sys.path.insert(0, str(REPO_DIR / "test" / "nvfp4"))
 
-from common.performance_report import ChartSpec, markdown_images, write_dashboard  # noqa: E402
+from common.performance_report import (  # noqa: E402
+    ChartSpec, markdown_images, model_performance_chart_specs, write_dashboard)
 from xlsx_report import write_xlsx  # noqa: E402
 
 
@@ -136,12 +137,6 @@ def create_charts(kind, result_dir, records):
     fastllm = [row for row in records if row["backend"] == "fastllm"]
     paths = []
     if kind == "model-performance":
-        specs = (
-            ChartSpec("TTFT", "ttft_ms", "ms"),
-            ChartSpec("TPOT", "tpot_ms", "ms"),
-            ChartSpec("E2EL", "e2el_ms", "ms"),
-            ChartSpec("OUTPUT THROUGHPUT", "output_tok_s", "tok/s"),
-        )
         groups = sorted({(row["mode"], row["scenario"], row["workload"])
                          for row in fastllm})
         for mode, scenario, workload in groups:
@@ -150,7 +145,8 @@ def create_charts(kind, result_dir, records):
                     (mode, scenario, workload)]
             name = f"model-layout-{mode}-{scenario}-{workload}.png"
             paths.append(write_dashboard(
-                image_dir / name, rows, specs,
+                image_dir / name, rows,
+                model_performance_chart_specs(workload),
                 f"FASTLLM LAYOUT {mode} {scenario} {workload}",
                 backend_field="series"))
     elif fastllm:
