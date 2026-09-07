@@ -170,10 +170,14 @@ NVFP4_VLLM_PYTHON=/path/to/vllm/python \
 
 整体模型对比由独立的`model_performance_compare.py`执行，不修改FastLLM原有
 `test/benchmark/prefill.py`和`decode.py`。脚本只用AutoTokenizer构造共享Token
-ID：Prefill默认4096个，Decode默认512个；FastLLM和vLLM均通过HTTP
+ID：统一使用 `--batch-sizes 1,2,4,8,16,32 --input-tokens 512 --output-tokens 64`。
+每个Batch只运行一组完整请求，两张Prefill/Decode图共享同一次测量数据。
+旧的Prefill/Decode专用输入、输出和Batch参数已删除。FastLLM和vLLM均通过HTTP
 `/v1/completions`直接消费Token ID并回传校验，不再次套用各自的Chat Template。
-两个框架分时加载模型，使用相同的多线程HTTP客户端、Greedy采样并忽略EOS，Decode
-默认覆盖batch=1/2/4/8/16/32。
+两个框架分时加载模型，使用相同的多线程HTTP客户端、Greedy采样并忽略EOS，
+默认覆盖并发请求数batch=1/2/4/8/16/32；实际GPU Batch由服务端调度决定。
+Prefill吞吐为总Prompt Token数除以批次开始至最后一个首Token到达的时间，
+包含缓存复用及排队、传输时间，不表示纯Prefill kernel吞吐。
 
 测试同时覆盖`eager/best`和`cold/cache_hit`四种组合。两个后端都启用Prefix
 Cache；Cold的warmup及5轮正式测试使用开头不同的Prompt，避免命中已有缓存，

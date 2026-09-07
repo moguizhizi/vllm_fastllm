@@ -153,10 +153,17 @@ W8A8_LOG_DIR="$PWD/test/w8a8/logs/sm120-model" \
 结果目录生成`model-performance-compare.{md,csv,json,xlsx}`。成功完成全部
 请求并得到完整对应记录的case标记为`PASS`；速度比不作为正确性判定。
 
+整体性能入口统一使用 `--batch-sizes 1,2,4,8,16,32 --input-tokens 512 --output-tokens 64`，
+删除旧的Prefill/Decode专用Batch、输入和输出参数。每个Batch只执行一组
+完整请求；Prefill图（TTFT、Prefill吞吐、E2EL）和Decode图（TPOT、ITL、
+Output吞吐、E2EL）共用测量结果。Prefill吞吐按总Prompt Token数除以
+批次开始至最后一个首Token到达的时间计算，包含缓存复用Token及排队、
+传输时间，不表示纯Prefill kernel吞吐。
+
 标准Llama需要横向比较KV布局和Paged Backend时，使用矩阵入口。它依次运行
 `continuous+auto`、`paged+native_paged+strict`和
 `paged+flashinfer_paged+strict`，每组仍完整覆盖Eager/Best、Cold/Cache Hit及
-decode batch=1/2/4/8/16/32。各组报告分别保存，同时在矩阵根目录生成合并的
+统一请求batch=1/2/4/8/16/32。各组报告分别保存，同时在矩阵根目录生成合并的
 `model-performance-attention-layout-matrix.{md,csv,json,xlsx}`和跨布局趋势图。
 
 ```bash

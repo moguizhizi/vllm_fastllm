@@ -671,9 +671,8 @@ run_model_performance() {
         --vllm-python "${vllm_python}" --fastllm-python "${vllm_python}" \
         --flm-dtype auto --flm-atype bfloat16 --flm-device cuda \
         "${attention_backend_args[@]}" \
-        --prefill-input-tokens 4096 --prefill-max-tokens 16 \
-        --decode-input-tokens 512 --decode-batch-sizes 1,2,4,8,16,32 \
-        --decode-max-tokens 64 --warmup 1 --repeats 5 \
+        --batch-sizes 1,2,4,8,16,32 --input-tokens 512 \
+        --output-tokens 64 --warmup 1 --repeats 5 \
         --max-model-len 8192 --gpu-memory-utilization 0.90
 }
 
@@ -694,9 +693,8 @@ run_model_performance_attention_layout_case() {
         --flm-kv-cache-layout "${layout}" \
         --flm-attention-backend "${backend}" \
         "${strict_args[@]}" \
-        --prefill-input-tokens 4096 --prefill-max-tokens 16 \
-        --decode-input-tokens 512 --decode-batch-sizes 1,2,4,8,16,32 \
-        --decode-max-tokens 64 --warmup 1 --repeats 5 \
+        --batch-sizes 1,2,4,8,16,32 --input-tokens 512 \
+        --output-tokens 64 --warmup 1 --repeats 5 \
         --max-model-len 8192 --gpu-memory-utilization 0.90
 }
 

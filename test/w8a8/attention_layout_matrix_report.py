@@ -59,6 +59,7 @@ def model_records(payload, layout, requested_backend):
                 "tpot_ms": metric_ms(row, "tpot_s"),
                 "itl_ms": metric_ms(row, "itl_s"),
                 "e2el_ms": metric_ms(row, "e2el_s"),
+                "prefill_tok_s": row.get("prefill_tok_s"),
                 "output_tok_s": row.get("output_tok_s"),
             })
     return records
@@ -137,12 +138,11 @@ def create_charts(kind, result_dir, records):
     fastllm = [row for row in records if row["backend"] == "fastllm"]
     paths = []
     if kind == "model-performance":
-        groups = sorted({(row["mode"], row["scenario"], row["workload"])
-                         for row in fastllm})
+        groups = sorted({(row["mode"], row["scenario"], view)
+                         for row in fastllm for view in ("prefill", "decode")})
         for mode, scenario, workload in groups:
             rows = [row for row in fastllm
-                    if (row["mode"], row["scenario"], row["workload"]) ==
-                    (mode, scenario, workload)]
+                    if (row["mode"], row["scenario"]) == (mode, scenario)]
             name = f"model-layout-{mode}-{scenario}-{workload}.png"
             paths.append(write_dashboard(
                 image_dir / name, rows,

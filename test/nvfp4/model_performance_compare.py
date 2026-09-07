@@ -45,14 +45,11 @@ def parse_args():
                         choices=("auto", "continuous", "paged"))
     parser.add_argument("--flm-attention-backend", default="auto")
     parser.add_argument("--flm-attention-backend-strict", action="store_true")
-    parser.add_argument("--prefill-input-tokens", type=int, default=4096)
-    parser.add_argument("--prefill-max-tokens", type=int, default=16)
-    parser.add_argument("--decode-input-tokens", type=int, default=512)
-    parser.add_argument("--decode-batch-size", type=int, default=32)
+    parser.add_argument("--input-tokens", type=int, default=512)
+    parser.add_argument("--output-tokens", type=int, default=64)
     parser.add_argument(
-        "--decode-batch-sizes", default="",
-        help="逗号分隔的decode batch矩阵；为空时使用--decode-batch-size")
-    parser.add_argument("--decode-max-tokens", type=int, default=64)
+        "--batch-sizes", default="1,2,4,8,16,32",
+        help="完整请求的并发数量矩阵；同一次测量生成Prefill和Decode图")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -70,12 +67,10 @@ def require_positive(name, value):
         raise ValueError(f"{name}必须大于0")
 
 
-def decode_batch_cases(args):
-    values = ([args.decode_batch_size] if not args.decode_batch_sizes else
-              [int(value.strip()) for value in args.decode_batch_sizes.split(",")
-               if value.strip()])
+def batch_cases(args):
+    values = [int(value.strip()) for value in args.batch_sizes.split(",")]
     if not values or any(value <= 0 for value in values):
-        raise ValueError("decode batch必须是正整数")
+        raise ValueError("batch-sizes必须是逗号分隔的正整数")
     return list(dict.fromkeys(values))
 
 
@@ -118,9 +113,8 @@ def render_prompt_tokens(tokenizer, target_tokens, label):
 
 def case_specs(args):
     return [
-        ("prefill", 1, args.prefill_input_tokens, args.prefill_max_tokens),
-        *[("decode", batch, args.decode_input_tokens, args.decode_max_tokens)
-          for batch in decode_batch_cases(args)],
+        ("request", batch, args.input_tokens, args.output_tokens)
+        for batch in batch_cases(args)
     ]
 
 
@@ -203,6 +197,12 @@ def summarize_requests(backend, mode, scenario, workload, batch, input_tokens,
     total_prompt_tokens = len(input_tokens) * batch
     wall = batch_end - batch_start
     ttft_avg = mean_or_none(ttfts)
+    # 客户端观测的有效Prompt吞吐，包括排队、缓存恢复和首Token返回。
+    # Cache Hit时计入复用Token，不能解释为实际Prefill kernel计算吞吐。
+    first_tokens = [item["token_times"][0] for item in requests_data
+                    if item["token_times"]]
+    prefill_wall = (max(first_tokens) - batch_start
+                    if len(first_tokens) == batch else None)
     return {
         "mode": mode,
         "scenario": scenario,
@@ -223,8 +223,8 @@ def summarize_requests(backend, mode, scenario, workload, batch, input_tokens,
         "e2el_s": mean_or_none(e2els),
         "wall_s": wall,
         "prefill_tok_s": (
-            len(input_tokens) / ttft_avg
-            if batch == 1 and ttft_avg and ttft_avg > 0 else None),
+            total_prompt_tokens / prefill_wall
+            if prefill_wall and prefill_wall > 0 else None),
         "output_tok_s": total_output_tokens / wall if wall > 0 else 0.0,
         "requests": requests_data,
     }
@@ -465,7 +465,7 @@ def run_fastllm(args, prompts, result_dir, mode):
         "--model", args.model, "--host", "127.0.0.1",
         "--port", str(args.port), "--dtype", args.flm_dtype,
         "--atype", args.flm_atype, "--device", args.flm_device,
-        "--max-batch", str(max(decode_batch_cases(args))),
+        "--max-batch", str(max(batch_cases(args))),
         "--kv-cache-layout", args.flm_kv_cache_layout,
         "--attention-backend", args.flm_attention_backend,
         "--attention-backend-trace", "--enable-prefix-cache",
@@ -525,7 +525,7 @@ def run_vllm(args, prompts, result_dir, mode):
         "--model", args.model, "--served-model-name", "nvfp4-performance",
         "--host", "127.0.0.1", "--port", str(args.port),
         "--dtype", "auto", "--max-model-len", str(args.max_model_len),
-        "--max-num-seqs", str(max(decode_batch_cases(args))),
+        "--max-num-seqs", str(max(batch_cases(args))),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--trust-remote-code", "--linear-backend", "cutlass",
         # Dense Linear与NVFP4 MoE分别受linear_backend和moe_backend控制。
@@ -571,9 +571,7 @@ def ordered_results(fastllm_results, vllm_results, mode, scenario):
 
     fastllm_map = select(fastllm_results)
     vllm_map = select(vllm_results)
-    keys = [("prefill", 1)] + [
-        ("decode", item["batch"]) for item in fastllm_map.values()
-        if item["workload"] == "decode"]
+    keys = list(dict.fromkeys([*fastllm_map, *vllm_map]))
     rows = []
     for key in keys:
         if key not in fastllm_map or key not in vllm_map:
@@ -587,6 +585,9 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
         f"# {quantization.upper()}严格整体性能对比", "",
         "> 两个后端通过HTTP `/v1/completions`接收同一组Token ID；忽略EOS；",
         "> 每个Case测试5轮并取中位数。Cold与Cache Hit分别统计。", "",
+        "> 每个Batch运行一组完整请求；Prefill/Decode两张图共享测量数据。",
+        "> Prefill吞吐为总Prompt Token数/从批次开始到最后一个首Token到达的时间，",
+        "> 包含缓存复用Token、排队及传输时间，不代表纯Prefill计算吞吐。", "",
     ]
     csv_rows = []
     comparison_rows = []
@@ -688,15 +689,10 @@ def make_report(result_dir, fastllm_results, vllm_results, quantization):
     image_dir = result_dir / "images"
     for mode in MODES:
         for scenario in SCENARIOS:
-            workloads = sorted({
-                row["workload"] for row in csv_rows
-                if row["mode"] == mode and row["scenario"] == scenario
-            })
-            for workload in workloads:
+            for workload in ("prefill", "decode"):
                 chart_rows = [
                     row for row in csv_rows
-                    if row["mode"] == mode and row["scenario"] == scenario and
-                    row["workload"] == workload
+                    if row["mode"] == mode and row["scenario"] == scenario
                 ]
                 filename = "model-performance-{}-{}-{}.png".format(
                     slugify(mode), slugify(scenario), slugify(workload))
@@ -755,10 +751,9 @@ def orchestrate(args):
 
 def main():
     args = parse_args()
-    require_positive("prefill-input-tokens", args.prefill_input_tokens)
-    require_positive("prefill-max-tokens", args.prefill_max_tokens)
-    require_positive("decode-input-tokens", args.decode_input_tokens)
-    require_positive("decode-max-tokens", args.decode_max_tokens)
+    require_positive("input-tokens", args.input_tokens)
+    require_positive("output-tokens", args.output_tokens)
+    batch_cases(args)
     require_positive("repeats", args.repeats)
     if args.warmup < 0:
         raise ValueError("warmup不能小于0")

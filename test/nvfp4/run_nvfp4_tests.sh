@@ -329,9 +329,8 @@ run_model() {
         --model "${model_path}" \
         --result-dir "${log_dir}/model-performance-results" \
         "${attention_backend_args[@]}" \
-        --prefill-input-tokens 4096 --prefill-max-tokens 16 \
-        --decode-batch-sizes 1,2,4,8,16,32 --decode-input-tokens 512 \
-        --decode-max-tokens 64 --warmup 1 --repeats 5
+        --batch-sizes 1,2,4,8,16,32 --input-tokens 512 \
+        --output-tokens 64 --warmup 1 --repeats 5
 }
 
 run_swiglu_versions() {
