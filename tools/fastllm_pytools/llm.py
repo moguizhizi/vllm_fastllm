@@ -590,6 +590,16 @@ def set_attention_backend_strict(strict: bool):
 def set_attention_backend_trace(trace: bool):
     fastllm_lib.set_attention_backend_trace(ctypes.c_bool(trace))
 
+def set_linear_backend(backend: str):
+    """在加载模型前选择权重量化Linear后端；显式machete不允许静默回退。"""
+    if backend not in ("native", "machete", "auto"):
+        raise ValueError("linear backend must be native, machete or auto")
+    os.environ["FASTLLM_LINEAR_BACKEND"] = backend
+
+def set_linear_backend_trace(trace: bool):
+    """控制一次性路径及scale舍入日志；测速前应关闭。"""
+    os.environ["FASTLLM_LINEAR_BACKEND_TRACE"] = "1" if trace else "0"
+
 def set_gpu_mem_ratio(ratio):
     fastllm_lib.set_gpu_mem_ratio(ctypes.c_float(ratio));
 

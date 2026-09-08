@@ -5169,6 +5169,9 @@ namespace fastllm {
         std::string dataTypeInfo = " input.dataType = " + GetDataTypeName(input.dataType) +
                                    ", weight.dataType = " + GetDataTypeName(weight.dataType) +
                                    ", bias.dataType = " + GetDataTypeName(bias.dataType) + ".";
+        // Machete先于旧类型表检查，以支持原生尚未覆盖的BF16+INT8等组合。
+        // 非W4A16/W8A16权重不参与选择；native保持旧分发流程不变。
+        if (FastllmCudaTryMacheteLinear(input, weight, bias, output)) return;
         if (!IsCudaLinearDataTypeSupported(input.dataType, weight.dataType, bias.dataType)) {
             ErrorInFastLLM("Linear error: unsupported dataType combination." + dataTypeInfo);
         }

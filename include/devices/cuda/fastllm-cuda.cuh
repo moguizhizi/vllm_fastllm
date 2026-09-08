@@ -3,6 +3,25 @@
 
 #include "fastllm.h"
 
+// native/machete/auto策略由FASTLLM_LINEAR_BACKEND指定，默认native。
+#ifdef USE_ROCM
+#include <cstdlib>
+#include <stdexcept>
+inline bool FastllmCudaTryMacheteLinear(const fastllm::Data&, fastllm::Data&,
+                                      const fastllm::Data&, fastllm::Data&) {
+    const char *policy = std::getenv("FASTLLM_LINEAR_BACKEND");
+    if (policy && std::string(policy) == "machete") {
+        throw std::runtime_error("Machete requires NVIDIA Hopper, not ROCm");
+    }
+    return false;
+}
+inline void FastllmCudaReleaseMacheteCache(const fastllm::Data*) {}
+#else
+bool FastllmCudaTryMacheteLinear(const fastllm::Data &input, fastllm::Data &weight,
+                               const fastllm::Data &bias, fastllm::Data &output);
+void FastllmCudaReleaseMacheteCache(const fastllm::Data *weight);
+#endif
+
 // Device-resident request/chunk offsets shared by the ragged GDN frontend,
 // recurrent kernels, and output layout conversion.  The backing storage is
 // owned by a per-worker CUDA cache; callers must only retain this view until

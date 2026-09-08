@@ -1109,6 +1109,7 @@ namespace fastllm {
         FastllmCudaReleaseNvfp4W4A4Cache(this);
         FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -1140,6 +1141,7 @@ namespace fastllm {
             FastllmCudaReleaseNvfp4W4A4Cache(this);
             FastllmCudaReleaseFp8W8A8BackendState(this);
             FastllmCudaReleaseNvfp4MarlinCache(this);
+            FastllmCudaReleaseMacheteCache(this);
         }
         if (this != &ori && !this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
@@ -1169,6 +1171,18 @@ namespace fastllm {
         this->tpSplitUnit = ori.tpSplitUnit;
         this->nvfp4GroupScales = ori.nvfp4GroupScales;
         this->nvfp4GlobalScale = ori.nvfp4GlobalScale;
+        // W4A16/W8A16的深拷贝必须保留量化语义，但不复制任何设备预打包缓存。
+        if (ori.dataType == DataType::INT8 || ori.dataType == DataType::INT4_GROUP ||
+            ori.dataType == DataType::INT4_NOZERO) {
+            this->group = ori.group;
+            this->groupCnt = ori.groupCnt;
+            this->perChannelAxis = ori.perChannelAxis;
+            this->scales = ori.scales;
+            this->mins = ori.mins;
+            this->zeros = ori.zeros;
+            this->perChannelsConfigs = ori.perChannelsConfigs;
+            this->halfScales = ori.halfScales;
+        }
         if (ori.dataType == DataType::INT4_W4A8) {
             this->group = ori.group;
             this->groupCnt = ori.groupCnt;
@@ -2262,6 +2276,7 @@ namespace fastllm {
         FastllmCudaReleaseNvfp4W4A4Cache(this);
         FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2518,6 +2533,7 @@ namespace fastllm {
         FastllmCudaReleaseNvfp4W4A4Cache(this);
         FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2927,6 +2943,7 @@ namespace fastllm {
                 FastllmCudaReleaseNvfp4W4A4Cache(this);
                 FastllmCudaReleaseFp8W8A8BackendState(this);
                 FastllmCudaReleaseNvfp4MarlinCache(this);
+                FastllmCudaReleaseMacheteCache(this);
                 if (!this->RestoreCudaDataForRepackedWeight(destDevice)) {
                     ErrorInFastLLM(
                         "ToDevice Error: cannot restore NVFP4 weight directly "
@@ -2956,6 +2973,7 @@ namespace fastllm {
         FastllmCudaReleaseNvfp4W4A4Cache(this);
         FastllmCudaReleaseFp8W8A8BackendState(this);
         FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }

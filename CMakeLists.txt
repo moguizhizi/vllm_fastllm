@@ -453,11 +453,29 @@ if (USE_CUDA)
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
+        src/devices/cuda/linear/fastllm-linear-machete.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
+
+    option(FASTLLM_ENABLE_MACHETE_BUILD "Build Hopper Machete W4A16/W8A16 backend" ON)
+    if(FASTLLM_ENABLE_MACHETE_BUILD AND FASTLLM_CUTLASS_W4A8_ENABLED)
+        # 独立目标强制90a，不能仅设置无效的逐源文件CUDA_ARCHITECTURES属性。
+        add_library(fastllm_machete_kernels OBJECT
+            src/devices/cuda/linear/machete/fastllm-machete-kernel.cu)
+        set_target_properties(fastllm_machete_kernels PROPERTIES
+            CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(fastllm_machete_kernels PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+        add_compile_definitions(FASTLLM_ENABLE_MACHETE)
+        list(APPEND FASTLLM_CUDA_SOURCES $<TARGET_OBJECTS:fastllm_machete_kernels>)
+        message(STATUS "Machete W4A16/W8A16: ON (sm_90a; runtime opt-in)")
+    else()
+        message(STATUS "Machete W4A16/W8A16: OFF")
+    endif()
 
     if(FASTLLM_CUTLASS_W4A8_ENABLED)
         include_directories(src)
@@ -720,6 +738,9 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(macheteLinearTest test/ops/macheteLinearTest.cpp)
+        target_link_libraries(macheteLinearTest fastllm)
+        target_include_directories(macheteLinearTest PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

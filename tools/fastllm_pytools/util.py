@@ -484,6 +484,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = '支持双KV布局模型的Cache布局；auto保留模型默认布局')
     parser.add_argument('--attention-backend', type = str, default = "auto",
                         help = 'Attention实现，可使用auto、legacy_contiguous、native_paged或flashinfer_paged')
+    parser.add_argument('--linear-backend', choices=('native', 'machete', 'auto'),
+                        default=os.environ.get('FASTLLM_LINEAR_BACKEND', 'native'),
+                        help='W4A16/W8A16 Linear后端；machete严格拒绝不支持的组合')
+    parser.add_argument('--linear-backend-trace', action='store_true',
+                        default=os.environ.get('FASTLLM_LINEAR_BACKEND_TRACE') == '1',
+                        help='记录Linear路径及scale/offset舍入误差，测速前关闭')
     parser.add_argument('--attention-backend-strict', action = 'store_true',
                         help = '指定Attention Backend不兼容时直接失败，禁止fallback')
     parser.add_argument('--attention-backend-trace', action = 'store_true',
@@ -1017,6 +1023,8 @@ def make_normal_llm_model(args, startup_progress = None):
     llm.set_attention_backend(args.attention_backend)
     llm.set_attention_backend_strict(args.attention_backend_strict)
     llm.set_attention_backend_trace(args.attention_backend_trace)
+    llm.set_linear_backend(getattr(args, 'linear_backend', os.environ.get('FASTLLM_LINEAR_BACKEND', 'native')))
+    llm.set_linear_backend_trace(getattr(args, 'linear_backend_trace', os.environ.get('FASTLLM_LINEAR_BACKEND_TRACE') == '1'))
     apply_prefix_cache_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
