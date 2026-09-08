@@ -3029,6 +3029,52 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
 } // namespace
 #endif
 
+/**
+ * 使用分页KV Cache执行批量因果注意力，并管理FlashInfer执行计划的复用。
+ *
+ * 每个请求执行output = softmax(scale * Q * K^T + causal_mask) * V，
+ * group个Q头共享一组K/V头。本函数只读取已写入的KV页，不负责追加或分配KV页。
+ * FlashInfer不可用时调用FastLLM原生实现；滑动窗口不允许走该回退路径。
+ * FlashInfer路径为prefill和decode共用分页prefill接口，按设备、形状及元数据
+ * 缓存计划；CUDA Graph捕获前须准备计划，满足条件的decode计划在GPU上更新。
+ * 执行使用cudaStreamPerThread；sync控制末尾DeviceSync，但计划准备及首次
+ * 动态计划验证仍可能同步，不能将sync=false理解为整个函数绝不阻塞。
+ *
+ * 令B为请求数、T为所有请求的Query token总数、Hq=group*Hkv、D为头维度。
+ * FlashInfer按q.strides[1]索引token、q.strides[0]索引头，典型Q布局为
+ * [Hq, T, D]。调用方也存在第一维合并batch与头数的形状；入口对q.dims[0]
+ * 仅作Hq整除检查，不是完整布局验证，调用方必须保证stride与qSizes一致。
+ * 请求边界来自qSizes，而非q.dims[0]/Hq。物理KV页布局为
+ * [页容量, pageLen, Hkv, D]；FlashInfer当前要求Q/K/V头维度相等。
+ *
+ * @param q                   GPU上的FP16/BF16 Query，逻辑为T个token、Hq个头；
+ *                            使用上述token/头stride，数据在执行完成前须有效。
+ * @param kCaches             K缓存描述，dims[0]为Hkv；pagedKVCacheData指向
+ *                            所有请求共用的物理页池，类型为q类型或FP8_E4M3。
+ * @param vCaches             V缓存描述，dims[2]为V头维度；物理页布局及类型须
+ *                            与K兼容，页索引与K共用。
+ * @param qSizes              INT32请求Query长度前缀和[B+1]，首项0、末项T；
+ *                            GPU数据用于执行，cpuIntDatas用于计划构造。
+ * @param pageSizes           INT32请求KV页数前缀和[B+1]，首项0；GPU数据与
+ *                            cpuIntDatas须符合当前执行计划及Graph更新约定。
+ * @param pageIndexs          GPU INT32物理页号数组，按pageSizes分段索引。
+ * @param lastPageLens        GPU INT32数组[B]，记录各请求最后一页有效token数。
+ * @param output              已分配GPU输出，类型与q一致；FlashInfer写入
+ *                            token优先的[T, Hq, D]结果，并交换原shape前两维。
+ * @param group               正整数Hq/Hkv，表示每组KV头共享的Q头数。
+ * @param scale               QK分数缩放系数，通常为1/sqrt(D)。
+ * @param attentionType       保留的接口参数，当前函数体不使用；仍执行因果注意力。
+ * @param inited              保留的接口参数，当前函数体不使用；计划按缓存键复用。
+ * @param sync                true时在返回前执行DeviceSync。
+ * @param enableCudaGraph     调用方是否启用CUDA Graph，参与动态decode计划选择。
+ * @param flashInferCudaGraph 小于0时跟随enableCudaGraph，0关闭FlashInfer
+ *                            Graph计划，非0启用；捕获期间不允许计划缓存缺失。
+ * @param windowLeft          小于0表示不限制左窗口；非负时限制左侧可见范围，
+ *                            该功能要求FlashInfer可用。
+ * @return true表示执行提交成功并完成所要求的同步，false表示显式校验失败或
+ *         原生实现返回失败，原因见日志。部分非法输入及FlashInfer执行错误
+ *         仍会打印日志后exit(0)，窗口回退限制通过断言报错，并非统一返回false。
+ */
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph, int windowLeft) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     fastllm::AssertInFastLLM(windowLeft < 0,
