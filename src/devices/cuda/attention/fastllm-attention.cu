@@ -3125,8 +3125,12 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
  *                            所有请求共用的物理页池，类型为q类型或FP8_E4M3。
  * @param vCaches             V缓存描述，dims[2]为V头维度；物理页布局及类型须
  *                            与K兼容，页索引与K共用。
- * @param qSizes              INT32请求Query长度前缀和[B+1]，首项0、末项T；
- *                            GPU数据用于执行，cpuIntDatas用于计划构造。
+ * @param qSizes              INT32数组，记录每个请求的Query token在合并输入中的
+ *                            起止位置。例如3个请求本次分别输入3、2、1个token，
+ *                            数组就是[0, 3, 5, 6]，相邻两项表示一个请求的起点
+ *                            和终点（不含终点）。数组长度为请求数+1，最后一项
+ *                            为总token数。GPU读取cudaData来区分各请求；CPU读取
+ *                            cpuIntDatas来安排这些请求的计算任务。
  * @param pageSizes           INT32请求KV页数前缀和[B+1]，首项0；GPU数据与
  *                            cpuIntDatas须符合当前执行计划及Graph更新约定。
  * @param pageIndexs          GPU INT32物理页号数组，按pageSizes分段索引。
