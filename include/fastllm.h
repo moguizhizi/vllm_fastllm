@@ -765,7 +765,7 @@ namespace fastllm {
             // 类型
             PagedCacheManagerType type;
 
-            // 页长
+            // 每页最多存储的 token 数
             int pageLen;
 
             // 最大页数
