@@ -480,13 +480,19 @@ def run_fastllm(args, prompts, result_dir, mode):
         env["FASTLLM_CUDA_NVFP4_W4A4_STRICT"] = "1"
         env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
         env["FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT"] = "1"
-    else:
+    elif args.quantization == "w8a8":
         env.pop("FASTLLM_CUDA_NVFP4_W4A4", None)
         env.pop("FASTLLM_CUDA_NVFP4_W4A4_STRICT", None)
         env.pop("FASTLLM_CUDA_MOE_NVFP4_W4A4", None)
         env.pop("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT", None)
         env["FASTLLM_CUDA_W8A8"] = "1"
         env["FASTLLM_CUDA_W8A8_STRICT"] = "1"
+    elif args.quantization == "a16":
+        # 供W4A16/W8A16原生/Machete矩阵复用正式HTTP测量流程。
+        for key in ("FASTLLM_CUDA_NVFP4_W4A4", "FASTLLM_CUDA_NVFP4_W4A4_STRICT",
+                    "FASTLLM_CUDA_MOE_NVFP4_W4A4", "FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT",
+                    "FASTLLM_CUDA_W8A8", "FASTLLM_CUDA_W8A8_STRICT"):
+            env.pop(key, None)
     env["FASTLLM_CUDA_GRAPH"] = "0" if mode == "eager" else "1"
     server_log = result_dir / f"fastllm-{mode}-server.log"
     rows = run_server(

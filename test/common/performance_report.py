@@ -10,6 +10,8 @@ import zlib
 
 
 BACKEND_COLORS = {
+    "native": (68, 114, 196),
+    "machete": (237, 125, 49),
     "fastllm": (68, 114, 196),
     "vllm": (237, 125, 49),
     "ratio": (112, 48, 160),

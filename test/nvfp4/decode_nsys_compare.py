@@ -56,7 +56,7 @@ def parse_args():
         description="按Batch对比FastLLM/vLLM稳定Decode阶段的Nsight Systems数据")
     parser.add_argument("--model", required=True)
     parser.add_argument("--result-dir", required=True)
-    parser.add_argument("--quantization", choices=("nvfp4", "w8a8"),
+    parser.add_argument("--quantization", choices=("nvfp4", "w8a8", "a16"),
                         default="w8a8")
     parser.add_argument("--backends", default="fastllm,vllm",
                         help="逗号分隔：fastllm,vllm")
@@ -188,11 +188,16 @@ def server_spec(args, backend, max_batch):
         if args.quantization == "w8a8":
             env["FASTLLM_CUDA_W8A8"] = "1"
             env["FASTLLM_CUDA_W8A8_STRICT"] = "1"
-        else:
+        elif args.quantization == "nvfp4":
             env["FASTLLM_CUDA_NVFP4_W4A4"] = "1"
             env["FASTLLM_CUDA_NVFP4_W4A4_STRICT"] = "1"
             env["FASTLLM_CUDA_MOE_NVFP4_W4A4"] = "1"
             env["FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT"] = "1"
+        elif args.quantization == "a16":
+            for key in ("FASTLLM_CUDA_NVFP4_W4A4", "FASTLLM_CUDA_NVFP4_W4A4_STRICT",
+                        "FASTLLM_CUDA_MOE_NVFP4_W4A4", "FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT",
+                        "FASTLLM_CUDA_W8A8", "FASTLLM_CUDA_W8A8_STRICT"):
+                env.pop(key, None)
         return command, env, "nvfp4-performance"
 
     command = [
@@ -1881,6 +1886,8 @@ def main():
     args = parse_args()
     batches = parse_positive_csv(args.batch_sizes, "batch-sizes")
     backends = selected_backends(args.backends)
+    if args.quantization == "a16" and "vllm" in backends:
+        raise ValueError("a16用于FastLLM native/Machete矩阵，请指定--backends fastllm")
     for name in ("prompt_tokens", "output_tokens", "warmup_output_tokens",
                  "max_model_len", "startup_timeout", "request_timeout"):
         if getattr(args, name) <= 0:
