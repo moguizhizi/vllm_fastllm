@@ -5820,93 +5820,106 @@ namespace fastllm {
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
 
-        // 尝试将 triePages 中已不在 Trie 中的 stale 条目迁移到 freePages
-        while (this->freePages.empty() && !this->triePages.empty()) {
-            int candidate = this->triePages.back();
-            auto it = this->pageToTrieNode.find(candidate);
-            if (it == this->pageToTrieNode.end()) {
-                // 页面已不在 Trie 中，迁移到 freePages
-                this->triePages.pop_back();
-                this->triePagesSet.erase(candidate);
-                this->freePages.push_back(candidate);
-                this->freePagesSet.insert(candidate);
-            } else {
-                break;
-            }
-        }
-
+        // 两个列表都没有可用页时，直接报错。
         if (this->freePages.empty() && this->triePages.empty()) {
             ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
         }
 
-        int pageIndex;
+        // 优先使用已有空闲页；pick=false 时只查看，不领走。
         if (!this->freePages.empty()) {
-            pageIndex = this->freePages.back();
+            int pageIndex = this->freePages.back();
             if (pick) {
                 this->freePages.pop_back();
                 this->freePagesSet.erase(pageIndex);
                 this->pageRefCount[pageIndex] = 1;
             }
-        } else {
-            if (!pick) {
-                pageIndex = this->triePages.back();
-                return pageIndex;
-            }
+            return pageIndex;
+        }
 
-            // pick 模式：从 triePages 中淘汰，优先选叶子节点
-            pageIndex = -1;
-            for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
-                int candidate = this->triePages[i];
-                auto it = this->pageToTrieNode.find(candidate);
-                if (it == this->pageToTrieNode.end()) {
-                    // stale 条目：页面已不在 Trie 中，直接用
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    break;
-                }
-                if (it->second->children.empty()) {
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
-                    break;
-                }
+        // freePages 已为空：只检查 triePages 末尾，最多迁移一个失效页。
+        // 末尾仍有树记录就不迁移，不在这里扫描整个列表。
+        if (!this->triePages.empty()) {
+            int candidate = this->triePages.back();
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end()) {
+                this->triePages.pop_back();
+                this->triePagesSet.erase(candidate);
+                this->freePages.push_back(candidate);
+                this->freePagesSet.insert(candidate);
             }
+        }
 
-            if (pageIndex == -1) {
-                // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
-                pageIndex = this->triePages.back();
+        // 如果迁移得到空闲页，就使用该页。
+        if (!this->freePages.empty()) {
+            int pageIndex = this->freePages.back();
+            if (pick) {
+                this->freePages.pop_back();
+                this->freePagesSet.erase(pageIndex);
+                this->pageRefCount[pageIndex] = 1;
+            }
+            return pageIndex;
+        }
+
+        // 仍无空闲页，沿用原来的前缀缓存选页和清理逻辑。
+        int pageIndex;
+        if (!pick) {
+            pageIndex = this->triePages.back();
+            return pageIndex;
+        }
+
+        // pick 模式：从 triePages 中淘汰，优先选叶子节点
+        pageIndex = -1;
+        for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
+            int candidate = this->triePages[i];
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end()) {
+                // stale 条目：页面已不在 Trie 中，直接用
+                pageIndex = candidate;
+                this->triePages[i] = this->triePages.back();
                 this->triePages.pop_back();
                 this->triePagesSet.erase(pageIndex);
-                auto it = this->pageToTrieNode.find(pageIndex);
-                if (it != this->pageToTrieNode.end()) {
-                    CacheTrieNode *node = it->second;
-                    for (auto &childKv : node->children) {
-                        EvictTrieSubtree(childKv.second);
-                    }
-                    node->children.clear();
-                    if (node->parent) {
-                        node->parent->children.erase(node->edgeHash);
-                    }
-                    this->pageToTrieNode.erase(it);
-                    delete node;
-                }
-                // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
-                // 过滤 triePages 中已不在 triePagesSet 的脏条目
-                int w = 0;
-                for (int i = 0; i < (int)this->triePages.size(); i++) {
-                    if (this->triePagesSet.count(this->triePages[i])) {
-                        this->triePages[w++] = this->triePages[i];
-                    }
-                }
-                this->triePages.resize(w);
+                break;
             }
-
-            this->pageRefCount[pageIndex] = 1;
+            if (it->second->children.empty()) {
+                pageIndex = candidate;
+                this->triePages[i] = this->triePages.back();
+                this->triePages.pop_back();
+                this->triePagesSet.erase(pageIndex);
+                RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
+                break;
+            }
         }
+
+        if (pageIndex == -1) {
+            // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
+            pageIndex = this->triePages.back();
+            this->triePages.pop_back();
+            this->triePagesSet.erase(pageIndex);
+            auto it = this->pageToTrieNode.find(pageIndex);
+            if (it != this->pageToTrieNode.end()) {
+                CacheTrieNode *node = it->second;
+                for (auto &childKv : node->children) {
+                    EvictTrieSubtree(childKv.second);
+                }
+                node->children.clear();
+                if (node->parent) {
+                    node->parent->children.erase(node->edgeHash);
+                }
+                this->pageToTrieNode.erase(it);
+                delete node;
+            }
+            // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
+            // 过滤 triePages 中已不在 triePagesSet 的脏条目
+            int w = 0;
+            for (int i = 0; i < (int)this->triePages.size(); i++) {
+                if (this->triePagesSet.count(this->triePages[i])) {
+                    this->triePages[w++] = this->triePages[i];
+                }
+            }
+            this->triePages.resize(w);
+        }
+
+        this->pageRefCount[pageIndex] = 1;
         return pageIndex;
     }
 
