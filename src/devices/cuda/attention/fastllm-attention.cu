@@ -3119,8 +3119,13 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
  * 请求边界来自qSizes，而非q.dims[0]/Hq。物理KV页布局为
  * [页容量, pageLen, Hkv, D]；FlashInfer当前要求Q/K/V头维度相等。
  *
- * @param q                   GPU上的FP16/BF16 Query，逻辑为T个token、Hq个头；
- *                            使用上述token/头stride，数据在执行完成前须有效。
+ * @param q                   GPU上的FP16/BF16 Query；正常主流程形状为[Hq, T, D]。
+ *                            Hq是每个请求的Query头数，T是本次所有请求输入的token
+ *                            总数，D是每个头的维度。各请求沿T维依次拼接，由qSizes
+ *                            标明起止位置；例如请求长度为3和2时，形状为[Hq, 5, D]。
+ *                            普通decode每个请求输入1个token，此时T=B，形状为
+ *                            [Hq, B, D]。按q.strides[1]定位token、q.strides[0]定位头；
+ *                            数据在GPU执行完成前须保持有效。
  * @param kCaches             K缓存描述，dims[0]为Hkv；pagedKVCacheData指向
  *                            所有请求共用的物理页池，类型为q类型或FP8_E4M3。
  * @param vCaches             V缓存描述，dims[2]为V头维度；物理页布局及类型须
