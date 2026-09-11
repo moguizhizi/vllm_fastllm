@@ -3136,10 +3136,16 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
  *                            和终点（不含终点）。数组长度为请求数+1，最后一项
  *                            为总token数。GPU读取cudaData来区分各请求；CPU读取
  *                            cpuIntDatas来安排这些请求的计算任务。
- * @param pageSizes           INT32请求KV页数前缀和[B+1]，首项0；GPU数据与
- *                            cpuIntDatas须符合当前执行计划及Graph更新约定。
- * @param pageIndexs          GPU INT32物理页号数组，按pageSizes分段索引。
- * @param lastPageLens        GPU INT32数组[B]，记录各请求最后一页有效token数。
+ * @param pageSizes           INT32数组，长度为B+1，记录各请求在pageIndexs中的
+ *                            起止位置（终点不含）。例如A用2页、B用1页，值为
+ *                            [0, 2, 3]，不是[2, 1]；首项为0，末项为页编号总数。
+ *                            GPU数据与cpuIntDatas须符合当前执行计划及Graph更新约定。
+ * @param pageIndexs          GPU INT32页编号数组，将各请求使用的页按token顺序
+ *                            依次拼接。例如A用页7、页3，B用页9，值为[7, 3, 9]；
+ *                            配合pageSizes=[0, 2, 3]，A取前两项，B取第三项。
+ * @param lastPageLens        GPU INT32数组，长度为B，记录每个请求末页实际存了
+ *                            多少个token。例如每页容量4，A共6个token、B共3个，
+ *                            值为[2, 3]。末页满时填pageLen，不是0。
  * @param output              已分配GPU输出，类型与q一致；FlashInfer写入
  *                            token优先的[T, Hq, D]结果，并交换原shape前两维。
  * @param group               正整数Hq/Hkv，表示每组KV头共享的Q头数。
